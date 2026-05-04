@@ -27,7 +27,7 @@
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false,
     "paths": {
-      "bare-claude": [ "./index.ts" ],
+      "@agladysh/bare-claude": [ "./index.ts" ],
     }
   }
 }
