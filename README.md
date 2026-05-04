@@ -39,6 +39,12 @@ Options:
 bun add @agladysh/bare-claude
 ```
 
+Or globally:
+
+```bash
+bun add -g @agladysh/bare-claude
+```
+
 ## Programmatic Usage
 
 ### Anthropic
