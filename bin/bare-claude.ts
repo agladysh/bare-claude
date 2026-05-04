@@ -234,7 +234,7 @@ interface AssistantBash {
     content: {
       type: 'tool_use';
       name: 'Bash';
-      input: { command: string, description: string };
+      input: { command: string, description?: string };
     }[];
   }
 }
@@ -252,7 +252,7 @@ function isAssistantBash(e: unknown): e is AssistantBash {
         && 'name' in c && c.name === 'Bash'
         && 'input' in c && c.input !== null && typeof c.input === 'object'
         && 'command' in c.input && typeof c.input.command === 'string'
-        && 'description' in c.input && typeof c.input.description === 'string'
+        && (!('description' in c.input) || typeof c.input.description === 'string')
     )
     ;
 }
@@ -774,7 +774,10 @@ const Rules: Rule[] = [
     `• Thinking\n| ${e.message.content.flatMap(t => truncateText(t.thinking)).join('\n| ')}\n`
   ),
   Rule(isAssistantBash, (e) =>
-    `• Bash\n| ${e.message.content.map(t => [ truncateLine(t.input.description), truncateText(t.input.command) ]).flat(Infinity).join('\n| ')}\n`
+    `• Bash\n| ${e.message.content.map(t => [
+      t.input.description && truncateLine(t.input.description),
+      truncateText(t.input.command) ]
+    ).filter(Boolean).flat(Infinity).join('\n| ')}\n`
   ),
   Rule(isAssistantWrite, (e) =>
     `• Write\n| ${e.message.content.map(t => [ t.input.file_path, truncateText(t.input.content) ]).flat(Infinity).join('\n| ')}\n`
