@@ -1,7 +1,7 @@
 {
   "name": "@agladysh/bare-claude",
   "description": "A convenience wrapper to run Claude Code headless. Supports alternative providers.",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "license": "MIT",
   "publishConfig": {
     "access": "public"
@@ -22,6 +22,17 @@
   "funding": {
     "url": "https://github.com/sponsors/agladysh"
   },
+  "keywords": [
+    "ai",
+    "agent",
+    "sdk",
+    "claude",
+    "anthropic",
+    "automation",
+    "code-generation",
+    "ollama",
+    "llm"
+  ],
   "type": "module",
   "module": "index.ts",
   "bin": {
