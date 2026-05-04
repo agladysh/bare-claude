@@ -118,7 +118,7 @@ export function isApiError(e: unknown): e is ApiError {
     && 'subtype' in e && e.subtype === 'api_error';
 }
 
-interface AssistantSynthetic {
+interface Synthetic {
   type: 'assistant';
   message: {
     model: '<synthetic>';
@@ -128,7 +128,7 @@ interface AssistantSynthetic {
   };
 }
 
-export function isAssistantSynthetic(e: unknown): e is AssistantSynthetic {
+export function isSynthetic(e: unknown): e is Synthetic {
   return e !== null && typeof e === 'object'
     && 'type' in e && e.type === 'assistant'
     && 'message' in e && e.message !== null && typeof e.message === 'object'
@@ -139,7 +139,7 @@ export function isAssistantSynthetic(e: unknown): e is AssistantSynthetic {
     );
 }
 
-interface AssistantThinking {
+interface Thinking {
   type: 'assistant';
   message: {
     type: 'message';
@@ -150,7 +150,7 @@ interface AssistantThinking {
   };
 }
 
-export function isAssistantThinking(e: unknown): e is AssistantThinking {
+export function isThinking(e: unknown): e is Thinking {
   return e !== null && typeof e === 'object'
     && 'type' in e && e.type === 'assistant'
     && 'message' in e && e.message !== null && typeof e.message === 'object'
@@ -165,7 +165,7 @@ export function isAssistantThinking(e: unknown): e is AssistantThinking {
     );
 }
 
-interface AssistantEncryptedThinking {
+interface EncryptedThinking {
   type: 'assistant';
   message: {
     type: 'message';
@@ -177,7 +177,7 @@ interface AssistantEncryptedThinking {
   };
 }
 
-export function isAssistantEncryptedThinking(e: unknown): e is AssistantEncryptedThinking {
+export function isEncryptedThinking(e: unknown): e is EncryptedThinking {
   return e !== null && typeof e === 'object'
     && 'type' in e && e.type === 'assistant'
     && 'message' in e && e.message !== null && typeof e.message === 'object'
@@ -193,7 +193,7 @@ export function isAssistantEncryptedThinking(e: unknown): e is AssistantEncrypte
 }
 
 // TODO: Technically different content types can be mixed in one event, support that
-interface AssistantBash {
+interface Bash {
   type: 'assistant';
   message: {
     type: 'message';
@@ -205,7 +205,7 @@ interface AssistantBash {
   };
 }
 
-export function isAssistantBash(e: unknown): e is AssistantBash {
+export function isBash(e: unknown): e is Bash {
   return e !== null && typeof e === 'object'
     && 'type' in e && e.type === 'assistant'
     && 'message' in e && e.message !== null && typeof e.message === 'object'
@@ -222,7 +222,7 @@ export function isAssistantBash(e: unknown): e is AssistantBash {
     );
 }
 
-interface AssistantWrite {
+interface Write {
   type: 'assistant';
   message: {
     type: 'message';
@@ -234,7 +234,7 @@ interface AssistantWrite {
   };
 }
 
-export function isAssistantWrite(e: unknown): e is AssistantWrite {
+export function isWrite(e: unknown): e is Write {
   return e !== null && typeof e === 'object'
     && 'type' in e && e.type === 'assistant'
     && 'message' in e && e.message !== null && typeof e.message === 'object'
@@ -251,7 +251,7 @@ export function isAssistantWrite(e: unknown): e is AssistantWrite {
     );
 }
 
-interface AssistantRead {
+interface Read {
   type: 'assistant';
   message: {
     type: 'message';
@@ -263,7 +263,7 @@ interface AssistantRead {
   };
 }
 
-export function isAssistantRead(e: unknown): e is AssistantRead {
+export function isRead(e: unknown): e is Read {
   return e !== null && typeof e === 'object'
     && 'type' in e && e.type === 'assistant'
     && 'message' in e && e.message !== null && typeof e.message === 'object'
@@ -279,7 +279,7 @@ export function isAssistantRead(e: unknown): e is AssistantRead {
     );
 }
 
-interface AssistantEdit {
+interface Edit {
   type: 'assistant';
   message: {
     type: 'message';
@@ -291,7 +291,7 @@ interface AssistantEdit {
   };
 }
 
-export function isAssistantEdit(e: unknown): e is AssistantEdit {
+export function isEdit(e: unknown): e is Edit {
   return e !== null && typeof e === 'object'
     && 'type' in e && e.type === 'assistant'
     && 'message' in e && e.message !== null && typeof e.message === 'object'
@@ -310,7 +310,7 @@ export function isAssistantEdit(e: unknown): e is AssistantEdit {
     );
 }
 
-interface AssistantSkill {
+interface Skill {
   type: 'assistant';
   message: {
     type: 'message';
@@ -322,7 +322,7 @@ interface AssistantSkill {
   };
 }
 
-export function isAssistantSkill(e: unknown): e is AssistantSkill {
+export function isSkill(e: unknown): e is Skill {
   return e !== null && typeof e === 'object'
     && 'type' in e && e.type === 'assistant'
     && 'message' in e && e.message !== null && typeof e.message === 'object'
@@ -339,7 +339,7 @@ export function isAssistantSkill(e: unknown): e is AssistantSkill {
     );
 }
 
-interface AssistantAgent {
+interface Agent {
   type: 'assistant';
   message: {
     type: 'message';
@@ -351,7 +351,7 @@ interface AssistantAgent {
   };
 }
 
-export function isAssistantAgent(e: unknown): e is AssistantAgent {
+export function isAgent(e: unknown): e is Agent {
   return e !== null && typeof e === 'object'
     && 'type' in e && e.type === 'assistant'
     && 'message' in e && e.message !== null && typeof e.message === 'object'
@@ -370,7 +370,7 @@ export function isAssistantAgent(e: unknown): e is AssistantAgent {
     );
 }
 
-interface AssistantToolSearch {
+interface ToolSearch {
   type: 'assistant';
   message: {
     type: 'message';
@@ -382,7 +382,7 @@ interface AssistantToolSearch {
   };
 }
 
-export function isAssistantToolSearch(e: unknown): e is AssistantToolSearch {
+export function isToolSearch(e: unknown): e is ToolSearch {
   return e !== null && typeof e === 'object'
     && 'type' in e && e.type === 'assistant'
     && 'message' in e && e.message !== null && typeof e.message === 'object'
@@ -398,7 +398,7 @@ export function isAssistantToolSearch(e: unknown): e is AssistantToolSearch {
     );
 }
 
-interface AssistantGrep {
+interface Grep {
   type: 'assistant';
   message: {
     type: 'message';
@@ -410,7 +410,7 @@ interface AssistantGrep {
   };
 }
 
-export function isAssistantGrep(e: unknown): e is AssistantGrep {
+export function isGrep(e: unknown): e is Grep {
   return e !== null && typeof e === 'object'
     && 'type' in e && e.type === 'assistant'
     && 'message' in e && e.message !== null && typeof e.message === 'object'
@@ -428,7 +428,7 @@ export function isAssistantGrep(e: unknown): e is AssistantGrep {
     );
 }
 
-interface AssistantAskUserQuestion {
+interface AskUserQuestion {
   type: 'assistant';
   message: {
     type: 'message';
@@ -449,7 +449,7 @@ interface AssistantAskUserQuestion {
   };
 }
 
-export function isAssistantAskUserQuestion(e: unknown): e is AssistantAskUserQuestion {
+export function isAskUserQuestion(e: unknown): e is AskUserQuestion {
   return e !== null && typeof e === 'object'
     && 'type' in e && e.type === 'assistant'
     && 'message' in e && e.message !== null && typeof e.message === 'object'
@@ -476,7 +476,7 @@ export function isAssistantAskUserQuestion(e: unknown): e is AssistantAskUserQue
     );
 }
 
-interface AssistantTaskCreate {
+interface TaskCreate {
   type: 'assistant';
   message: {
     type: 'message';
@@ -492,7 +492,7 @@ interface AssistantTaskCreate {
   };
 }
 
-export function isAssistantTaskCreate(e: unknown): e is AssistantTaskCreate {
+export function isTaskCreate(e: unknown): e is TaskCreate {
   return e !== null && typeof e === 'object'
     && 'type' in e && e.type === 'assistant'
     && 'message' in e && e.message !== null && typeof e.message === 'object'
@@ -510,7 +510,7 @@ export function isAssistantTaskCreate(e: unknown): e is AssistantTaskCreate {
     );
 }
 
-interface AssistantTaskUpdate {
+interface TaskUpdate {
   type: 'assistant';
   message: {
     type: 'message';
@@ -525,7 +525,7 @@ interface AssistantTaskUpdate {
   };
 }
 
-export function isAssistantTaskUpdate(e: unknown): e is AssistantTaskUpdate {
+export function isTaskUpdate(e: unknown): e is TaskUpdate {
   return e !== null && typeof e === 'object'
     && 'type' in e && e.type === 'assistant'
     && 'message' in e && e.message !== null && typeof e.message === 'object'
@@ -817,20 +817,20 @@ export type SessionEvent =
   | AgentName
   | TurnDuration
   | ApiError
-  | AssistantSynthetic
-  | AssistantThinking
-  | AssistantEncryptedThinking
-  | AssistantBash
-  | AssistantWrite
-  | AssistantRead
-  | AssistantEdit
-  | AssistantSkill
-  | AssistantAgent
-  | AssistantToolSearch
-  | AssistantGrep
-  | AssistantAskUserQuestion
-  | AssistantTaskCreate
-  | AssistantTaskUpdate
+  | Synthetic
+  | Thinking
+  | EncryptedThinking
+  | Bash
+  | Write
+  | Read
+  | Edit
+  | Skill
+  | Agent
+  | ToolSearch
+  | Grep
+  | AskUserQuestion
+  | TaskCreate
+  | TaskUpdate
   | ExitPlanMode
   | EnterPlanMode
   | OtherToolUse
