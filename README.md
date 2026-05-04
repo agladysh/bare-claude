@@ -22,7 +22,7 @@ The Anthropic API key use and alternate model provider use should be okay.
 ## Command Line Usage
 
 ```shell
-bunx bare-claude --launcher ollama --model nemotron-3-super:cloud 'Explain this project to me'
+bunx @agladysh/bare-claude --launcher ollama --model nemotron-3-super:cloud 'Explain this project to me'
 ```
 
 Options:
@@ -36,7 +36,7 @@ Options:
 ## Installation
 
 ```bash
-bun add bare-claude
+bun add @agladysh/bare-claude
 ```
 
 ## Programmatic Usage

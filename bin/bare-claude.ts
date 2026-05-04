@@ -6,7 +6,7 @@ import { watch } from 'node:fs/promises';
 
 import TailFile from '@logdna/tail-file';
 
-import { Launchers, spawnClaude, type JsonObject, type Launcher } from 'bare-claude';
+import { Launchers, spawnClaude, type Launcher } from '@agladysh/bare-claude';
 
 import pkg from '../package.json';
 

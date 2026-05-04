@@ -1,7 +1,7 @@
 {
-  "name": "bare-claude",
+  "name": "@agladysh/bare-claude",
   "description": "A convenience wrapper to run Claude Code headless. Supports alternative providers.",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "license": "MIT",
   "author": {
     "name": "Alexander Gladysh",
@@ -10,7 +10,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/agladysh/bare-claude.git"
+    "url": "git+https://github.com/agladysh/bare-claude.git"
   },
   "bugs": {
     "url": "https://github.com/agladysh/bare-claude/issues"
