@@ -805,3 +805,40 @@ export function isCommandPermissionsAttachment(e: unknown): e is CommandPermissi
     && 'allowedTools' in e.attachment && Array.isArray(e.attachment.allowedTools)
     && e.attachment.allowedTools.every(t => typeof t === 'string');
 }
+
+export type SessionEvent =
+  | FileHistorySnapshot
+  | LastPrompt
+  | EnqueueOperation
+  | DequeueOperation
+  | RemoveOperation
+  | PopAllOperation
+  | CustomTitle
+  | AgentName
+  | TurnDuration
+  | ApiError
+  | AssistantSynthetic
+  | AssistantThinking
+  | AssistantEncryptedThinking
+  | AssistantBash
+  | AssistantWrite
+  | AssistantRead
+  | AssistantEdit
+  | AssistantSkill
+  | AssistantAgent
+  | AssistantToolSearch
+  | AssistantGrep
+  | AssistantAskUserQuestion
+  | AssistantTaskCreate
+  | AssistantTaskUpdate
+  | ExitPlanMode
+  | EnterPlanMode
+  | OtherToolUse
+  | Assistant
+  | ToolResult
+  | ToolResultArray
+  | ToolReference
+  | User
+  | UserArray
+  | SkillListingAttachment
+  | CommandPermissionsAttachment;
