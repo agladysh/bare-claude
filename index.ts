@@ -195,6 +195,7 @@ export async function spawnClaude<
     s.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1';
   }
 
+  // TODO: This still feeds model a ton of skills
   if (c.noSkills) {
     o.cmd.push('--disable-slash-commands');
     s.env.CLAUDE_CODE_DISABLE_CRON = '1';
