@@ -1,6 +1,5 @@
 interface FileHistorySnapshot {
   type: 'file-history-snapshot';
-  lastPrompt: string;
 }
 
 // TODO: This code might benefit from arktype, valibot, or even zod.
