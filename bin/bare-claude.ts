@@ -457,6 +457,37 @@ function isAssistantToolSearch(e: unknown): e is AssistantToolSearch {
     ;
 }
 
+interface AssistantGrep {
+  type: 'assistant';
+  message: {
+    type: 'message';
+    content: {
+      type: 'tool_use';
+      name: 'Grep';
+      input: { pattern: string, path?: string, output_mode?: string };
+    }[];
+  }
+}
+
+function isAssistantGrep(e: unknown): e is AssistantGrep {
+  return  e !== null && typeof e === 'object'
+    && 'type' in e && e.type === 'assistant'
+    && 'message' in e && e.message !== null && typeof e.message === 'object'
+    && (!('model' in e.message) || e.message.model !== '<synthetic>')
+    && 'type' in e.message && e.message.type === 'message'
+    && 'content' in e.message && Array.isArray(e.message.content)
+    && e.message.content.every(
+      c => c !== null && typeof c === 'object'
+        && 'type' in c && c.type === 'tool_use'
+        && 'name' in c && c.name === 'Grep'
+        && 'input' in c && c.input !== null && typeof c.input === 'object'
+        && 'pattern' in c.input && typeof c.input.pattern === 'string'
+        && (!('path' in c.input) || typeof c.input.path === 'string')
+        && (!('output_mode' in c.input) || typeof c.input.output_mode === 'string')
+    )
+    ;
+}
+
 interface AssistantAskUserQuestion {
   type: 'assistant';
   message: {
@@ -858,6 +889,13 @@ const Rules: Rule[] = [
   ),
   Verbose(isAssistantToolSearch, (e) =>
     `• Tool Search\n| ${e.message.content.flatMap(t => t.input.query).join('\n| ')}\n`
+  ),
+  Rule(isAssistantGrep, (e) =>
+    `• Grep\n| ${e.message.content.map(t => [
+      t.input.pattern,
+      t.input.path && `in ${t.input.path}`,
+      t.input.output_mode && `mode: ${t.input.output_mode}`
+    ].filter(Boolean).flat(Infinity).join('\n| '))}\n`
   ),
   Verbose(isToolReference, (e) =>
     `• Tool Reference\n| ${e.message.content.map(t => t.content.map(r => r.tool_name)).flat(Infinity).join('\n| ')}\n`
