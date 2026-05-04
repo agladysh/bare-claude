@@ -33,23 +33,46 @@ function truncateText(str: string, maxLines: number = 16) {
   return [...head, `... [${lines.length - head.length - tail.length} lines truncated] ...`, ...tail];
 }
 
-type Rule = (e: unknown, verbose: boolean) => string | null;
+interface RuleOptions {
+  verbose: boolean;
+  debug: boolean;
+}
 
-function Rule<T>(guard: (e: unknown) => e is T, run: (e: T) => string): Rule {
-  return (e: unknown) => {
+type Rule = (e: unknown, o: RuleOptions) => string | null;
+
+function Rule<T>(guard: (e: unknown) => e is T, run: (e: T, o: RuleOptions) => string): Rule {
+  return (e: unknown, o: RuleOptions) => {
     if (!guard(e)) {
       return null;
     }
-    return run(e);
+    return (!o.debug) ? run(e, o) : '';
   }
 }
 
-function Verbose<T>(guard: (e: unknown) => e is T, run: (e: T) => string): Rule {
-  return (e: unknown, verbose: boolean) => {
-    if (!verbose || !guard(e)) {
+function Verbose<T>(guard: (e: unknown) => e is T, run: (e: T, o: RuleOptions) => string): Rule {
+  return (e: unknown, o: RuleOptions) => {
+    if (!o.verbose || !guard(e)) {
       return null;
     }
-    return run(e);
+    return (!o.debug) ? run(e, o) : '';
+  }
+}
+
+function Debug<T>(guard: (e: unknown) => e is T, run: (e: T, o: RuleOptions) => string): Rule {
+  return (e: unknown, o: RuleOptions) => {
+    if (!guard(e)) {
+      return null;
+    }
+    return run(e, o); // No debug guard
+  }
+}
+
+function VerboseDebug<T>(guard: (e: unknown) => e is T, run: (e: T, o: RuleOptions) => string): Rule {
+  return (e: unknown, o: RuleOptions) => {
+    if (!o.verbose || !guard(e)) {
+      return null;
+    }
+    return run(e, o); // No debug guard
   }
 }
 
@@ -58,6 +81,7 @@ interface FileHistorySnapshot {
   lastPrompt: string;
 }
 
+// TODO: This code might benefit from arktype, valibot, or even zod.
 function isFileHistorySnapshot(e: unknown): e is FileHistorySnapshot {
   return e !== null && typeof e === 'object'
     && 'type' in e && e.type === 'file-history-snapshot'
@@ -712,8 +736,8 @@ function isCommandPermissionsAttachment(e: unknown): e is CommandPermissionsAtta
 
 // TODO: This needs to support even more events.
 //       Use this file ~/.claude/projects/-Users-agladysh-rs-contract-unit/149fe6d5-fc0f-4427-9db7-7d7959956c0d.jsonl
-//       Add debugging where only isOtherToolUse and unsupported types are printed
-//       Weed all of them out: everything should be supported
+//       Run with --debug --verbose --display
+//       Weed out all unsupported tool calls and event types: everything should be supported
 // TODO: Improve layout, add some colors, wrap lines etc.
 const Rules: Rule[] = [
   Verbose(isFileHistorySnapshot, (e) =>
@@ -725,7 +749,7 @@ const Rules: Rule[] = [
   Verbose(isEnqueueOperation, (e) =>
     `• Enqueue\n| ${truncateText(e.content).join('\n| ')}\n`
   ),
-  Verbose(isDequeueOperation, (e) =>
+  Verbose(isDequeueOperation, () =>
     `• Dequeue\n`
   ),
   Rule(isCustomTitle, (e) =>
@@ -743,7 +767,7 @@ const Rules: Rule[] = [
   Rule(isAssistantSynthetic, (e) =>
     `• Synthetic\n| ${e.message.content.flatMap(t => truncateText(t.text)).join('\n| ')}\n`
   ),
-  Verbose(isAssistantEncryptedThinking, (e) =>
+  Verbose(isAssistantEncryptedThinking, () =>
     `• Encrypted Thinking\n`
   ),
   Rule(isAssistantThinking, (e) =>
@@ -792,7 +816,7 @@ const Rules: Rule[] = [
   Rule(isExitPlanMode, () =>
     `• Exit Plan Mode\n`
   ),
-  Rule(isOtherToolUse, (e) =>
+  Debug(isOtherToolUse, (e) =>
     `• Tool\n| ${e.message.content.flatMap(t => [ t.name, JSON.stringify(t.input) ]).join('\n| ')}\n`
   ),
   Rule(isAssistant, (e) =>
@@ -812,14 +836,14 @@ const Rules: Rule[] = [
   ),
 ] as const;
 
-function displayClaudeEvent(e: unknown, verbose: boolean): string {
+function displayClaudeEvent(e: unknown, o: RuleOptions): string {
   for (const r of Rules) {
-    const result = r(e, verbose);
+    const result = r(e, o);
     if (result !== null) {
       return result;
     }
   }
-  return verbose ? `${JSON.stringify(e)}\n` : '';
+  return (o.verbose || o.debug) ? `${JSON.stringify(e)}\n` : '';
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -837,6 +861,10 @@ const { values, positionals } = parseArgs({
       short: 'm',
     },
     verbose: {
+      type: 'boolean',
+      default: false,
+    },
+    debug: {
       type: 'boolean',
       default: false,
     },
@@ -875,7 +903,7 @@ async function main() {
   if (values.display) {
     const result = Bun.JSONL.parse(await Bun.file(values.display).text());
     for (const event of result) {
-      process.stdout.write(displayClaudeEvent(event, values.verbose));
+      process.stdout.write(displayClaudeEvent(event, values));
     }
     return 0;
   }
@@ -896,7 +924,7 @@ async function main() {
     callToAction: positionals.join(' '),
   });
 
-  if (values.verbose) {
+  if (values.verbose || values.debug) {
     process.stdout.write(`${claude.sessionJsonlPath}\n`);
   }
 
@@ -919,7 +947,7 @@ async function main() {
 
         const result = Bun.JSONL.parseChunk(buffer);
         for (const event of result.values) {
-          process.stdout.write(displayClaudeEvent(event, values.verbose));
+          process.stdout.write(displayClaudeEvent(event, values));
         }
 
         buffer = buffer.slice(result.read);
@@ -932,7 +960,7 @@ async function main() {
     if (buffer.length > 0) {
       const final = Bun.JSONL.parseChunk(buffer);
       for (const event of final.values) {
-        process.stdout.write(displayClaudeEvent(event, values.verbose));
+        process.stdout.write(displayClaudeEvent(event, values));
       }
       if (final.error) {
         process.stderr.write(`unable to parse final jsonl chunk: ${final.error.message}:\n\n${buffer}`);
