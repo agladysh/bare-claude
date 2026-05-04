@@ -65,7 +65,10 @@ function VerboseDebug<T>(guard: (e: unknown) => e is T, run: (e: T, o: RuleOptio
 // TODO: Improve layout, add some colors, wrap lines etc.
 const Rules: Rule[] = [
   Verbose(Event.isFileHistorySnapshot, (e) =>
-    `• File History snapshot\n`
+    `• File History Snapshot\n`
+  ),
+  Verbose(Event.isPermissionMode, (e) =>
+    `• Permission Mode ${e.permissionMode}\n`
   ),
   Verbose(Event.isLastPrompt, (e) =>
     `• Last Prompt\n| ${truncateText(e.lastPrompt).join('\n| ')}\n`

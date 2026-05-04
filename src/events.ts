@@ -8,6 +8,18 @@ export function isFileHistorySnapshot(e: unknown): e is FileHistorySnapshot {
     && 'type' in e && e.type === 'file-history-snapshot';
 }
 
+interface PermissionMode {
+  type: 'permission-mode';
+  permissionMode: string;
+}
+
+// TODO: This code might benefit from arktype, valibot, or even zod.
+export function isPermissionMode(e: unknown): e is PermissionMode {
+  return e !== null && typeof e === 'object'
+    && 'type' in e && e.type === 'permission-mode'
+    && 'permissionMode' in e && typeof e.permissionMode === 'string';
+}
+
 interface LastPrompt {
   type: 'last-prompt';
   lastPrompt: string;
@@ -807,6 +819,7 @@ export function isCommandPermissionsAttachment(e: unknown): e is CommandPermissi
 
 export type SessionEvent =
   | FileHistorySnapshot
+  | PermissionMode
   | LastPrompt
   | EnqueueOperation
   | DequeueOperation
