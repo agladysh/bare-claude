@@ -139,6 +139,17 @@ A promise that resolves to a `ClaudeSubprocess` object containing:
 - `projectHomePath`: Path to the project directory in Claude home
 - `sessionJsonlPath`: Path to the session JSONL file
 
+### displayClaudeEvent(e: event, options: { verbose: boolean, debug: boolean }): string
+
+Converts Claude Code session NDJSON event entry to readable string.
+Returns empty string for suppressed events. Returns serialized JSON for unsupported events.
+
+When `verbose` is `true`, displays more events, suppresses them otherwise.
+
+When `debug` is `true`, displays only unsupported events, supported events are suppressed.
+
+### Examples
+
 See `bin/bare-claude.ts` for more advanced usage example.
 
 ## License
