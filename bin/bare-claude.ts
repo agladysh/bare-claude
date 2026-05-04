@@ -149,6 +149,24 @@ function isAgentName(e: unknown): e is AgentName {
     ;
 }
 
+interface TurnDuration {
+  type: 'system';
+  subtype: 'turn_duration';
+  durationMs: number;
+  messageCount: number;
+  timestamp: string;
+}
+
+function isTurnDuration(e: unknown): e is TurnDuration {
+  return e !== null && typeof e === 'object'
+    && 'type' in e && e.type === 'system'
+    && 'subtype' in e && e.subtype === 'turn_duration'
+    && 'durationMs' in e && typeof e.durationMs === 'number'
+    && 'messageCount' in e && typeof e.messageCount === 'number'
+    && 'timestamp' in e && typeof e.timestamp === 'string'
+    ;
+}
+
 interface AssistantSynthetic {
   type: 'assistant';
   message: {
@@ -836,6 +854,9 @@ const Rules: Rule[] = [
   ),
   Rule(isUserArray, (e) =>
     `• User\n| ${e.message.content.flatMap(t => truncateText(t.text)).join('\n| ')}\n`
+  ),
+  Rule(isTurnDuration, (e) =>
+    `• Turn Duration\n| ${e.durationMs}ms, ${e.messageCount} messages\n`
   ),
 ] as const;
 
