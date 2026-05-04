@@ -25,6 +25,10 @@ The Anthropic API key use and alternate model provider use should be okay.
 bunx @agladysh/bare-claude --launcher ollama --model nemotron-3-super:cloud 'Explain this project to me'
 ```
 
+```shell
+bare-claude --read README.md --read src/index.ts 'Review the API documentation in the README.md'
+```
+
 Options:
 
 - `--launcher [value]`: `claude` for native Anthropic modes (default), `ollama` for `ollama launch`
@@ -32,6 +36,7 @@ Options:
 - `--quiet`: do not print transcript
 - `--verbose`: print more events in transcript
 - `--display [file.jsonl]`: print existing transcript
+- `--read [file]`: preload file in a synthetic session
 
 ## Installation
 

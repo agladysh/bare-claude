@@ -1,13 +1,17 @@
 #!/usr/bin/env bun
 
+import { $ } from 'bun';
+
 import { parseArgs } from 'node:util';
 import path from 'node:path';
 import { watch } from 'node:fs/promises';
 
 import TailFile from '@logdna/tail-file';
+import { isBinaryFile } from 'isbinaryfile';
 
-import { Launchers, spawnClaude, type Launcher } from '@agladysh/bare-claude';
+import { Launchers, spawnClaude, type Launcher, type LaunchOptions } from '@agladysh/bare-claude';
 import { displayClaudeEvent } from '@agladysh/bare-claude/display';
+import { SessionBuilder } from '@agladysh/bare-claude/SessionBuilder';
 
 import pkg from '../package.json';
 
@@ -29,6 +33,12 @@ const { values, positionals } = parseArgs({
       type: 'boolean',
       default: false,
     },
+    read: {
+      type: 'string',
+      short: 'r',
+      multiple: true
+    },
+    // TODO: support emitBash() as well?
     debug: {
       type: 'boolean',
       default: false,
@@ -76,18 +86,45 @@ async function main() {
   if (values.help || positionals.length === 0 || !(values.launcher in Launchers)) {
     // TODO: Write better help text
     process.stdout.write(
-      `Usage: ${Object.keys(pkg.bin)[0]} [--launcher=claude|ollama] [--model=<model>] [--quiet] "call to action"\n`
+      `Usage: ${Object.keys(pkg.bin)[0]} [--launcher=claude|ollama] [--model=<model>] [--quiet] [--read=<file>] "call to action"\n`
     );
     return 0;
   }
 
-  let exited = false;
+  let customSessionData: LaunchOptions['customSessionData'] = null;
+  if (values.read) {
+    const sessionId = Bun.randomUUIDv7();
+    const builder = new SessionBuilder(
+      sessionId,
+      (await $ `claude --version`.text()).replace(' (Claude Code)', '').trim(),
+      process.cwd(),
+      (await $`git branch --show-current`.text()).trim(),
+      values.model ?? '<synthetic>'
+    );
+    for (const filename of values.read) {
+      const file = Bun.file(filename);
+      if (!file.exists()) {
+        process.stderr.write(`File "${filename}" does not exist, cannot Read`);
+        return 0;
+      }
+      if (await isBinaryFile(filename)) {
+        process.stderr.write(`File "${filename}" is binary, would not Read`);
+        return 0;
+      }
+      builder.emitRead(filename, await file.text());
+    }
+    customSessionData = {
+      sessionId,
+      value: builder.commit().map(e => JSON.stringify(e)).join('\n'),
+    }
+  }
 
   const claude = await spawnClaude({
     launcher: values.launcher as Launcher,
     model: values.model,
     callToAction: positionals.join(' '),
     permissionMode: 'acceptEdits',
+    customSessionData,
   });
 
   if (values.verbose || values.debug) {
@@ -99,8 +136,9 @@ async function main() {
   } else {
     const watcher = watch(claude.projectHomePath);
     const basename = path.basename(claude.sessionJsonlPath);
+    // TODO: This should break if subprocess exited early without creating a file (likely due to a crash).
     for await (const event of watcher) {
-      if (event.filename === basename || exited) {
+      if (event.filename === basename) {
         break;
       }
     }
