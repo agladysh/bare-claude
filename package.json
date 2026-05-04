@@ -38,7 +38,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./events": "./src/events.ts",
-    "./display": "./src/display.ts"
+    "./display": "./src/display.ts",
+    "./SessionBuilder": "./src/SessionBuilder.ts"
   },
   "bin": {
     "bare-claude": "bin/bare-claude.ts"
