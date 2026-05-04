@@ -53,6 +53,7 @@
     "typescript": "^7"
   },
   "dependencies": {
-    "@logdna/tail-file": "^4.0.2"
+    "@logdna/tail-file": "^4.0.2",
+    "isbinaryfile": "^6.0.0"
   }
 }

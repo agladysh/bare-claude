@@ -77,7 +77,7 @@ type SystemPromptOp = 'appendString' | 'setString' | 'appendFile' | 'setFile';
 /**
  * Options for launching a Claude subprocess.
  */
-interface LaunchOptions {
+export interface LaunchOptions {
   /**
    * Working directory for the Claude process. Defaults to process.cwd().
    */
