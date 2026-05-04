@@ -922,6 +922,7 @@ async function main() {
     launcher: values.launcher as Launcher,
     model: values.model,
     callToAction: positionals.join(' '),
+    permissionMode: 'acceptEdits',
   });
 
   if (values.verbose || values.debug) {
