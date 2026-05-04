@@ -34,7 +34,12 @@
     "llm"
   ],
   "type": "module",
-  "module": "index.ts",
+  "module": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./events": "./src/events.ts",
+    "./display": "./src/display.ts"
+  },
   "bin": {
     "bare-claude": "bin/bare-claude.ts"
   },
