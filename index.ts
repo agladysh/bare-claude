@@ -2,18 +2,47 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+/**
+ * Represents a JSON structure that can be either an object or array.
+ */
 export type JsonStructure = JsonObject | JsonArray
+
+/**
+ * Interface representing a JSON object with string keys and Json values.
+ */
 export interface JsonObject {
 	[k: string]: Json
 }
+
+/**
+ * Represents a JSON array containing Json values.
+ */
 export type JsonArray = Json[]
+
+/**
+ * Represents a JSON primitive value (string, boolean, number, or null).
+ */
 export type JsonPrimitive = string | boolean | number | null
+
+/**
+ * Represents any valid JSON value - either a structure (object/array) or primitive.
+ */
 export type Json = JsonStructure | JsonPrimitive
 
+/**
+ * Sanitizes a string for use as a filename by replacing non-alphanumeric characters with hyphens.
+ * @param s - The string to sanitize
+ * @returns A sanitized string safe for use as a filename
+ */
 function sanitizeForFilename(s: string) {
   return s.replace(/[^a-zA-Z0-9]/g, '-');
 }
 
+/**
+ * Converts a file path to a filename suitable for filesystem use.
+ * @param path - The file path to convert
+ * @returns A sanitized filename, truncated with hash if too long
+ */
 function pathToFilename(path: string): string {
   const maxLength = 200;
   const filename = sanitizeForFilename(path);
@@ -22,47 +51,175 @@ function pathToFilename(path: string): string {
     : `${filename.slice(0, maxLength)}-${Bun.hash(path).toString(36)}`;
 }
 
+/**
+ * Available launcher types for spawning Claude processes.
+ */
 export const Launchers = {
   claude: 'claude',
   ollama: 'ollama',
 } as const;
 
+/**
+ * Type representing all possible launcher values.
+ */
 export type Launchers = typeof Launchers;
+
+/**
+ * Type representing a single launcher key.
+ */
 export type Launcher = keyof Launchers;
+/**
+ * Operations that can be performed to modify the system prompt.
+ */
 type SystemPromptOp = 'appendString' | 'setString' | 'appendFile' | 'setFile';
 
 // TODO: Support worktrees.
+/**
+ * Options for launching a Claude subprocess.
+ */
 interface LaunchOptions {
+  /**
+   * Working directory for the Claude process. Defaults to process.cwd().
+   */
   cwd?: string | null,
+
+  /**
+   * Path to ephemeral Claude home directory. If not provided, a temporary directory will be created.
+   */
   ephemeralClaudeHomePath?: string | null,
+
+  /**
+   * Custom session data to use for resuming a session.
+   */
   customSessionData?: null | { sessionId: string, value: string },
+
+  /**
+   * Launcher to use for spawning Claude. Defaults to 'claude'.
+   */
   launcher?: Launcher,
+
+  /**
+   * Model to use for Claude. Defaults to null (uses Claude's default).
+   */
   model?: null | string,
+
+  /**
+   * Effort level for Claude. Defaults to 'high'.
+   */
   effortLevel?: string,
+
+  /**
+   * Permission mode for Claude. Defaults to 'auto'.
+   */
   permissionMode?: string,
+
+  /**
+   * Configuration for modifying the system prompt.
+   */
   changeSystemPrompt?: null | { type: SystemPromptOp, value: string },
+
+  /**
+   * Whether to disable instruction files. Defaults to true.
+   */
   noInstructionFiles?: boolean,
+
+  /**
+   * Whether to disable memory. Defaults to true.
+   */
   noMemory?: boolean,
+
+  /**
+   * Whether to disable skills. Defaults to true.
+   */
   noSkills?: boolean,
+
+  /**
+   * Whether to disable hooks. Defaults to true.
+   */
   noHooks?: boolean,
+
+  /**
+   * Whether to disable plugins. Defaults to true.
+   */
   noPlugins?: boolean,
+
+  /**
+   * Whether to disable MCP. Defaults to true.
+   */
   noMcp?: boolean,
+
+  /**
+   * Whether to disable agents. Defaults to true.
+   */
   noAgents?: boolean,
+
+  /**
+   * Whether to disable tasks. Defaults to false.
+   */
   noTasks?: boolean,
+
+  /**
+   * Whether to disable compact. Defaults to true.
+   */
   noCompact?: boolean,
+
+  /**
+   * Whether to disable integrations. Defaults to true.
+   */
   noIntegrations?: boolean,
+
+  /**
+   * Whether to disable housekeeping. Defaults to true.
+   */
   noHousekeeping?: boolean,
+
+  /**
+   * Whether to disable calling the mothership.
+   * Defaults to false when launcher is claude, true otherwise.
+   */
   noMothership?: boolean,
+
+  /**
+   * Whether to disable process environment inheritance. Defaults to false.
+   */
   noProcessEnv?: boolean,
+
+  /**
+   * Maximum output length for various Claude components. Defaults to null (default limit).
+   */
   maxOutputLength?: null | number,
+
+  /**
+   * Additional environment variables to set for the Claude process.
+   */
   extraEnv?: Record<string, string>,
+
+  /**
+   * Additional command-line arguments to pass to Claude.
+   */
   extraArgs?: string[],
+
+  /**
+   * Additional settings to merge into Claude's configuration.
+   */
   extraSettings?: JsonObject,
+
+  /**
+   * The call-to-action prompt to send to Claude.
+   */
   callToAction: string
 }
 
+/**
+ * Type representing a fully resolved launch configuration with all required fields.
+ */
 type LaunchConfig = Required<LaunchOptions>;
 
+/**
+ * Converts LaunchOptions to a fully resolved LaunchConfig by applying defaults.
+ * @param o - The launch options to convert
+ * @returns A LaunchConfig with all fields resolved to non-optional values
+ */
 function LaunchConfig(o: LaunchOptions): LaunchConfig {
   return {
     cwd: o.cwd ?? null,
@@ -94,18 +251,38 @@ function LaunchConfig(o: LaunchOptions): LaunchConfig {
   };
 }
 
+/**
+ * Represents a spawned Claude subprocess with associated metadata.
+ * @template In - The type of writable stdin stream
+ * @template Out - The type of readable stdout stream
+ * @template Err - The type of readable stderr stream
+ */
 interface ClaudeSubprocess<
   In extends Bun.SpawnOptions.Writable,
   Out extends Bun.SpawnOptions.Readable,
   Err extends Bun.SpawnOptions.Readable
 > {
+  /** The spawned Bun subprocess */
   subprocess: Bun.Subprocess<In, Out, Err>,
+  /** Path to the ephemeral Claude home directory */
   ephemeralClaudeHomePath: string,
+  /** Unique identifier for the Claude session */
   sessionId: string,
+  /** Path to the project home directory within Claude home */
   projectHomePath: string,
+  /** Path to the JSONL session file */
   sessionJsonlPath: string,
 };
 
+/**
+ * Spawns a Claude subprocess with the given launch options.
+ * @template In - The type of writable stdin stream
+ * @template Out - The type of readable stdout stream
+ * @template Err - The type of readable stderr stream
+ * @param launchOptions - Configuration options for launching Claude
+ * @param spawnOptions - Optional Bun spawn options for customizing the subprocess
+ * @returns A Promise that resolves to a ClaudeSubprocess containing the spawned process and metadata
+ */
 export async function spawnClaude<
   In extends Bun.SpawnOptions.Writable,
   Out extends Bun.SpawnOptions.Readable,
