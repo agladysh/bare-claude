@@ -94,28 +94,28 @@ const Rules: Rule[] = [
   Verbose(Event.isCommandPermissionsAttachment, (e) =>
     `• Allowed Tools\n| ${e.attachment.allowedTools.join('\n| ')}\n`
   ),
-  Rule(Event.isAssistantSynthetic, (e) =>
+  Rule(Event.isSynthetic, (e) =>
     `• Synthetic\n| ${e.message.content.flatMap(t => truncateText(t.text)).join('\n| ')}\n`
   ),
-  Verbose(Event.isAssistantEncryptedThinking, () =>
+  Verbose(Event.isEncryptedThinking, () =>
     `• Encrypted Thinking\n`
   ),
-  Rule(Event.isAssistantThinking, (e) =>
+  Rule(Event.isThinking, (e) =>
     `• Thinking\n| ${e.message.content.flatMap(t => truncateText(t.thinking)).join('\n| ')}\n`
   ),
-  Rule(Event.isAssistantBash, (e) =>
+  Rule(Event.isBash, (e) =>
     `• Bash\n| ${e.message.content.map(t => [
       t.input.description && truncateLine(t.input.description),
       truncateText(t.input.command) ]
     ).filter(Boolean).flat(Infinity).join('\n| ')}\n`
   ),
-  Rule(Event.isAssistantWrite, (e) =>
+  Rule(Event.isWrite, (e) =>
     `• Write\n| ${e.message.content.map(t => [ t.input.file_path, truncateText(t.input.content) ]).flat(Infinity).join('\n| ')}\n`
   ),
-  Rule(Event.isAssistantRead, (e) =>
+  Rule(Event.isRead, (e) =>
     `• Read\n| ${e.message.content.map(t => t.input.file_path).flat(Infinity).join('\n| ')}\n`
   ),
-  Rule(Event.isAssistantEdit, (e) =>
+  Rule(Event.isEdit, (e) =>
     `• Edit\n| ${e.message.content.map(t => [
       t.input.file_path,
       t.input.replace_all ? 'Replace All' : undefined,
@@ -125,10 +125,10 @@ const Rules: Rule[] = [
       truncateText(t.input.new_string),
     ].filter(Boolean).flat(Infinity).join('\n| '))}\n`
   ),
-  Rule(Event.isAssistantSkill, (e) =>
+  Rule(Event.isSkill, (e) =>
     `• Skill\n| ${e.message.content.flatMap(t => [ t.input.skill, t.input.args ].filter(Boolean)).join('\n| ')}\n`
   ),
-  Rule(Event.isAssistantAgent, (e) =>
+  Rule(Event.isAgent, (e) =>
     `• Agent\n| ${e.message.content.map(t => [
       t.input.subagent_type,
       t.input.model,
@@ -136,10 +136,10 @@ const Rules: Rule[] = [
       truncateText(t.input.prompt),
     ]).flat(Infinity).filter(Boolean).join('\n| ')}\n`
   ),
-  Verbose(Event.isAssistantToolSearch, (e) =>
+  Verbose(Event.isToolSearch, (e) =>
     `• Tool Search\n| ${e.message.content.flatMap(t => t.input.query).join('\n| ')}\n`
   ),
-  Rule(Event.isAssistantGrep, (e) =>
+  Rule(Event.isGrep, (e) =>
     `• Grep\n| ${e.message.content.map(t => [
       t.input.pattern,
       t.input.path && `in ${t.input.path}`,
@@ -150,20 +150,20 @@ const Rules: Rule[] = [
     `• Tool Reference\n| ${e.message.content.map(t => t.content.map(r => r.tool_name)).flat(Infinity).join('\n| ')}\n`
   ),
   // TODO: This especially is in dire need of additional formatting for readability
-  Verbose(Event.isAssistantAskUserQuestion, (e) =>
+  Verbose(Event.isAskUserQuestion, (e) =>
     `• Ask User Question\n| ${e.message.content.map(t => t.input.questions.map(q => [
       truncateLine(q.header),
       truncateText(q.question),
       q.options.map(o => [ truncateLine(o.label), truncateText(o.description) ])
     ])).flat(Infinity).join('\n| ')}\n`
   ),
-  Rule(Event.isAssistantTaskCreate, (e) =>
+  Rule(Event.isTaskCreate, (e) =>
     `• Task Create\n| ${e.message.content.map(t => [
       truncateLine(t.input.subject),
       truncateText(t.input.description),
     ]).flat(Infinity).join('\n| ')}\n`
   ),
-  Rule(Event.isAssistantTaskUpdate, (e) =>
+  Rule(Event.isTaskUpdate, (e) =>
     `• Task Update\n| ${e.message.content.map(t => [
       `${t.input.taskId}: ${t.input.status}`,
     ]).flat(Infinity).join('\n| ')}\n`
