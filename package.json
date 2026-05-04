@@ -32,5 +32,8 @@
   },
   "peerDependencies": {
     "typescript": "^7"
+  },
+  "dependencies": {
+    "@logdna/tail-file": "^4.0.2"
   }
 }
