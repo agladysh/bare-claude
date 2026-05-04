@@ -14,11 +14,6 @@ import pkg from '../package.json';
 // TODO: Move this to a dedicated module
 // TODO: This needs nicer formatting
 
-interface Rule {
-  test: (e: JsonObject) => boolean,
-  run: (e: JsonObject) => string,
-}
-
 function truncateLine(str: string, max: number = 80) {
   if (str.length <= max) {
     return str;
@@ -36,30 +31,122 @@ function truncateText(str: string, maxLines: number = 16) {
   return [...head, `... [${lines.length - (maxLines - 1)} lines truncated] ...`, ...tail];
 }
 
-// TODO: Fix types and guards.
-const Rules: Rule[] = [{
-  test: (e) => e.type === 'last-prompt',
-  run: (e) => `• last-prompt: ${truncateLine(String(e.lastPrompt))}\n`,
-}, {
-  test: (e) => e.type === 'assistant' &&
-    !Array.isArray(e.message) && typeof(e.message) === 'object' && e.message?.model === '<synthetic>',
-  run: (e) => `• synthetic:\n| ${truncateText(String(e.message.content[0].text)).join('\n| ')}\n`,
-}, {
-  test: (e) => e.type === 'assistant' &&
-    !Array.isArray(e.message) && typeof(e.message) === 'object' && e.message?.content[0].type === 'thinking',
-  run: (e) => `• thinking:\n| ${truncateText(String(e.message.content[0].thinking)).join('\n| ')}\n`,
-}, {
-  test: (e) => e.type === 'assistant' &&
-    !Array.isArray(e.message) && typeof(e.message) === 'object' && e.message?.content[0].text,
-  run: (e) => `• assistant:\n| ${truncateText(String(e.message.content[0].text)).join('\n| ')}\n`,
-}] as const;
+type Rule = (e: unknown) => string | null;
 
-function displayClaudeEvent(e: JsonObject): string {
-  const r = Rules.find(r => r.test(e));
-  if (!r) {
-    return `${JSON.stringify(e)}\n`;
+function Rule<T>(guard: (e: unknown) => e is T, run: (e: T) => string): Rule {
+  return (e: unknown) => {
+    if (!guard(e)) {
+      return null;
+    }
+    return run(e);
   }
-  return r.run(e);
+}
+
+interface LastPrompt {
+  type: 'last-prompt';
+  lastPrompt: string;
+}
+
+function isLastPrompt(e: unknown): e is LastPrompt {
+  return e !== null && typeof e === 'object'
+    && 'type' in e && e.type === 'last-prompt'
+    && 'lastPrompt' in e && typeof e.lastPrompt === 'string'
+    ;
+}
+
+interface AssistantSynthetic {
+  type: 'assistant';
+  message: {
+    model: '<synthetic>';
+    content: {
+      text: string;
+    }[];
+  }
+}
+
+function isAssistantSynthetic(e: unknown): e is AssistantSynthetic {
+  return  e !== null && typeof e === 'object'
+    && 'type' in e && e.type === 'assistant'
+    && 'message' in e && e.message !== null && typeof e.message === 'object'
+    && 'model' in e.message && e.message.model === '<synthetic>'
+    && 'content' in e.message && Array.isArray(e.message.content)
+    && e.message.content.every(
+      c => c !== null && typeof c === 'object' && 'text' in c && typeof c.text === 'string'
+    )
+    ;
+}
+
+interface AssistantThinking {
+  type: 'assistant';
+  message: {
+    type: 'message';
+    content: {
+      type: 'thinking';
+      thinking: string;
+    }[];
+  }
+}
+
+function isAssistantThinking(e: unknown): e is AssistantThinking {
+  return  e !== null && typeof e === 'object'
+    && 'type' in e && e.type === 'assistant'
+    && 'message' in e && e.message !== null && typeof e.message === 'object'
+    && (!('model' in e.message) || e.message.model !== '<synthetic>')
+    && 'type' in e.message && e.message.type === 'message'
+    && 'content' in e.message && Array.isArray(e.message.content)
+    && e.message.content.every(
+      c => c !== null && typeof c === 'object'
+        && 'type' in c && c.type === 'thinking'
+        && 'thinking' in c && typeof c.thinking === 'string'
+    )
+    ;
+}
+
+interface Assistant {
+  type: 'assistant';
+  message: {
+    content: {
+      text: string;
+    }[];
+  }
+}
+
+function isAssistant(e: unknown): e is Assistant {
+  return  e !== null && typeof e === 'object'
+    && 'type' in e && e.type === 'assistant'
+    && 'message' in e && e.message !== null && typeof e.message === 'object'
+    && (!('model' in e.message) || e.message.model !== '<synthetic>')
+    && 'type' in e.message && e.message.type !== 'thinking'
+    && 'content' in e.message && Array.isArray(e.message.content)
+    && e.message.content.every(
+      c => c !== null && typeof c === 'object' && 'text' in c && typeof c.text === 'string'
+    )
+    ;
+}
+// TODO: Improve layout, add some colors, wrap lines etc.
+const Rules: Rule[] = [
+  Rule(isLastPrompt, (e) =>
+    `• last-prompt: ${truncateLine(e.lastPrompt)}\n`
+  ),
+  Rule(isAssistantSynthetic, (e) =>
+    `• synthetic\n| ${e.message.content.map(t => truncateText(t.text)).join('\n| ')}\n`
+  ),
+  Rule(isAssistantThinking, (e) =>
+    `• thinking\n| ${e.message.content.map(t => truncateText(t.thinking)).join('\n| ')}\n`
+  ),
+  Rule(isAssistant, (e) =>
+    `• assistant\n| ${e.message.content.map(t => truncateText(t.text)).join('\n| ')}\n`
+  ),
+] as const;
+
+function displayClaudeEvent(e: unknown): string {
+  for (const r of Rules) {
+    const result = r(e);
+    if (result !== null) {
+      return result;
+    }
+  }
+  return `${JSON.stringify(e)}\n`;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -140,7 +227,7 @@ async function main() {
 
         const result = Bun.JSONL.parseChunk(buffer);
         for (const event of result.values) {
-          process.stdout.write(displayClaudeEvent(event as JsonObject));
+          process.stdout.write(displayClaudeEvent(event));
         }
 
         buffer = buffer.slice(result.read);
