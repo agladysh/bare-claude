@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 
 export type JsonStructure = JsonObject | JsonArray
@@ -103,7 +104,7 @@ export async function spawnClaude<
   const cwd = c.cwd ?? process.cwd();
 
   // Assumes directory to be created if path is supplied.
-  const homeDir = c.ephemeralClaudeHomePath ?? await fs.mkdtemp('bare-claude-home');
+  const homeDir = c.ephemeralClaudeHomePath ?? await fs.mkdtemp(path.join(os.tmpdir(), 'bare-claude-home'));
 
   const s: JsonObject = {
     $schema: 'https://json.schemastore.org/claude-code-settings.json',
