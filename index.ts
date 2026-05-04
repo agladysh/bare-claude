@@ -94,17 +94,37 @@ function LaunchConfig(o: LaunchOptions): LaunchConfig {
   };
 }
 
+interface ClaudeSubprocess<
+  In extends Bun.SpawnOptions.Writable,
+  Out extends Bun.SpawnOptions.Readable,
+  Err extends Bun.SpawnOptions.Readable
+> {
+  subprocess: Bun.Subprocess<In, Out, Err>,
+  ephemeralClaudeHomePath: string,
+  sessionId: string,
+  projectHomePath: string,
+  sessionJsonlPath: string,
+};
+
 export async function spawnClaude<
   In extends Bun.SpawnOptions.Writable,
   Out extends Bun.SpawnOptions.Readable,
   Err extends Bun.SpawnOptions.Readable
->(launchOptions: LaunchOptions, spawnOptions: Bun.Spawn.SpawnOptions<In, Out, Err> = {}) {
+>(
+  launchOptions: LaunchOptions,
+  spawnOptions: Bun.Spawn.SpawnOptions<In, Out, Err> = {}
+): Promise<ClaudeSubprocess<In, Out, Err>> {
   const c = LaunchConfig(launchOptions);
-
   const cwd = c.cwd ?? process.cwd();
 
   // Assumes directory to be created if path is supplied.
-  const homeDir = c.ephemeralClaudeHomePath ?? await fs.mkdtemp(path.join(os.tmpdir(), 'bare-claude-home'));
+  const ephemeralClaudeHomePath = c.ephemeralClaudeHomePath ?? await fs.mkdtemp(
+    path.join(os.tmpdir(), 'bare-claude-home')
+  );
+
+  const sessionId = c.customSessionData?.sessionId ?? Bun.randomUUIDv7();
+  const projectHomePath = path.join(ephemeralClaudeHomePath, 'projects', pathToFilename(cwd));
+  const sessionJsonlPath = path.join(projectHomePath, `${sessionId}.jsonl`)
 
   const s: JsonObject = {
     $schema: 'https://json.schemastore.org/claude-code-settings.json',
@@ -129,7 +149,7 @@ export async function spawnClaude<
     env: {
       ...(c.noProcessEnv ? {} : process.env),
       ...c.extraEnv, // TODO: Why don't we use spawnOptions here?
-      CLAUDE_CONFIG_DIR: homeDir,
+      CLAUDE_CONFIG_DIR: ephemeralClaudeHomePath,
     },
   };
 
@@ -147,6 +167,8 @@ export async function spawnClaude<
 
   if (c.customSessionData) {
     o.cmd.push('--resume', c.customSessionData.sessionId);
+  } else {
+    o.cmd.push('--session-id', sessionId);
   }
 
   o.cmd.push('--effort', c.effortLevel);
@@ -235,24 +257,27 @@ export async function spawnClaude<
 
   o.cmd.push('--print', c.callToAction);
 
+  // Creating unconditionally to simplify watch() logic.
+  fs.mkdir(projectHomePath, { recursive: true });
+
   if (c.customSessionData) {
-    await Bun.file(path.join(homeDir, 'history.jsonl')).write(`${JSON.stringify({
+    await Bun.file(path.join(ephemeralClaudeHomePath, 'history.jsonl')).write(`${JSON.stringify({
       display: 'bare-claude',
       pastedContents: {},
       timestamp: Date.now(),
       project: path.resolve(cwd),
       sessionId: c.customSessionData.sessionId,
     })}\n`);
-
-    const sessionDir = path.join(homeDir, 'projects', pathToFilename(cwd));
-    fs.mkdir(sessionDir, { recursive: true });
-
-    await Bun.file(
-      path.join(sessionDir, `${c.customSessionData.sessionId}.jsonl`)
-    ).write(c.customSessionData.value);
+    await Bun.file(sessionJsonlPath).write(c.customSessionData.value);
   }
 
-  await Bun.file(path.join(homeDir, 'settings.json')).write(`${JSON.stringify(s, null, 2)}\n`);
+  await Bun.file(path.join(ephemeralClaudeHomePath, 'settings.json')).write(`${JSON.stringify(s, null, 2)}\n`);
 
-  return Bun.spawn(o);
+  return {
+    subprocess: Bun.spawn(o),
+    ephemeralClaudeHomePath: ephemeralClaudeHomePath,
+    sessionId,
+    projectHomePath,
+    sessionJsonlPath,
+  }
 }
