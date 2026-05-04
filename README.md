@@ -76,7 +76,7 @@ const claudeProcess = await spawnClaude({
   model: 'openai/gpt-oss-20b',
   callToAction: 'Explain this project to me',
   permissionMode: 'acceptEdits',
-  noMonthership: true,
+  noMothership: true,
   extraEnv: {
     ANTHROPIC_AUTH_TOKEN: 'lmstudio',
     ANTHROPIC_BASE_URL: 'http://localhost:1234',
@@ -122,7 +122,7 @@ Optional:
 - `noIntegrations`: Whether to disable integrations. Defaults to `true`.
 - `noHousekeeping`: Whether to disable housekeeping. Defaults to `true`.
 - `noMothership`: Whether to disable calling the mothership.
-  Defaults to `false` if `launcher` is `clause`, and `false` otherwise.
+  Defaults to `false` if `launcher` is `claude`, and `false` otherwise.
 - `noProcessEnv`: Whether to disable process environment inheritance. Defaults to `false`.
 - `maxOutputLength`: Maximum output length for various Claude components. Defaults to `null` (default).
 - `extraEnv`: Additional environment variables to set for the Claude process.
