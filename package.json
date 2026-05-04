@@ -1,0 +1,36 @@
+{
+  "name": "bare-claude",
+  "description": "A convenience wrapper to run Claude Code headless. Supports alternative providers.",
+  "version": "0.8.0",
+  "license": "MIT",
+  "author": {
+    "name": "Alexander Gladysh",
+    "email": "agladysh@gmail.com",
+    "url": "https://github.com/agladysh/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/agladysh/bare-claude.git"
+  },
+  "bugs": {
+    "url": "https://github.com/agladysh/bare-claude/issues"
+  },
+  "homepage": "https://github.com/agladysh/bare-claude#readme",
+  "funding": {
+    "url": "https://github.com/sponsors/agladysh"
+  },
+  "type": "module",
+  "module": "index.ts",
+  "bin": {
+    "bare-claude": "bin/bare-claude.ts"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  }
+}
