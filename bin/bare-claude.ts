@@ -125,6 +125,32 @@ function isDequeueOperation(e: unknown): e is DequeueOperation {
     ;
 }
 
+interface RemoveOperation {
+  type: 'queue-operation';
+  operation: 'remove';
+}
+
+function isRemoveOperation(e: unknown): e is RemoveOperation {
+  return e !== null && typeof e === 'object'
+    && 'type' in e && e.type === 'queue-operation'
+    && 'operation' in e && e.operation === 'remove'
+    ;
+}
+
+interface PopAllOperation {
+  type: 'queue-operation';
+  operation: 'popAll';
+  content: string;
+}
+
+function isPopAllOperation(e: unknown): e is PopAllOperation {
+  return e !== null && typeof e === 'object'
+    && 'type' in e && e.type === 'queue-operation'
+    && 'operation' in e && e.operation === 'popAll'
+    && 'content' in e && typeof e.content === 'string'
+    ;
+}
+
 interface CustomTitle {
   type: 'custom-title';
   customTitle: string;
@@ -164,6 +190,18 @@ function isTurnDuration(e: unknown): e is TurnDuration {
     && 'durationMs' in e && typeof e.durationMs === 'number'
     && 'messageCount' in e && typeof e.messageCount === 'number'
     && 'timestamp' in e && typeof e.timestamp === 'string'
+    ;
+}
+
+interface ApiError {
+  type: 'system';
+  subtype: 'api_error';
+}
+
+function isApiError(e: unknown): e is ApiError {
+  return e !== null && typeof e === 'object'
+    && 'type' in e && e.type === 'system'
+    && 'subtype' in e && e.subtype === 'api_error'
     ;
 }
 
@@ -403,7 +441,7 @@ interface AssistantAgent {
     content: {
       type: 'tool_use';
       name: 'Agent';
-      input: { description: string, subagent_type: string, prompt: string, model?: string };
+      input: { description: string, subagent_type?: string, prompt: string, model?: string };
     }[];
   }
 }
@@ -421,7 +459,7 @@ function isAssistantAgent(e: unknown): e is AssistantAgent {
         && 'name' in c && c.name === 'Agent'
         && 'input' in c && c.input !== null && typeof c.input === 'object'
         && 'description' in c.input && typeof c.input.description === 'string'
-        && 'subagent_type' in c.input && typeof c.input.subagent_type === 'string'
+        && (!('subagent_type' in c.input) || typeof c.input.subagent_type === 'string')
         && 'prompt' in c.input && typeof c.input.prompt === 'string'
         && (!('model' in c.input) || typeof c.input.model === 'string')
     )
@@ -572,6 +610,39 @@ function isAssistantTaskCreate(e: unknown): e is AssistantTaskCreate {
     ;
 }
 
+interface AssistantTaskUpdate {
+  type: 'assistant';
+  message: {
+    type: 'message';
+    content: {
+      type: 'tool_use';
+      name: 'TaskUpdate';
+      input: {
+        taskId: string;
+        status: string;
+      };
+    }[];
+  }
+}
+
+function isAssistantTaskUpdate(e: unknown): e is AssistantTaskUpdate {
+  return  e !== null && typeof e === 'object'
+    && 'type' in e && e.type === 'assistant'
+    && 'message' in e && e.message !== null && typeof e.message === 'object'
+    && (!('model' in e.message) || e.message.model !== '<synthetic>')
+    && 'type' in e.message && e.message.type === 'message'
+    && 'content' in e.message && Array.isArray(e.message.content)
+    && e.message.content.every(
+      c => c !== null && typeof c === 'object'
+        && 'type' in c && c.type === 'tool_use'
+        && 'name' in c && c.name === 'TaskUpdate'
+        && 'input' in c && c.input !== null && typeof c.input === 'object'
+        && 'taskId' in c.input && typeof c.input.taskId === 'string'
+        && 'status' in c.input && typeof c.input.status === 'string'
+    )
+    ;
+}
+
 interface ExitPlanMode {
   type: 'assistant';
   message: {
@@ -599,6 +670,33 @@ function isExitPlanMode(e: unknown): e is ExitPlanMode {
     ;
 }
 
+interface EnterPlanMode {
+  type: 'assistant';
+  message: {
+    type: 'message';
+    content: {
+      type: 'tool_use';
+      name: 'EnterPlanMode';
+    }[];
+  }
+}
+
+function isEnterPlanMode(e: unknown): e is EnterPlanMode {
+  return  e !== null && typeof e === 'object'
+    && 'type' in e && e.type === 'assistant'
+    && 'message' in e && e.message !== null && typeof e.message === 'object'
+    && (!('model' in e.message) || e.message.model !== '<synthetic>')
+    && 'type' in e.message && e.message.type === 'message'
+    && 'content' in e.message && Array.isArray(e.message.content)
+    && e.message.content.every(
+      c => c !== null && typeof c === 'object'
+        && 'type' in c && c.type === 'tool_use'
+        && 'name' in c && c.name === 'EnterPlanMode'
+        && 'input' in c && c.input !== null && typeof c.input === 'object'
+    )
+    ;
+}
+
 interface OtherToolUse {
   type: 'assistant';
   message: {
@@ -621,15 +719,19 @@ function isOtherToolUse(e: unknown): e is OtherToolUse {
     && e.message.content.every(
       c => c !== null && typeof c === 'object'
         && 'type' in c && c.type === 'tool_use'
-        && 'name' in c
+        && 'name' in c // Make sure to list all supportedtools here.
           && c.name !== 'Bash'
+          && c.name !== 'Grep'
           && c.name !== 'Write'
+          && c.name !== 'Edit'
           && c.name !== 'Read'
           && c.name !== 'Skill'
           && c.name !== 'Agent'
           && c.name !== 'ToolSearch'
           && c.name !== 'AskUserQuestion'
           && c.name !== 'TaskCreate'
+          && c.name !== 'TaskUpdate'
+          && c.name !== 'EnterPlanMode'
           && c.name !== 'ExitPlanMode'
         && 'input' in c && c.input !== null && typeof c.input === 'object'
     )
@@ -815,10 +917,6 @@ function isCommandPermissionsAttachment(e: unknown): e is CommandPermissionsAtta
     ;
 }
 
-// TODO: This needs to support even more events.
-//       Use this file ~/.claude/projects/-Users-agladysh-rs-contract-unit/149fe6d5-fc0f-4427-9db7-7d7959956c0d.jsonl
-//       Run with --debug --verbose --display
-//       Weed out all unsupported tool calls and event types: everything should be supported
 // TODO: Improve layout, add some colors, wrap lines etc.
 const Rules: Rule[] = [
   Verbose(isFileHistorySnapshot, (e) =>
@@ -832,6 +930,12 @@ const Rules: Rule[] = [
   ),
   Verbose(isDequeueOperation, () =>
     `• Dequeue\n`
+  ),
+  Verbose(isPopAllOperation, (e) =>
+    `• Pop All\n| ${truncateText(e.content).join('\n| ')}\n`
+  ),
+  Verbose(isRemoveOperation, () =>
+    `• Remove\n`
   ),
   Rule(isCustomTitle, (e) =>
     `• Custom Title\n| ${truncateText(e.customTitle).join('\n| ')}\n`
@@ -914,6 +1018,14 @@ const Rules: Rule[] = [
       truncateText(t.input.description),
     ]).flat(Infinity).join('\n| ')}\n`
   ),
+  Rule(isAssistantTaskUpdate, (e) =>
+    `• Task Update\n| ${e.message.content.map(t => [
+      `${t.input.taskId}: ${t.input.status}`,
+    ]).flat(Infinity).join('\n| ')}\n`
+  ),
+  Rule(isEnterPlanMode, () =>
+    `• Enter Plan Mode\n`
+  ),
   Rule(isExitPlanMode, () =>
     `• Exit Plan Mode\n`
   ),
@@ -937,6 +1049,9 @@ const Rules: Rule[] = [
   ),
   Rule(isTurnDuration, (e) =>
     `• Turn Duration\n| ${e.durationMs}ms, ${e.messageCount} messages\n`
+  ),
+  Rule(isApiError, () =>
+    `• API Error\n`
   ),
 ] as const;
 
