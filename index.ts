@@ -254,25 +254,5 @@ export async function spawnClaude<
 
   await Bun.file(path.join(homeDir, 'settings.json')).write(`${JSON.stringify(s, null, 2)}\n`);
 
-  //   permissions: {
-  //     // TODO: Deny stuff!
-  //     allow: [
-  //       'Read',
-  //       'Glob',
-  //       'Grep',
-  //       'Bash(git status :*)', // TODO: Arbitrary
-  //       'Write',
-  //       'Edit',
-  //     ],
-  //   },
-  //   // attribution: 'Commit Signature' would be nice
-  //   // filesystem.allowWrite
-  //   // filesystem.denyWrite
-  //   // filesystem.denyRead
-  //   // filesystem.allowRead
-  //   env: {
-  //     // Semi-hermeutic, no agent files skills etc, but proper system message, with addendum.
-  //     // TODO: This has much useful stuff https://code.claude.com/docs/en/env-vars
-
   return Bun.spawn(o);
 }
