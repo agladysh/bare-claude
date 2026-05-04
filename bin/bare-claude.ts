@@ -334,6 +334,38 @@ function isAssistantRead(e: unknown): e is AssistantRead {
     ;
 }
 
+interface AssistantEdit {
+  type: 'assistant';
+  message: {
+    type: 'message';
+    content: {
+      type: 'tool_use';
+      name: 'Edit';
+      input: { file_path: string, old_string: string, new_string: string, replace_all?: boolean };
+    }[];
+  }
+}
+
+function isAssistantEdit(e: unknown): e is AssistantEdit {
+  return  e !== null && typeof e === 'object'
+    && 'type' in e && e.type === 'assistant'
+    && 'message' in e && e.message !== null && typeof e.message === 'object'
+    && (!('model' in e.message) || e.message.model !== '<synthetic>')
+    && 'type' in e.message && e.message.type === 'message'
+    && 'content' in e.message && Array.isArray(e.message.content)
+    && e.message.content.every(
+      c => c !== null && typeof c === 'object'
+        && 'type' in c && c.type === 'tool_use'
+        && 'name' in c && c.name === 'Edit'
+        && 'input' in c && c.input !== null && typeof c.input === 'object'
+        && 'file_path' in c.input && typeof c.input.file_path === 'string'
+        && 'old_string' in c.input && typeof c.input.old_string === 'string'
+        && 'new_string' in c.input && typeof c.input.new_string === 'string'
+        && (!('replace_all' in c.input) || typeof c.input.replace_all === 'boolean')
+    )
+    ;
+}
+
 interface AssistantSkill {
   type: 'assistant';
   message: {
@@ -802,6 +834,16 @@ const Rules: Rule[] = [
   ),
   Rule(isAssistantRead, (e) =>
     `• Read\n| ${e.message.content.map(t => t.input.file_path).flat(Infinity).join('\n| ')}\n`
+  ),
+  Rule(isAssistantEdit, (e) =>
+    `• Edit\n| ${e.message.content.map(t => [
+      t.input.file_path,
+      t.input.replace_all ? 'Replace All' : undefined,
+      'Old',
+      truncateText(t.input.old_string),
+      'New',
+      truncateText(t.input.new_string),
+    ].filter(Boolean).flat(Infinity).join('\n| '))}\n`
   ),
   Rule(isAssistantSkill, (e) =>
     `• Skill\n| ${e.message.content.flatMap(t => [ t.input.skill, t.input.args ].filter(Boolean)).join('\n| ')}\n`
