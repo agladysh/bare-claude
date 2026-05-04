@@ -1,6 +1,5 @@
 import * as Bun from 'bun';
 
-import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import type { SessionEvent } from '@agladysh/bare-claude/events';
