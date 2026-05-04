@@ -193,7 +193,7 @@ function isAssistantThinking(e: unknown): e is AssistantThinking {
       c => c !== null && typeof c === 'object'
         && 'type' in c && c.type === 'thinking'
         && 'thinking' in c && typeof c.thinking === 'string' && c.thinking !== ''
-        && !('signature' in c)
+        && !('signature' in c || c.signature === '')
     )
     ;
 }
