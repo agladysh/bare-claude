@@ -1,6 +1,6 @@
-# bare-claude
+# Bare Claude
 
-A convenience wrapper to run Claude Code in bare headless mode. Supports alternative providers.
+A wrapper to run Claude Code in bare headless mode. Supports alternative providers.
 
 Uses the system `claude` executable, and, by default, its auth session.
 
