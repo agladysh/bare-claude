@@ -181,7 +181,7 @@ const Rules: Rule[] = [
     `• Tool\n| ${e.message.content.flatMap(t => [ t.name, JSON.stringify(t.input) ]).join('\n| ')}\n`
   ),
   Rule(Event.isAssistant, (e) =>
-    `• Assistant\n| ${e.message.content.flatMap(t => truncateText(t.text)).join('\n| ')}\n`
+    `• Assistant\n| ${e.message.content.flatMap(t => truncateText(t.text, Infinity)).join('\n| ')}\n`
   ),
   Rule(Event.isToolResult, (e) =>
     `> ${e.message.content.flatMap(t => truncateText(t.content)).join('\n| ')}\n`
