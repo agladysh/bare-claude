@@ -69,6 +69,16 @@ const { values, positionals } = parseArgs({
 positionals.shift(); // Bun
 positionals.shift(); // Script name
 
+async function globFilenames(patterns: string[]): Promise<string[]> {
+  if (patterns.length === 0) {
+    return [];
+  }
+
+  const output = await $ `git ls-files --cached --others --exclude-standard --deduplicate -z -- ${patterns}`.text();
+
+  return output.split('\0').filter(Boolean);
+}
+
 async function main() {
   if (values.version) {
     process.stdout.write(`${pkg.version}\n`);
@@ -92,8 +102,11 @@ async function main() {
   }
 
   let customSessionData: LaunchOptions['customSessionData'] = null;
-  if (values.read) {
+  const filenames = await globFilenames(values.read ?? []);
+
+  if (filenames.length > 0) {
     const sessionId = Bun.randomUUIDv7();
+
     const builder = new SessionBuilder(
       sessionId,
       (await $ `claude --version`.text()).replace(' (Claude Code)', '').trim(),
@@ -101,7 +114,8 @@ async function main() {
       (await $`git branch --show-current`.text()).trim(),
       values.model ?? '<synthetic>'
     );
-    for (const filename of values.read) {
+
+    for (const filename of filenames) {
       const file = Bun.file(filename);
       if (!file.exists()) {
         process.stderr.write(`File "${filename}" does not exist, cannot Read`);
@@ -113,6 +127,7 @@ async function main() {
       }
       builder.emitRead(filename, await file.text());
     }
+
     customSessionData = {
       sessionId,
       value: builder.commit().map(e => JSON.stringify(e)).join('\n'),
