@@ -19,28 +19,6 @@ your use of the software with the Anthropic subscription is at your own risk.
 
 The Anthropic API key use and alternate model provider use should be okay.
 
-## Command Line Usage
-
-```shell
-bunx @agladysh/bare-claude --launcher ollama --model nemotron-3-super:cloud 'Explain this project to me'
-```
-
-```shell
-bare-claude --read README.md --read src/index.ts 'Review the API documentation in the README.md'
-```
-
-Options:
-
-- `--launcher [value]`: `claude` for native Anthropic modes (default), `ollama` for `ollama launch`
-- `--model [model]`: model to be used
-- `--verbose`: print more events in transcript
-- `--quiet`: do not print transcript at all
-- `--print`: print Claude Code console output (what `claude --print` prints),
-  use with `--quiet` when you need the last assistant message only
-- `--display [file.jsonl]`: print existing transcript
-- `--read [file]`: preload non-gitignored file in a synthetic session, may be included several times, supports
-  [Git pathspec patterns](https://git-scm.com/docs/gitglossary#Documentation/gitglossary.txt-pathspec)
-
 ## Installation
 
 ```bash
@@ -52,6 +30,168 @@ Or globally:
 ```bash
 bun add -g @agladysh/bare-claude
 ```
+
+## Command Line Usage
+
+```shell
+# Run without installing
+bunx @agladysh/bare-claude --launcher ollama --model nemotron-3-super:cloud -- 'Explain this project to me'
+
+# Pre-read files
+bare-claude --read README.md --read src/index.ts -- 'Review the API documentation in the README.md'
+
+# Use the configuration file's defaults
+bare-claude -- 'Explain this project'
+
+# Override the model from the command line
+bare-claude --model claude-4.7-opus -- 'Explain this project'
+
+# Use a named preset
+bare-claude --use claude -- 'Explain this project'
+```
+
+Options:
+
+- `--use [presetId]`: use configuration preset `presetId`
+- `--launcher [value]`: `claude` for native Anthropic modes (default), `ollama` for `ollama launch`
+- `--model [model]`: model to be used
+- `--verbose`: print more events in transcript
+- `--quiet`: do not print transcript at all
+- `--print`: print Claude Code console output (what `claude --print` prints),
+  use with `--quiet` when you need the last assistant message only
+- `--display [file.jsonl]`: print existing transcript
+- `--read [file]`: preload non-gitignored file in a synthetic session, may be included several times, supports
+  [Git pathspec patterns](https://git-scm.com/docs/gitglossary#Documentation/gitglossary.txt-pathspec)
+
+### Configuration
+
+Bare Claude can be configured via a `bare-claude.yaml` file located at the root of the Git working copy.
+This file is optional and allows you to set default values for command-line options and define named presets.
+
+Elaborate example: see [`bare-claude.yaml`](./bare-claude.yaml) in this repository.
+
+A configuration file data is a Preset (see below) with an optional extra `presets` field,
+containing record of named presets.
+
+#### Preset
+
+A Preset is a record with any of the fields from the `LaunchOptions` (below) and command line options (above).
+
+Minimal practical configuration file consists of a root configuration file Preset.
+
+Example:
+
+```yaml
+quiet: true
+print: true
+callToAction: Run `git diff` and explain it to me
+```
+
+Since presets are technically allowed to be empty, degeneratively minimal valid configuration file is empty.
+
+Root configuration file Preset fields are merged with the command line arguments, arguments taking precedence.
+Exception is the `use` root field and `--use` argument: if argument is specified, field is ignored.
+
+##### Array Fields
+
+Array fields `use` and `read` may be specified as strings, not arrays, when you need only one value:
+
+This is the same...
+
+```yaml
+use: foo
+read: bar
+```
+
+...as this:
+
+```yaml
+use:
+  - foo
+read:
+  - bar
+```
+
+### Presets
+
+You can define named Presets:
+
+```yaml
+presets:
+  ollama:
+    launcher: ollama
+    model: nemotron-3-super:cloud
+  claude:
+    launcher: claude
+```
+
+### Inheritance
+
+Presets may inherit values from other presets via the `use` field.
+One or several preset IDs may be specified.
+
+```yaml
+presets:
+  withCode:
+    read:
+      - '*.ts'
+  withDocs:
+    read:
+      - '*.md'
+  withAll:
+    use:
+      - withCode
+      - withDocs
+```
+
+#### Preset Resolution Order
+
+Presets are merged in the following order (later sources override earlier ones):
+
+1. Default values (hardcoded in the application)
+2. Values from `bare-claude.yaml` (top-level keys, excluding the `presets` section)
+3. Values from presets specified by the `--use` option or `use` Preset field
+   (can be a single Preset or a list; Presets are merged left to right,
+   with later Presets overriding earlier ones)
+4. Command-line options
+
+Arrays are merged by concatenation. The `use` field is not merged.
+
+Example:
+
+This `bare-claude.yaml` file...
+
+```yaml
+use: claude
+read: '*.ts'
+
+presets:
+  claude:
+    launcher: claude
+  ollama:
+    launcher: ollama
+    model: nemotron-3-super:cloud
+```
+
+Invoked with these command line arguments:
+
+```bash
+bare-claude --use ollama --read '*.md' --verbose -- 'Explain this project to me'
+```
+
+Will result in the following configuration:
+
+```yaml
+verbose: true
+launcher: ollama
+model: nemotron-3-super:cloud
+read:
+  - '*.ts'
+  - '*.md'
+callToAction: Explain this project to me
+```
+
+Note command-line `--use` overrode `use` field from the configuration file root Preset.
 
 ## Programmatic Usage
 
@@ -164,7 +304,7 @@ When `debug` is `true`, displays only unsupported events, supported events are s
 
 ### Examples
 
-See `bin/bare-claude.ts` for more advanced usage example.
+See [`bin/bare-claude.ts`](./bin/bare-claude.ts) for more advanced usage example.
 
 ## Assumptions
 

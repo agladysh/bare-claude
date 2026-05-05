@@ -1,0 +1,29 @@
+# Bare Claude Configuration
+
+# TODO: Specify schema file
+
+use: default
+
+presets:
+  ollama:
+    launcher: ollama
+    model: nemotron-3-super:cloud
+
+  default:
+    use: ollama # Can be an array
+    quiet: false
+    verbose: false
+    debug: false
+    permissionMode: acceptEdits
+
+  changelog:
+    use: default
+    read:
+      - './README.md'
+      - './CHANGELOG.md'
+    # TODO: This would benefit from git log + diff since last tag Bash tool preload etc.
+    # TODO: This wolld benefit from allowlist/sandbos disallowing Write tool
+    #       and allowing only Edit tool on CHANGELOG.md
+    callToAction: >
+      Review the changes from the last version tag, research and prepare the CHANGELOG.md entry
+      for the next release.

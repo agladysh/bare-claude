@@ -336,6 +336,12 @@ export async function spawnClaude<
     ollama: () => o.cmd.push('ollama', 'launch', 'claude', ...modelFlag(c), '--yes', '--'),
   };
 
+  if (!(c.launcher in Launchers)) {
+    throw new Error(
+      `Unknown launcher "${c.launcher}", known launchers are ${Object.keys(launcher).join(', ')}`
+    );
+  }
+
   launcher[c.launcher]();
 
   if (c.model) {
