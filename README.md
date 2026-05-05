@@ -163,6 +163,14 @@ When `debug` is `true`, displays only unsupported events, supported events are s
 
 See `bin/bare-claude.ts` for more advanced usage example.
 
+## Assumptions
+
+The current version of the Bare Claude makes the following assumptions:
+
+- Claude Code executable, `claude`, is installed and available in `PATH`
+- `bare-claude` is run inside a Git working copy
+- `git` is installed and available in `PATH`
+
 ## License
 
 MIT
