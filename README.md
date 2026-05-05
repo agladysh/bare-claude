@@ -36,7 +36,8 @@ Options:
 - `--quiet`: do not print transcript
 - `--verbose`: print more events in transcript
 - `--display [file.jsonl]`: print existing transcript
-- `--read [file]`: preload file in a synthetic session
+- `--read [file]`: preload non-gitignored file in a synthetic session, may be included several times, supports
+  [Git pathspec patterns](https://git-scm.com/docs/gitglossary#Documentation/gitglossary.txt-pathspec)
 
 ## Installation
 
