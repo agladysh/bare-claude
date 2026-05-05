@@ -1,7 +1,7 @@
 {
   "name": "@agladysh/bare-claude",
   "description": "A convenience wrapper to run Claude Code headless. Supports alternative providers.",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "license": "MIT",
   "publishConfig": {
     "access": "public"
