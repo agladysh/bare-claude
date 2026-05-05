@@ -65,7 +65,6 @@ async function loadPreset(): Promise<Preset | null> {
       },
       verbose: {
         type: 'boolean',
-        default: false,
       },
       read: {
         type: 'string',
@@ -75,27 +74,22 @@ async function loadPreset(): Promise<Preset | null> {
       // TODO: support emitBash() as well?
       debug: {
         type: 'boolean',
-        default: false,
       },
       quiet: {
         type: 'boolean',
         short: 'q',
-        default: false,
       },
       print: {
         type: 'boolean',
         short: 'p',
-        default: false,
       },
       version: {
         type: 'boolean',
         short: 'v',
-        default: false,
       },
       help: {
         type: 'boolean',
         short: 'h',
-        default: false,
       },
       display: {
         type: 'string',
@@ -121,7 +115,11 @@ async function loadPreset(): Promise<Preset | null> {
   if (values.display) {
     const result = Bun.JSONL.parse(await Bun.file(values.display).text());
     for (const event of result) {
-      process.stdout.write(displayClaudeEvent(event, values));
+      process.stdout.write(displayClaudeEvent(event, {
+        // TODO: These probably should also come from the preset?
+        debug: Boolean(values.debug),
+        verbose: Boolean(values.verbose)
+      }));
     }
     return null;
   }
