@@ -33,8 +33,9 @@ Options:
 
 - `--launcher [value]`: `claude` for native Anthropic modes (default), `ollama` for `ollama launch`
 - `--model [model]`: model to be used
-- `--quiet`: do not print transcript
 - `--verbose`: print more events in transcript
+- `--quiet`: do not print transcript at all
+- `--print`: print Claude Code console output (what `claude --print` prints)
 - `--display [file.jsonl]`: print existing transcript
 - `--read [file]`: preload non-gitignored file in a synthetic session, may be included several times, supports
   [Git pathspec patterns](https://git-scm.com/docs/gitglossary#Documentation/gitglossary.txt-pathspec)

@@ -48,6 +48,11 @@ const { values, positionals } = parseArgs({
       short: 'q',
       default: false,
     },
+    print: {
+      type: 'boolean',
+      short: 'p',
+      default: false,
+    },
     version: {
       type: 'boolean',
       short: 'v',
@@ -140,7 +145,7 @@ async function main() {
     callToAction: positionals.join(' '),
     permissionMode: 'acceptEdits',
     customSessionData,
-  });
+  }, { stdout: values.print ? 'inherit' : 'pipe' });
 
   if (values.verbose || values.debug) {
     process.stdout.write(`${claude.sessionJsonlPath}\n`);
