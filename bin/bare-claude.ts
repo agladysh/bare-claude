@@ -154,6 +154,10 @@ async function main() {
     return 0;
   }
 
+  if (preset.debug) {
+    process.stdout.write(`Configuration:\n${JSON.stringify(preset, null, 2)}\n`);
+  }
+
   const filenames = await globFilenames(preset.read ?? []);
   if (filenames.length > 0) {
     const sessionId = preset.customSessionData?.sessionId ?? Bun.randomUUIDv7();
