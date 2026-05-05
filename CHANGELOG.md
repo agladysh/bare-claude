@@ -1,5 +1,16 @@
 # Changelog
 
+## [v0.8.6] - 2026-05-05
+
+### Added
+- Print resulting configuration when `--debug` flag is used
+
+### Fixed
+- Removed CLI option defaults (no change in semantics) that were preventing boolean CLI flags in presets from working
+
+### Changed
+- Refined bare-claude.yaml for better readability
+
 ## [v0.8.5] - 2026-05-05
 
 ### Added
