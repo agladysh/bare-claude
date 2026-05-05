@@ -35,7 +35,8 @@ Options:
 - `--model [model]`: model to be used
 - `--verbose`: print more events in transcript
 - `--quiet`: do not print transcript at all
-- `--print`: print Claude Code console output (what `claude --print` prints)
+- `--print`: print Claude Code console output (what `claude --print` prints),
+  use with `--quiet` when you need the last assistant message only
 - `--display [file.jsonl]`: print existing transcript
 - `--read [file]`: preload non-gitignored file in a synthetic session, may be included several times, supports
   [Git pathspec patterns](https://git-scm.com/docs/gitglossary#Documentation/gitglossary.txt-pathspec)
