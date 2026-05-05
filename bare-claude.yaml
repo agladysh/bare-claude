@@ -10,19 +10,18 @@ presets:
     model: nemotron-3-super:cloud
 
   default:
-    use: ollama # Can be an array
-    quiet: false
-    verbose: false
-    debug: false
+    use: ollama
     permissionMode: acceptEdits
 
   changelog:
     use: default
+    quiet: true
+    print: true
     read:
       - './README.md'
       - './CHANGELOG.md'
     # TODO: This would benefit from git log + diff since last tag Bash tool preload etc.
-    # TODO: This wolld benefit from allowlist/sandbos disallowing Write tool
+    # TODO: This wolld benefit from allowlist/sandbox disallowing Write tool
     #       and allowing only Edit tool on CHANGELOG.md
     callToAction: >
       Review the changes from the last version tag, research and prepare the CHANGELOG.md entry
