@@ -31,7 +31,8 @@
     "automation",
     "code-generation",
     "ollama",
-    "llm"
+    "llm",
+    "byollm"
   ],
   "type": "module",
   "module": "src/index.ts",
