@@ -645,6 +645,36 @@ export function isOtherToolUse(e: unknown): e is OtherToolUse {
     );
 }
 
+interface ToolUse {
+  type: 'assistant';
+  message: {
+    type: 'message';
+    content: {
+      type: 'tool_use';
+      id: string;
+      name: string;
+      input: object;
+    }[];
+  };
+}
+
+// Pairing helper, not a display shape: captures the id a tool_result refers back to.
+// Deliberately does not exclude '<synthetic>' so preloaded pairs are captured too.
+export function isToolUse(e: unknown): e is ToolUse {
+  return e !== null && typeof e === 'object'
+    && 'type' in e && e.type === 'assistant'
+    && 'message' in e && e.message !== null && typeof e.message === 'object'
+    && 'type' in e.message && e.message.type === 'message'
+    && 'content' in e.message && Array.isArray(e.message.content)
+    && e.message.content.every(
+      c => c !== null && typeof c === 'object'
+        && 'type' in c && c.type === 'tool_use'
+        && 'id' in c && typeof c.id === 'string'
+        && 'name' in c && typeof c.name === 'string'
+        && 'input' in c && c.input !== null && typeof c.input === 'object'
+    );
+}
+
 interface Assistant {
   type: 'assistant';
   message: {
@@ -671,6 +701,7 @@ interface ToolResult {
   message: {
     content: {
       type: 'tool_result';
+      tool_use_id?: string;
       content: string;
     }[];
   };
@@ -685,6 +716,7 @@ export function isToolResult(e: unknown): e is ToolResult {
     && e.message.content.every(
       c => c !== null && typeof c === 'object'
         && 'type' in c && c.type === 'tool_result'
+        && (!('tool_use_id' in c) || typeof c.tool_use_id === 'string')
         && 'content' in c && typeof c.content === 'string'
     );
 }
@@ -694,6 +726,7 @@ interface ToolResultArray {
   message: {
     content: {
       type: 'tool_result';
+      tool_use_id?: string;
       content: {
         text: string;
       }[];
@@ -710,6 +743,7 @@ export function isToolResultArray(e: unknown): e is ToolResultArray {
     && e.message.content.every(
       c => c !== null && typeof c === 'object'
         && 'type' in c && c.type === 'tool_result'
+        && (!('tool_use_id' in c) || typeof c.tool_use_id === 'string')
         && 'content' in c && Array.isArray(c.content)
         && c.content.every(
           (cc: unknown) => cc !== null && typeof cc === 'object'
