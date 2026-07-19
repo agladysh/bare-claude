@@ -110,10 +110,10 @@ const Rules: Rule[] = [
     `• Thinking\n| ${e.message.content.flatMap(t => truncateText(t.thinking)).join('\n| ')}\n`
   ),
   Rule(Event.isBash, (e) =>
-    `• Bash\n| ${e.message.content.map(t => [
-      t.input.description && truncateLine(t.input.description),
-      truncateText(t.input.command) ]
-    ).filter(Boolean).flat(Infinity).join('\n| ')}\n`
+    `• Bash\n| ${e.message.content.flatMap(t => [
+      ...(t.input.description ? [truncateLine(t.input.description)] : []),
+      ...truncateText(t.input.command) ]
+    ).join('\n| ')}\n`
   ),
   Rule(Event.isWrite, (e) =>
     `• Write\n| ${e.message.content.map(t => [ t.input.file_path, truncateText(t.input.content) ]).flat(Infinity).join('\n| ')}\n`
