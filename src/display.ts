@@ -19,6 +19,9 @@ function truncateText(str: string, maxLines: number = 16) {
   return [...head, `... [${lines.length - head.length - tail.length} lines truncated] ...`, ...tail];
 }
 
+// Pairs a tool_result back to the tool that produced it; on a miss the result renders in full.
+const toolNamesById = new Map<string, string>();
+
 interface RuleOptions {
   verbose: boolean;
   debug: boolean;
@@ -183,11 +186,19 @@ const Rules: Rule[] = [
   Rule(Event.isAssistant, (e) =>
     `• Assistant\n| ${e.message.content.flatMap(t => truncateText(t.text, Infinity)).join('\n| ')}\n`
   ),
-  Rule(Event.isToolResult, (e) =>
-    `> ${e.message.content.flatMap(t => truncateText(t.content)).join('\n| ')}\n`
+  Rule(Event.isToolResult, (e, o) =>
+    `> ${e.message.content.flatMap(t =>
+      (!o.verbose && t.tool_use_id !== undefined && toolNamesById.get(t.tool_use_id) === 'Read')
+        ? `[${t.content.split('\n').length} lines]`
+        : truncateText(t.content)
+    ).join('\n| ')}\n`
   ),
-  Rule(Event.isToolResultArray, (e) =>
-    `> ${e.message.content.flatMap(t => t.content.flatMap(c => truncateText(c.text))).join('\n| ')}\n`
+  Rule(Event.isToolResultArray, (e, o) =>
+    `> ${e.message.content.flatMap(t =>
+      (!o.verbose && t.tool_use_id !== undefined && toolNamesById.get(t.tool_use_id) === 'Read')
+        ? `[${t.content.reduce((n, c) => n + c.text.split('\n').length, 0)} lines]`
+        : t.content.flatMap(c => truncateText(c.text))
+    ).join('\n| ')}\n`
   ),
   Rule(Event.isUser, (e) =>
     `• User\n| ${truncateText(e.message.content).join('\n| ')}\n`
@@ -204,6 +215,11 @@ const Rules: Rule[] = [
 ] as const;
 
 export function displayClaudeEvent(e: unknown, o: RuleOptions): string {
+  if (Event.isToolUse(e)) {
+    for (const c of e.message.content) {
+      toolNamesById.set(c.id, c.name);
+    }
+  }
   for (const r of Rules) {
     const result = r(e, o);
     if (result !== null) {
