@@ -1,0 +1,83 @@
+#!/usr/bin/env bun
+/**
+ * Fake `claude`, standing in for the real subprocess `spawnClaude` execs.
+ *
+ * Never touches a model or the network. `bin/bare-claude.ts`'s own spawn path
+ * (`spawnClaude`, `buildArgv`, `buildEnv`) is untouched here — a test drives
+ * it by putting this script's directory first on `PATH`, so `Bun.spawn`
+ * resolves the literal `claude` in `buildArgv`'s command vector to this file
+ * instead of the real binary. What it needs to fake:
+ *
+ * - `spawnClaude` creates `CLAUDE_CONFIG_DIR/projects/<cwd>/` before spawning
+ *   (so a session-file watcher has something to watch), and passes the
+ *   session id via `--session-id` (fresh run) or `--resume` (resumed run).
+ *   This finds that one directory and writes `<sessionId>.jsonl` into it —
+ *   a real run's session transcript, in miniature.
+ * - `--print` is always the flag immediately before the call to action, and
+ *   the call to action is always the last argv element (measured constraint
+ *   in `buildArgv`), so `argv.at(-1)` recovers it without flag parsing.
+ *
+ * Behaviour a test needs to control is read from the environment, not argv,
+ * so one script serves every scenario in `spawn.test.ts`:
+ *
+ *   FAKE_CLAUDE_EXIT_CODE      - process exit code. Default `'0'`.
+ *   FAKE_CLAUDE_STDOUT         - text written to this process's stdout,
+ *                                standing in for what `claude --print` itself
+ *                                would print. Default: the call to action
+ *                                followed by a canned reply.
+ *   FAKE_CLAUDE_WRITE_SESSION  - `'0'` skips writing the session file
+ *                                entirely, simulating a crash or a refused
+ *                                launch before Claude Code ever created one.
+ *                                Default writes it.
+ */
+import fs from 'node:fs/promises';
+import path from 'node:path';
+
+const argv = process.argv.slice(2);
+
+function flagValue(name: string): string | undefined {
+  const i = argv.indexOf(name);
+  return i === -1 ? undefined : argv[i + 1];
+}
+
+const sessionId = flagValue('--session-id') ?? flagValue('--resume') ?? 'fake-session';
+const callToAction = argv.at(-1) ?? '';
+
+const configDir = process.env.CLAUDE_CONFIG_DIR;
+if (configDir === undefined) {
+  process.stderr.write('fake claude: CLAUDE_CONFIG_DIR is not set\n');
+  process.exit(1);
+}
+
+if (process.env.FAKE_CLAUDE_WRITE_SESSION !== '0') {
+  const projectsDir = path.join(configDir, 'projects');
+  const projectDirs = await fs.readdir(projectsDir);
+  if (projectDirs.length !== 1) {
+    process.stderr.write(
+      `fake claude: expected exactly one project directory under ${projectsDir}, found ${projectDirs.length}\n`
+    );
+    process.exit(1);
+  }
+
+  const sessionPath = path.join(projectsDir, projectDirs[0] ?? '', `${sessionId}.jsonl`);
+
+  // A small, plausible transcript: the prompt echoed back, then a reply.
+  // Real enough for TranscriptRenderer to recognize both records.
+  const records: object[] = [
+    { type: 'user', message: { role: 'user', content: callToAction } },
+    {
+      type: 'assistant',
+      message: {
+        model: 'fake-claude', type: 'message', role: 'assistant',
+        content: [ { type: 'text', text: 'Done.' } ],
+      },
+    },
+  ];
+
+  for (const record of records) {
+    await fs.appendFile(sessionPath, `${JSON.stringify(record)}\n`);
+  }
+}
+
+process.stdout.write(process.env.FAKE_CLAUDE_STDOUT ?? `${callToAction}\n\nDone.\n`);
+process.exit(Number(process.env.FAKE_CLAUDE_EXIT_CODE ?? '0'));
