@@ -1,281 +1,185 @@
 # Bare Claude — Session Event Stream Rendering Reference
 
-Source of truth: `src/events.ts` (type guards, one per recognized shape) and `src/display.ts` (the ordered `Rules` table + fallback). Real transcript sampled from `session-events-example.txt`; project context from `README.md`. This reference describes what `displayClaudeEvent(e, { verbose, debug })` recognizes and renders.
+Source of truth: `src/events.ts` (type guards, one per recognized shape) and `src/display.ts` (the ordered rule tables + fallback). This reference describes what `TranscriptRenderer` recognizes and renders. Symbols are cited by name, never by line number — line numbers rot within a commit.
+
+Corpus figures below were measured on 2026-07-26 against `~/.claude/projects/**/*.jsonl` on the author's machine: 954 session files, ~102 000 records, written by `claude` 2.1.220 and its predecessors. Re-measure, and re-date, when they stop holding.
+
+## Rendering is per content block, not per record
+
+A record is dispatched in two stages.
+
+1. **Standalone events** — `EventRules` is walked first. These are the metadata records that carry no `message.content` array, plus `user` records whose content is a bare string.
+2. **Content blocks** — if the record is a `BlockMessage` (`type` is `assistant` or `user` and `message.content` is an array), every block in that array is dispatched independently through `AssistantBlockRules` or `UserBlockRules`, and the results are concatenated in order.
+
+The two stages are disjoint, so their relative order is not load-bearing; order *within* a table is.
+
+This matters because the guards used to be written with `content.every(...)`, which meant a record only matched when *all* of its blocks agreed. A record mixing prose with a tool call, or carrying two tool calls, matched no specific guard, was rejected by the catch-all tool guard (a known tool name was present) and by the prose guard (a `tool_use` block has no `text`), and therefore rendered as **nothing**. Measured: 11 such records, every one of them in a subagent transcript or from a non-Opus model (`glm-5.2`, `claude-fable-5`, `claude-opus-4-8`). All 11 render now.
+
+Single-block records — 99.98% of the corpus — render byte-for-byte as they did before the split.
+
+### Falling through
+
+- A block no rule matches renders as `JSON.stringify(block)` under `--verbose`/`--debug`, and as `''` otherwise.
+- A record where **not one** block matched falls through to the whole-record fallback instead, so the envelope (model, uuid, timestamps) stays visible for a genuinely unknown shape.
+- The whole-record fallback is `JSON.stringify(record)` under `--verbose`/`--debug`, `''` otherwise.
+
+Measured after the split: **zero** unrecognized content blocks across the corpus, and zero unrecognized `assistant`/`user` records.
 
 ## Rule combinators (from `display.ts`)
 
-The dispatcher walks `Rules` in array order and returns the first non-`null` result; a matched-but-suppressed rule returns `''` (empty string), which still stops the walk.
+Each table is walked in array order; the first rule to return a non-`null` value wins, and `''` is a value. "Matching" and "rendering" are separate: a rule that matches but has nothing to say at the current verbosity returns `''`, which still stops the walk. That is what keeps a quiet block from leaking into a later catch-all.
 
-- **Always** — `Rule(guard, run)`: renders when the guard matches, *except* under `--debug`, where it matches but returns `''`. So: shown by default and under `--verbose`; silenced under `--debug`.
-- **Verbose** — `Verbose(guard, run)`: renders only when `o.verbose`; under `--debug` it matches but returns `''`. So: shown only with `--verbose` and not `--debug`.
-- **Debug** — `Debug(guard, run)`: renders whenever the guard matches, with *no* flag gate — it is the only family that still prints under `--debug` when everything else goes silent. In this table only `OtherToolUse` uses it, giving `--debug` its "show unrecognized/other tools only" behavior (README: "displays only unsupported events").
-- **VerboseDebug** — `VerboseDebug(guard, run)`: renders when `o.verbose` regardless of `debug` (no debug suppression). **Defined but unused** — no rule in `Rules` uses it.
-- **Fallback** — end of `displayClaudeEvent`: any event matching no rule is serialized via `JSON.stringify(e)` only when `o.verbose || o.debug`, else `''`.
+- **Always** — `Rule(guard, run)`: renders when the guard matches, except under `--debug`, where it matches and returns `''`. Shown by default and under `--verbose`; silent under `--debug`.
+- **Verbose** — `Verbose(guard, run)`: matches whenever the guard matches; renders only when `o.verbose && !o.debug`, and returns `''` otherwise.
+- **Debug** — `Debug(guard, run)`: renders whenever the guard matches, with no flag gate. It is the only family that still prints under `--debug` when everything else goes quiet. Only the catch-all tool rule uses it, which is what gives `--debug` its "show me the tool calls nothing renders" behaviour (README: "displays only unsupported events").
+- **VerboseDebug** — `VerboseDebug(guard, run)`: like `Verbose` but without the debug suppression. **Defined but unused.**
 
-Truncation helpers: `truncateLine(s, max=80)` cuts to `max-3` chars + `'...'`; `truncateText(s, maxLines=16)` keeps 8 head + 8 tail lines with a `... [N lines truncated] ...` marker between. `Assistant` text passes `Infinity` (no line-count truncation).
+Truncation helpers: `truncateLine(s, max = 80)` cuts to `max - 3` chars plus `'...'`; `truncateText(s, maxLines = 16)` keeps 8 head and 7 tail lines with a `... [N lines truncated] ...` marker between, so a truncated block never renders more lines than the block it stands in for. Assistant prose passes `Infinity` and is never line-truncated.
 
-Cross-cutting quirk (all `tool_use` shapes): every guard uses `content.every(...)`, so an assistant event whose `content` mixes text with a tool call, or mixes two different tools, matches *no* specific guard and falls to `OtherToolUse` or the fallback. `events.ts:206` flags this: `// TODO: Technically different content types can be mixed in one event, support that`.
+## Line prefixes
 
----
+Three, and only three:
 
-## type: `file-history-snapshot`
+| Prefix | Meaning |
+| --- | --- |
+| `• ` | Header: what happened. |
+| `\| ` | Body of a header — what Claude said, thought, or asked a tool to do. |
+| `> ` | A tool result — what came back. |
 
-**FileHistorySnapshot** (`isFileHistorySnapshot`)
-- Shape: `type === 'file-history-snapshot'`. No payload fields are read.
-- Emitted: Claude Code records a working-copy file-history snapshot (session start / checkpoint). Exact trigger beyond that is unknown.
-- Display: Verbose — `• File History Snapshot\n`.
-- Notes: Body is discarded; renderer prints only the header. Suppressed unless `--verbose`.
-
-## type: `permission-mode`
-
-**PermissionMode** (`isPermissionMode`)
-- Shape: `type === 'permission-mode'`; reads `permissionMode: string`.
-- Emitted: when the session permission mode is set/changed (e.g. `default`, `acceptEdits`, `plan`, `bypassPermissions`).
-- Display: Verbose — `• Permission Mode ${permissionMode}\n`.
-- Notes: No truncation; value printed inline.
-
-## type: `last-prompt`
-
-**LastPrompt** (`isLastPrompt`)
-- Shape: `type === 'last-prompt'`; reads `lastPrompt: string`.
-- Emitted: records the most recent user prompt text; exact lifecycle point is unknown.
-- Display: Verbose — `• Last Prompt\n| ${truncateText(lastPrompt)}\n`.
-- Notes: 16-line window truncation.
-
-## type: `queue-operation`
-
-**EnqueueOperation** (`isEnqueueOperation`)
-- Shape: `type === 'queue-operation'`, `operation === 'enqueue'`; reads `content: string`.
-- Emitted: user queues a message mid-turn; `content` is the queued text.
-- Display: Verbose — `• Enqueue\n| ${truncateText(content)}\n`.
-- Notes: 16-line window truncation.
-
-**DequeueOperation** (`isDequeueOperation`)
-- Shape: `type === 'queue-operation'`, `operation === 'dequeue'`. No further fields read.
-- Emitted: a queued message is consumed.
-- Display: Verbose — `• Dequeue\n`.
-- Notes: Header only.
-
-**RemoveOperation** (`isRemoveOperation`)
-- Shape: `type === 'queue-operation'`, `operation === 'remove'`. No further fields read.
-- Emitted: a queued message is removed without being consumed.
-- Display: Verbose — `• Remove\n`.
-- Notes: Header only. In `Rules`, `PopAll` is listed before `Remove`; both discriminate on `operation`, so no collision.
-
-**PopAllOperation** (`isPopAllOperation`)
-- Shape: `type === 'queue-operation'`, `operation === 'popAll'`; reads `content: string`.
-- Emitted: all queued messages flushed at once; `content` is the combined text.
-- Display: Verbose — `• Pop All\n| ${truncateText(content)}\n`.
-- Notes: Guard key is literal `'popAll'` (camelCase). 16-line truncation.
-
-## type: `custom-title`
-
-**CustomTitle** (`isCustomTitle`)
-- Shape: `type === 'custom-title'`; reads `customTitle: string`.
-- Emitted: a custom session title is set.
-- Display: Always — `• Custom Title\n| ${truncateText(customTitle)}\n`.
-- Notes: One of the few non-verbose metadata rules. Suppressed under `--debug`.
-
-## type: `agent-name`
-
-**AgentName** (`isAgentName`)
-- Shape: `type === 'agent-name'`; reads `agentName: string`.
-- Emitted: a named (sub)agent is identified for the turn.
-- Display: Always — `• Agent Name\n| ${truncateText(agentName)}\n`.
-- Notes: `truncateText` on a normally-single-line value; harmless.
-
-## type: `attachment`
-
-**SkillListingAttachment** (`isSkillListingAttachment`)
-- Shape: `type === 'attachment'`, `attachment.type === 'skill_listing'`; reads `attachment.content: string`.
-- Emitted: a skills catalog is attached to context.
-- Display: Verbose — `• Skill Listing\n| ${truncateText(attachment.content)}\n`.
-- Notes: 16-line truncation of a typically long listing.
-
-**CommandPermissionsAttachment** (`isCommandPermissionsAttachment`)
-- Shape: `type === 'attachment'`, `attachment.type === 'command_permissions'`; reads `attachment.allowedTools: string[]`.
-- Emitted: a slash command declares its allowed-tools.
-- Display: Verbose — `• Allowed Tools\n| ${allowedTools.join('\n| ')}\n`.
-- Notes: No truncation; each tool on its own `|` line.
-
-## type: `system`
-
-**TurnDuration** (`isTurnDuration`)
-- Shape: `type === 'system'`, `subtype === 'turn_duration'`; reads `durationMs: number`, `messageCount: number` (also guards `timestamp: string`, but does not print it).
-- Emitted: end of an assistant turn; timing/message-count stats.
-- Display: Always — `• Turn Duration\n| ${durationMs}ms, ${messageCount} messages\n`.
-- Notes: `timestamp` is validated but never rendered.
-
-**ApiError** (`isApiError`)
-- Shape: `type === 'system'`, `subtype === 'api_error'`. No payload fields read.
-- Emitted: the provider/API returned an error during the turn.
-- Display: Always — `• API Error\n`.
-- Notes: Header only; any error detail in the event is discarded.
-
-## type: `assistant`
-
-Ordering in `Rules`: `Synthetic` → `EncryptedThinking` → `Thinking` → `Bash` → `Write` → `Read` → `Edit` → `Skill` → `Agent` → `ToolSearch` → `Grep` → (`ToolReference`/`AskUserQuestion` etc.) → `OtherToolUse` → `Assistant`. `Assistant` (plain text) is the catch-all and must stay last among `assistant` shapes.
-
-**Synthetic** (`isSynthetic`)
-- Shape: `type === 'assistant'`, `message.model === '<synthetic>'`, `message.content[].text: string`.
-- Emitted: non-model assistant content injected by bare-claude — e.g. preloaded `--read` files in the synthetic session (README "Pre-read files").
-- Display: Always — `• Synthetic\n| ${content.flatMap(t => truncateText(t.text))}\n`.
-- Notes: Checked before all other `assistant` shapes; every other `assistant` guard explicitly excludes `model === '<synthetic>'`.
-
-**EncryptedThinking** (`isEncryptedThinking`)
-- Shape: `type === 'assistant'`, `message.type === 'message'`, each `content[]` is `type === 'thinking'` with `thinking === ''` and `signature: string`.
-- Emitted: redacted/encrypted extended-thinking (signature present, no plaintext).
-- Display: Verbose — `• Encrypted Thinking\n`.
-- Notes: Header only; the signature is not printed. Listed before `Thinking`, which requires the opposite (`signature` absent/empty).
-
-**Thinking** (`isThinking`)
-- Shape: `type === 'assistant'`, `message.type === 'message'`, each `content[]` is `type === 'thinking'` with non-empty `thinking: string` and no/empty `signature`.
-- Emitted: extended-thinking block(s) with visible reasoning text (seen in `session-events-example.txt`).
-- Display: Always — `• Thinking\n| ${content.flatMap(t => truncateText(t.thinking))}\n`.
-- Notes: 16-line truncation per block; the `... [N lines truncated] ...` marker appears in the sample transcript.
-
-**Bash** (`isBash`)
-- Shape: `tool_use`, `name === 'Bash'`; reads `input.command: string`, optional `input.description: string`.
-- Emitted: Claude runs a shell command.
-- Display: Always — `• Bash\n| ${description? truncateLine + command(truncateText)}\n`.
-- Notes: `description` line-truncated (80); `command` 16-line truncated. Falsy description filtered out.
-
-**Write** (`isWrite`)
-- Shape: `tool_use`, `name === 'Write'`; reads `input.file_path: string`, `input.content: string`.
-- Emitted: Claude writes a file.
-- Display: Always — `• Write\n| ${file_path}\n| ${truncateText(content)}\n`.
-- Notes: File body 16-line truncated; path untruncated.
-
-**Read** (`isRead`)
-- Shape: `tool_use`, `name === 'Read'`; reads **only** `input.file_path: string`.
-- Emitted: Claude reads a file (seen in `session-events-example.txt`).
-- Display: Always — `• Read\n| ${file_path}\n`.
-- Notes: The interface and guard capture only `file_path`; the file *text* is not in this event — it arrives later in the paired `tool_result`. The "Read should display file text only in verbose mode" TODO therefore cannot be satisfied from this event alone; it needs the `tool_use`↔`tool_result` pairing described below.
-
-**Edit** (`isEdit`)
-- Shape: `tool_use`, `name === 'Edit'`; reads `input.file_path`, `input.old_string`, `input.new_string`, optional `input.replace_all: boolean`.
-- Emitted: Claude edits a file.
-- Display: Always — `• Edit\n| ${file_path}\n| [Replace All]\n| Old\n| ${truncateText(old_string)}\n| New\n| ${truncateText(new_string)}\n`.
-- Notes: `Replace All` label shown only when `replace_all` truthy; both strings 16-line truncated.
-
-**Skill** (`isSkill`)
-- Shape: `tool_use`, `name === 'Skill'`; reads `input.skill: string`, optional `input.args: string`.
-- Emitted: Claude invokes a skill.
-- Display: Always — `• Skill\n| ${skill}\n| ${args?}\n`.
-- Notes: `args` line dropped when falsy; no truncation.
-
-**Agent** (`isAgent`)
-- Shape: `tool_use`, `name === 'Agent'`; reads `input.description: string`, `input.prompt: string`, optional `input.subagent_type`, `input.model`.
-- Emitted: Claude launches a sub-agent.
-- Display: Always — `• Agent\n| ${subagent_type?}\n| ${model?}\n| ${truncateLine(description)}\n| ${truncateText(prompt)}\n`.
-- Notes: `description` line-truncated (80); `prompt` 16-line truncated; optional fields filtered when falsy.
-
-**ToolSearch** (`isToolSearch`)
-- Shape: `tool_use`, `name === 'ToolSearch'`; reads `input.query: string`.
-- Emitted: Claude searches for a dynamically-loadable tool.
-- Display: Verbose — `• Tool Search\n| ${query}\n`.
-- Notes: No truncation.
-
-**Grep** (`isGrep`)
-- Shape: `tool_use`, `name === 'Grep'`; reads `input.pattern: string`, optional `input.path`, `input.output_mode`.
-- Emitted: Claude runs a search.
-- Display: Always — `• Grep\n| ${pattern}\n| in ${path?}\n| mode: ${output_mode?}\n`.
-- Notes: Optional lines emitted only when present. No truncation.
-
-**AskUserQuestion** (`isAskUserQuestion`)
-- Shape: `tool_use`, `name === 'AskUserQuestion'`; reads `input.questions[]` with `question`, `header`, `options[]{ label, description }`.
-- Emitted: Claude asks the user a multiple-choice question.
-- Display: Verbose — `• Ask User Question\n| ${per-question: truncateLine(header), truncateText(question), options[truncateLine(label), truncateText(description)]}\n`.
-- Notes: `display.ts:155` flags this: `// TODO: This especially is in dire need of additional formatting for readability`. The nested arrays are flattened via `.flat(Infinity)`, so structure is largely lost.
-
-**TaskCreate** (`isTaskCreate`)
-- Shape: `tool_use`, `name === 'TaskCreate'`; reads `input.subject`, `input.description` (also guards `activeForm`, not printed).
-- Emitted: Claude creates a task.
-- Display: Always — `• Task Create\n| ${truncateLine(subject)}\n| ${truncateText(description)}\n`.
-- Notes: `activeForm` validated but not rendered.
-
-**TaskUpdate** (`isTaskUpdate`)
-- Shape: `tool_use`, `name === 'TaskUpdate'`; reads `input.taskId`, `input.status`.
-- Emitted: Claude updates a task's status.
-- Display: Always — `• Task Update\n| ${taskId}: ${status}\n`.
-- Notes: No truncation.
-
-**EnterPlanMode** (`isEnterPlanMode`)
-- Shape: `tool_use`, `name === 'EnterPlanMode'`; only `input` object presence is guarded.
-- Emitted: Claude enters plan mode.
-- Display: Always — `• Enter Plan Mode\n`.
-- Notes: Header only.
-
-**ExitPlanMode** (`isExitPlanMode`)
-- Shape: `tool_use`, `name === 'ExitPlanMode'`; only `input` object presence is guarded.
-- Emitted: Claude exits plan mode (presenting a plan).
-- Display: Always — `• Exit Plan Mode\n`.
-- Notes: Header only; the plan text (if any in `input`) is not rendered.
-
-**OtherToolUse** (`isOtherToolUse`)
-- Shape: `tool_use` whose `name` is none of the enumerated tools (guard lists Bash/Grep/Write/Edit/Read/Skill/Agent/ToolSearch/AskUserQuestion/TaskCreate/TaskUpdate/EnterPlanMode/ExitPlanMode); reads `name` and `input`.
-- Emitted: Claude calls any tool without a dedicated renderer.
-- Display: Debug — `• Tool\n| ${name}\n| ${JSON.stringify(input)}\n`. Renders regardless of flags and is the one shape that still prints under `--debug`.
-- Notes: `events.ts:630` comment `// Make sure to list all supported tools here.` — the exclusion list must be kept in sync with the specific guards, or a supported tool could double-match. `ToolReference` is *not* excluded here because it is a `user` event, not `assistant`.
-
-**Assistant** (`isAssistant`)
-- Shape: `type === 'assistant'`, `message.type !== 'thinking'`, `message.content[].text: string`, `model !== '<synthetic>'`.
-- Emitted: normal assistant message text (seen in `session-events-example.txt`).
-- Display: Always — `• Assistant\n| ${content.flatMap(t => truncateText(t.text, Infinity))}\n`.
-- Notes: Catch-all for `assistant`; `truncateText(..., Infinity)` disables line-count truncation, so full text is printed. Because `tool_use` blocks lack a `text` field, this guard does not swallow tool calls.
-
-## type: `user`
-
-Ordering in `Rules`: `ToolReference` (Verbose) → `Assistant`/`OtherToolUse` (assistant only) → `ToolResult` → `ToolResultArray` → `User` → `UserArray`. `ToolReference` precedes `ToolResultArray`; their `content[].type` values (`tool_reference` vs `text`) keep them disjoint.
-
-**User** (`isUser`)
-- Shape: `type === 'user'`, `message.content: string`.
-- Emitted: a user message with plain-string content (the opening `• User` in `session-events-example.txt`).
-- Display: Always — `• User\n| ${truncateText(content)}\n`.
-- Notes: 16-line truncation. `events.ts:760` carries the `// TODO: This should be grouped by the tool_use_id in the output` marker (mis-placed on a plain user message).
-
-**UserArray** (`isUserArray`)
-- Shape: `type === 'user'`, `message.content[].text: string`.
-- Emitted: a user message whose content is an array of text blocks.
-- Display: Always — `• User\n| ${content.flatMap(t => truncateText(t.text))}\n`.
-- Notes: Same header as `User`.
-
-**ToolResult** (`isToolResult`)
-- Shape: `type === 'user'`, each `message.content[]` is `type === 'tool_result'` with `content: string`. **No `tool_use_id` is read.**
-- Emitted: a tool returns a plain-string result to Claude (the `> …` lines in the sample transcript).
-- Display: Always — `> ${content.flatMap(t => truncateText(t.content))}\n`.
-- Notes: `events.ts:679` — `// TODO: This should be grouped by the tool_use_id in the output`. 16-line truncation. Rendered with a bare `>` prefix and no owning-tool header.
-
-**ToolResultArray** (`isToolResultArray`)
-- Shape: `type === 'user'`, each `message.content[]` is `type === 'tool_result'` whose `content[]` is `type === 'text'` with `text: string`. **No `tool_use_id` is read.**
-- Emitted: a tool returns a result as an array of text blocks.
-- Display: Always — `> ${content.flatMap(t => t.content.flatMap(c => truncateText(c.text)))}\n`.
-- Notes: `events.ts:704` — same `tool_use_id` TODO. 16-line truncation.
-
-**ToolReference** (`isToolReference`)
-- Shape: `type === 'user'`, each `message.content[]` is `type === 'tool_result'` whose `content[]` is `type === 'tool_reference'` with `tool_name: string`. **No `tool_use_id` is read.**
-- Emitted: a tool result that references other tools by name (e.g. `ToolSearch`/dynamic tool loading).
-- Display: Verbose — `• Tool Reference\n| ${content.map(t => t.content.map(r => r.tool_name))}\n`.
-- Notes: `events.ts:735` — same `tool_use_id` TODO. When *not* `--verbose`, this event matches no rule (the `text`-typed `ToolResultArray` guard rejects `tool_reference`) and hits the fallback (JSON only under `--verbose`/`--debug`, else `''`).
+Every line of a multi-line body carries its prefix, including the first line after the header and including every continuation line of a `>` block. The transcript is greppable: `grep '^> '` is exactly the tool output, `grep '^• '` is exactly the event spine.
 
 ---
 
-## Pairing tool_use with tool_result
+## Standalone events
 
-**How the pairing is supposed to work (raw NDJSON / Anthropic Messages tool-use schema).** A tool call and its result live in two separate top-level events:
+Walked in this order. Guards discriminate on `type` (and `subtype`/`operation`), so the order is documentation rather than disambiguation.
 
-- The call is an `assistant` event: `message.content[]` block with `type: "tool_use"`, carrying the call identifier field **`id`** (e.g. `"toolu_01…"`), plus `name` and `input`.
-- The result is a `user` event: `message.content[]` block with `type: "tool_result"`, carrying **`tool_use_id`**, plus `content`.
+| Guard | Level | Renders | Notes |
+| --- | --- | --- | --- |
+| `isFileHistorySnapshot` | Verbose | `• File History Snapshot` | Header only; the snapshot body is discarded. |
+| `isFileHistoryDelta` | Verbose | `• File History Delta` + `trackingPath` | 661 records measured. One tracked file's change against the last snapshot. |
+| `isPermissionMode` | Verbose | `• Permission Mode <mode>` | `default`, `acceptEdits`, `plan`, `bypassPermissions`. |
+| `isMode` | Verbose | `• Mode <mode>` | 2 231 records, every one `normal`. Introduced by 2.1.220; distinct from the permission mode. |
+| `isAgentSetting` | Verbose | `• Agent Setting <setting>` | 219 records, every one `claude`. |
+| `isLastPrompt` | Verbose | `• Last Prompt` + text | 16-line truncation. |
+| `isEnqueueOperation` | Verbose | `• Enqueue` + text | `type: 'queue-operation'`, `operation: 'enqueue'`. |
+| `isDequeueOperation` | Verbose | `• Dequeue` | Header only. |
+| `isPopAllOperation` | Verbose | `• Pop All` + text | Guard key is literal `'popAll'`, camelCase. |
+| `isRemoveOperation` | Verbose | `• Remove` | Header only. |
+| `isCustomTitle` | Always | `• Custom Title` + text | **Zero records measured.** Claude Code writes `ai-title` unless a title is set by hand. |
+| `isAiTitle` | Always | `• AI Title` + text | 2 272 records. The title a real transcript actually carries. |
+| `isAgentName` | Always | `• Agent Name` + text | |
+| `isSkillListingAttachment` | Verbose | `• Skill Listing` + text | `type: 'attachment'`, `attachment.type: 'skill_listing'`. |
+| `isCommandPermissionsAttachment` | Verbose | `• Allowed Tools` + one tool per line | `attachment.type: 'command_permissions'`. No truncation. |
+| `isUserText` | Always | `• User` + text | `type: 'user'` with `message.content` a bare string. 16-line truncation. |
+| `isTurnDuration` | Always | `• Turn Duration` + `<ms>ms, <n> messages` | `type: 'system'`, `subtype: 'turn_duration'`. `timestamp` is guarded but not printed. |
+| `isApiError` | Always | `• API Error` | `type: 'system'`, `subtype: 'api_error'`. Any detail in the record is discarded. |
 
-A result is matched to the call that produced it by equality of the identifiers: **`tool_result.tool_use_id === tool_use.id`**. The `id` lives on the `assistant` `tool_use` block; the `tool_use_id` lives on the `user` `tool_result` block.
+## `assistant` content blocks
 
-**What the current guards do with those ids — they drop both.** Reading `src/events.ts` directly:
+Walked in this order. The two catch-alls are last for a reason, and moving them breaks the table.
 
-- The `tool_use` interfaces (`Bash`, `Write`, `Read`, `Edit`, `Skill`, `Agent`, `ToolSearch`, `Grep`, `AskUserQuestion`, `TaskCreate`, `TaskUpdate`, `EnterPlanMode`, `ExitPlanMode`, `OtherToolUse`) declare each content block as `{ type: 'tool_use'; name; input }` and their guards check exactly `c.type === 'tool_use'`, `c.name`, and `c.input`. **None references `id`.** The call identifier is present in the raw event but never captured or typed.
-- The `tool_result` interfaces (`ToolResult`, `ToolResultArray`, `ToolReference`) declare each block as `{ type: 'tool_result'; content }` and their guards check exactly `c.type === 'tool_result'` and `c.content`. **None references `tool_use_id`.** The back-reference is present in the raw event but never captured or typed.
+| Guard | Level | Renders |
+| --- | --- | --- |
+| `isEncryptedThinkingBlock` | Verbose | `• Encrypted Thinking` |
+| `isThinkingBlock` | Always | `• Thinking` + `truncateText(thinking)` |
+| `isFallbackBlock` | Always | `• Model Fallback` + `<from> → <to>` |
+| `isBashBlock` | Always | `• Bash` + `truncateLine(description)?` + `truncateText(command)` |
+| `isWriteBlock` | Always | `• Write` + `file_path` + `truncateText(content)` |
+| `isReadBlock` | Always | `• Read` + `file_path` |
+| `isEditBlock` | Always | `• Edit` + `file_path` + `Replace All`? + `Old` + old + `New` + new |
+| `isSkillBlock` | Always | `• Skill` + `skill` + `args`? |
+| `isAgentBlock` | Always | `• Agent` + `subagent_type`? + `model`? + `truncateLine(description)` + `truncateText(prompt)` |
+| `isToolSearchBlock` | Verbose | `• Tool Search` + `query` |
+| `isGrepBlock` | Always | `• Grep` + `pattern` + `in <path>`? + `mode: <output_mode>`? |
+| `isAskUserQuestionBlock` | Verbose | `• Ask User Question` + flattened questions/options |
+| `isTaskCreateBlock` | Always | `• Task Create` + `truncateLine(subject)` + `truncateText(description)` |
+| `isTaskUpdateBlock` | Always | `• Task Update` + `<taskId>: <status>`? + `Blocked By <ids>`? + `truncateText(description)`? |
+| `isEnterPlanModeBlock` | Always | `• Enter Plan Mode` |
+| `isExitPlanModeBlock` | Always | `• Exit Plan Mode` |
+| `isAnyToolUseBlock` | Debug | `• Tool` + `name` + `JSON.stringify(input)` |
+| `isTextBlock` | Always | `• Synthetic` or `• Assistant` + text |
 
-So both halves of the pairing key are discarded at the guard boundary. This is exactly what the four `// TODO: This should be grouped by the tool_use_id in the output` markers in `events.ts` (on `isToolResult:679`, `isToolResultArray:704`, `isToolReference:735`, and `isUser:760`) are pointing at: the renderer emits every `tool_result` as a free-floating `> …` line with no way to attach it to its originating `tool_use`, because the discriminating id was thrown away.
+### Notes
 
-**Why this blocks "Read should display file text only in verbose mode."** The `Read` event (`isRead`) carries only `input.file_path`; the file *text* is only ever present in the paired `tool_result`. To render that text under the `Read` entry (and gate it behind `--verbose`), the renderer must join the `Read` `tool_use.id` to the `tool_result.tool_use_id` — but `isRead` never captures `id` and the `tool_result` guards never capture `tool_use_id`. The pairing id is dropped on both sides, so the join is impossible with the current guards. Closing that gap (adding `id` to the `tool_use` shapes and `tool_use_id` to the `tool_result` shapes, then grouping on it) is the prerequisite the TODO needs.
+**`isThinkingBlock` vs `isEncryptedThinkingBlock`.** They discriminate on whether `thinking` is empty, and on nothing else. The guard used to additionally require the signature to be absent or empty on the readable shape; measured, 87 of 16 503 thinking blocks carry *both* readable text and a non-empty signature, and every one of them matched neither shape and rendered as nothing. 16 070 blocks are genuinely encrypted (empty `thinking`, signature present); the remaining 346 are readable with no signature.
 
-*Sourcing note:* field names on the guards (`type`, `name`, `input`, `content`, and the absence of `id`/`tool_use_id`) are quoted directly from `src/events.ts`, which I read. The raw-NDJSON field names `id` and `tool_use_id` are the Anthropic Messages tool-use schema names; the example file accessible to me (`session-events-example.txt`) was already-rendered transcript output (`• User` / `• Thinking` / `> …`), not raw NDJSON, so those two literals are cited from the schema rather than transcribed from a raw sample.
+**`isFallbackBlock`.** `{ type: 'fallback', from: { model }, to: { model } }` — the turn was served by a different model than the one it started on. 16 blocks measured, every one a downgrade away from `claude-fable-5`. Rendered at Always level on purpose: a hermetic run cannot let the model change underneath it silently.
+
+**`isAnyToolUseBlock` is the catch-all, and it excludes nothing.** It matches every `tool_use` block whatever its name. It is correct only because it sits after every specific tool rule, and because a `Verbose` rule *matches* even when it renders nothing — so a quiet `ToolSearch` block stops the walk rather than falling through to be dumped as raw input.
+
+The previous design kept a hardcoded list of "tools that have their own guard" and subtracted it. That list had to be kept in sync by hand, and it was wrong in a way no sync could fix: originally measured, 9 calls in the corpus named a *known* tool but carried input the specific guard rejected — a `TaskUpdate` carrying `{ taskId, addBlockedBy }` with no `status`, a `Read` whose arguments arrived as `input.__unparsedToolInput` because the model emitted invalid JSON. Being a known name, they were excluded from the catch-all; failing the specific guard, they matched nothing. All nine rendered as nothing. Ordering catches them and prints the input the model actually sent.
+
+Re-measured 2026-07-26 after `isTaskUpdateBlock` was loosened to accept a partial update (see below): only **2** calls remain in this state, both the same `Read`/`__unparsedToolInput` shape. The 7 `TaskUpdate` calls that used to land here now match their own rule instead.
+
+**`isTaskUpdateBlock` accepts a partial update.** `taskId` is the only field every call carries. Measured 2026-07-26 over the local corpus, a call touches exactly one of `status` (64 calls), `addBlockedBy` (6 calls, a `string[]` of task ids), or `description` (1 call) — never more than one alongside `taskId`, and this is presumably how the tool is actually invoked turn over turn, but the guard does not enforce it: the type declares all three optional so a future call combining them still matches. The renderer prints whichever of the three are present — `status` inline with the id, `addBlockedBy` and `description` each on their own `| ` line — falling back to the bare `taskId` when none are. Before this, a call missing `status` (7 of the 71 measured) matched neither this guard nor any other and fell to the `isAnyToolUseBlock` catch-all above.
+
+**`isTextBlock` is the prose catch-all and must stay last.** It accepts a bare `{ text }` block with no `type`, which is what `SessionBuilder` and the vendored forks emit; every block in the measured corpus does carry `type: 'text'`. It branches on the enclosing record: `message.model === '<synthetic>'` renders `• Synthetic` with 16-line truncation, anything else renders `• Assistant` untruncated. `<synthetic>` is Claude Code's own marker for fabricated assistant content — 157 records measured.
+
+Note that the `<synthetic>` check now applies only to *prose*. A preloaded `Read` in a synthetic session renders as `• Read` like any other, because block guards see one block and cannot see the model. Under per-record dispatch every non-synthetic guard excluded `<synthetic>`, so a preloaded tool call rendered as raw JSON or not at all.
+
+## `user` content blocks
+
+| Guard | Level | Renders |
+| --- | --- | --- |
+| `isToolReferenceBlock` | Verbose | `• Tool Reference` + `[ToolName]`? + one `tool_name` per line |
+| `isToolResultBlock` | Always | `> ` + `[ToolName]`? + `truncateText(content)`, or `> [ToolName]`? + `[N lines]` |
+| `isToolResultTextBlock` | Always | `> ` + `[ToolName]`? + text of each block, or `> [ToolName]`? + `[N lines]` |
+| `isToolResultImageBlock` | Always | `> [ToolName]`? + `[<media_type>]` per image |
+| `isImageBlock` | Always | `• Image` + `media_type` |
+| `isTextBlock` | Always | `• User` + `truncateText(text)` |
+
+### Notes
+
+All four `tool_result` guards read `tool_use_id` when present and tolerate its absence.
+
+**The three array-shaped `tool_result` guards each reject an empty array**, because `[].every(...)` is vacuously true and all three would otherwise match. No empty ones exist in the corpus.
+
+**Images.** 206 `tool_result` blocks and 3 top-level `user` blocks carry a base64 image. None of them rendered at all before; both now do, by media type. No inner `tool_result` content array in the corpus mixes block kinds — text arrays are all text, image arrays are all images — so the three inner shapes are guarded separately rather than dispatched recursively. A mixed array would fall to the block fallback.
+
+**`[ToolName]`** is the grouping tag described below — every one of these four guards can carry it, prepended to the first rendered line.
+
+## Pairing `tool_use` with `tool_result`
+
+A tool call and its result live in two separate records:
+
+- the call is an `assistant` record with a `message.content[]` block of `type: 'tool_use'`, carrying **`id`**, plus `name` and `input`;
+- the result is a `user` record with a `message.content[]` block of `type: 'tool_result'`, carrying **`tool_use_id`**, plus `content`.
+
+They match on `tool_result.tool_use_id === tool_use.id`. Both halves of that key are declared and read: `ToolUseBlock` requires `id`, and every `tool_result` shape declares an optional `tool_use_id`.
+
+`TranscriptRenderer` maintains the join in a private `Map<string, string>` from `tool_use.id` to tool name:
+
+- **learn** — before rendering, every `tool_use` block of an `assistant` record with an `id` is recorded. This happens per block, so a record mixing prose with a tool call teaches the renderer just as well as a pure tool-call record does. The old pairing guard demanded that *every* block be a `tool_use`, so mixed records taught it nothing.
+- **use** — a `tool_result` whose call was a `Read` collapses to `> [N lines]` instead of printing the file back, unless `--verbose`; and every result's first line may carry a `[ToolName]` grouping tag (below).
+- **consume** — after rendering, every `tool_use_id` the record referenced is deleted. Measured over the five largest local transcripts: a result follows its call by 1.05 records on average and 5 at worst, and exactly one call in 1 498 went unanswered. The table therefore holds only outstanding calls and stays effectively empty for the life of a stream.
+
+The table used to be a module-level `Map` shared by every consumer of the library and never cleared. It is now owned by the renderer instance, so two streams rendered in one process cannot see each other's calls, and a renderer can be dropped or `reset()` to forget everything at once.
+
+`displayClaudeEvent(e, options)` remains, as a one-shot for inspecting a single record. It constructs a throwaway renderer, so it has **no pairing memory**: a `Read` result rendered through it prints in full, and — since the grouping tag below needs that same memory across two `display()` calls — a result rendered through it never carries a tag either. Use `TranscriptRenderer` to render a stream.
+
+### Grouping a result with its call
+
+Before this, a `tool_result` was a free-floating `> ` block with no visible link to the call it answered. In a quiet transcript that link is implicit — a call and its result are almost always adjacent — but a busy one can interleave several outstanding calls (parallel `tool_use` blocks in one record, or a slow call whose result lands several records after a second call has already started), and at that point position alone no longer tells a reader which result goes with which call.
+
+The rule: **a result's first rendered line is prefixed with `[ToolName] ` exactly when more than one call is outstanding at the moment it renders; otherwise the line is untouched.** "Outstanding" is read straight off the pairing table's size, captured once per record before that record's own results are consumed, so every result in a single multi-result record sees the same count and either all of them are tagged or none are. Concretely:
+
+- **The ordinary case — one call, then its result — is untouched.** The pairing table holds exactly one entry throughout, so `outstandingCalls() === 1` and no tag is added. This is true even when several unrelated records (thinking, permission changes, an unrelated later call answered first) separate the call from its result: as long as only one call is unanswered at a time, there is nothing to disambiguate. This is the overwhelmingly common shape, and it renders byte-for-byte as it did before grouping existed.
+- **Parallel calls tag every one of their results.** Two `tool_use` blocks in one `assistant` record push the table to size 2; whichever result answers first still sees size 2 (the other call's entry is still outstanding), so both get tagged — `> [Bash] total 4` / `> [Grep] no matches`, say — even if the two calls share no other relationship.
+- **A call that is never answered (measured: 1 in 1 498) keeps tagging every later result until the table is `reset()`.** The stale entry never leaves the table, so any subsequent call, however solitary in intent, finds itself sharing the table with that orphan and its result is tagged too. This over-tags relative to a hypothetical omniscient reader, but never under-tags: erring toward "here's which call this is" is the safer failure mode for a rendering tool built to make a transcript legible.
+- **The tag never adds a line.** It is prepended to the existing first line — `total 4` becomes `[Bash] total 4`, not a new `[Bash]` line above it — so a tagged multi-line result has exactly as many lines as an untagged one. `isToolReferenceBlock` is the one exception in placement, not in trigger: it renders `•`/`| ` rather than `>`, so its tag is appended to the header line (`• Tool Reference [ToolSearch]`) instead of the body.
+- **A call this renderer never saw gets no tag.** `toolName(id)` returns `undefined` for an id outside the pairing table (unpaired result, or the call happened before this renderer existed), and `resultTag` requires a known name before it looks at the outstanding count at all.
+
+Every collapsed `Read` result can still carry a tag on top of its collapse — `> [Read] [3 lines]` — since collapsing and tagging answer different questions (how much to show, versus which call this is) and compose without conflict.
+
+## Deliberately not recognized
+
+Every record type below still falls to the JSON fallback. Counts measured 2026-07-26.
+
+| Type | Count | Why not |
+| --- | --- | --- |
+| `attachment` (19 further subtypes) | 2 392 | `task_reminder`, `deferred_tools_delta`, `hook_success`, `edited_text_file`, `read_truncation_notice`, `agent_listing_delta`, `queued_command`, `plan_mode*`, `budget_usd`, `date_change`, … Each carries a differently-shaped payload. A generic `• Attachment <subtype>` rule would suppress 2 392 raw dumps at the cost of throwing their content away, which is worse than the dump under `--verbose`. |
+| `started`, `result` | 991 | Only ever found in `*/subagents/workflows/*/journal.jsonl` — a workflow journal, not a session transcript. `result.result` is arbitrary caller-defined JSON with no stable shape. |
+| `system` (7 further subtypes) | 276 | `stop_hook_summary` (163), `away_summary` (97), `local_command` (7), `model_refusal_fallback` (5), `informational` (2), `model_refusal_no_fallback` (1), `compact_boundary` (1). Same trade-off as `attachment`. `compact_boundary` is the one worth a dedicated rule when it becomes common — it marks a discontinuity in the transcript. |
+| `last-prompt` with `lastPrompt: null` | 5 | The guard requires a string. |
+| `relocated`, `worktree-state`, `frame-link` | 5 | Too rare to design against. |
