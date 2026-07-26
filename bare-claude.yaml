@@ -1,28 +1,69 @@
 # Bare Claude Configuration
+#
+# Validated on load against the schema in src/config.ts: an unknown key or an
+# out-of-range value is an error naming the path, not a silently ignored typo.
 
 use: default
 
 presets:
+  lmstudio:
+    launcher: claude
+    model: openai/gpt-oss-20b
+    extraEnv:
+      ANTHROPIC_AUTH_TOKEN: lmstudio
+      ANTHROPIC_BASE_URL: http://localhost:1234
+
   ollama:
     launcher: ollama
     model: nemotron-3-super:cloud
 
   default:
-    use: ollama
+    use: lmstudio
     permissionMode: acceptEdits
 
   changelog:
     use: default
     quiet: true
     print: true
+
+    # Everything the entry is written from, at zero model cost: the file being
+    # extended, the project it describes, and the history since the last tag as
+    # real Bash tool results. Cheapest first, because the shared byte budget is
+    # spent in order and the full diff is the one entry worth losing to it.
     read:
       - './README.md'
       - './CHANGELOG.md'
+    preload:
+      - type: shell
+        cmd: git describe --tags --abbrev=0
+        description: last release tag
+      - type: shell
+        cmd: git log --no-merges --oneline "$(git describe --tags --abbrev=0)"..HEAD
+        description: commits since the last release
+      - type: shell
+        cmd: git diff --stat "$(git describe --tags --abbrev=0)"..HEAD
+        description: files changed since the last release
+      - type: shell
+        cmd: git diff "$(git describe --tags --abbrev=0)"..HEAD
+        description: full diff since the last release
+
+    # Write is never offered, and Edit lands on CHANGELOG.md alone. All three
+    # measured 2026-07-26 against claude 2.1.220: `--tools` binds where
+    # `--allowedTools ''` fails open; `dontAsk` denies whatever the allow list
+    # does not name, rather than prompting a headless run that cannot answer;
+    # and a `./`-relative rule resolves against the working directory, not
+    # against the directory of the settings file that declares it.
+    permissionMode: dontAsk
+    tools:
+      - Read
+      - Edit
+    disallowedTools:
+      - Write
+    extraSettings:
+      permissions:
+        allow:
+          - 'Edit(./CHANGELOG.md)'
+
     callToAction: >
       Review the changes from the last version tag,
       research and prepare the CHANGELOG.md entry for the next release.
-
-# TODO: Specify schema
-# TODO: The `changelog` preset would benefit from git log + diff since last tag Bash tool preload etc.
-# TODO: The `changelog` preset  would benefit from allowlist/sandbox disallowing Write tool
-#       and allowing only Edit tool on CHANGELOG.md
