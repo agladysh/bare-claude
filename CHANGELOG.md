@@ -4,6 +4,18 @@
 
 ### Added
 
+- `--doctor`: one line per thing a run needs — bun, `claude` and its version, git, whether
+  `CLAUDE_CODE_OAUTH_TOKEN` is present (never its value, with the `claude setup-token` guidance
+  beneath when it is not), the `PATH` install, and the `bare-claude.yaml` a run from here would
+  load, validated. Exits 1 when something required is missing. Programmatically, `runDoctor()`
+  and `formatDoctorReport()` from `@agladysh/bare-claude/doctor`.
+- `bun run install:user`, `install:status` and `install:uninstall`: a symlink
+  `~/.local/bin/bare-claude -> bin/bare-claude.ts` (`--bin-dir` to put it elsewhere), reported as
+  installed, absent or foreign. A foreign entry is never overwritten without `--force` and never
+  removed. The library behind it is `@agladysh/bare-claude/install`.
+- `locateConfig()` and `configFileName` from `@agladysh/bare-claude/config`: the one rule for where
+  `bare-claude.yaml` is looked up, shared by the CLI and the doctor.
+- `--help` now says how to authenticate a bare run and how to install and inspect the command.
 - `claudePath` launch option and `--claude-path`, selecting the Claude Code executable. It also
   governs the `claude --version` probe and `--usage`. It does not apply to the `ollama` launcher,
   where `claude` names what ollama launches rather than a path.
@@ -84,6 +96,8 @@
 
 ### Fixed
 
+- Outside a Git working copy the CLI reports the directory and why a working copy is required,
+  instead of the shell helper's "Failed with exit code 128" with git's own complaint above it.
 - **No transcript was rendered at all for any run without preloaded files.** `Bun.file()` caches
   its stat, so the handle taken before the subprocess created the session file reported it missing
   forever and rendering bailed out. Runs using `--read` were unaffected, because those write the

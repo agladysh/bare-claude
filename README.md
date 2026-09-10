@@ -58,6 +58,19 @@ Or globally:
 bun add -g @agladysh/bare-claude
 ```
 
+Or from a checkout, as a symlink on `PATH` that tracks the source:
+
+```bash
+bun install
+bun run install:user        # ~/.local/bin/bare-claude -> bin/bare-claude.ts
+bun run install:status      # installed / absent / foreign; exits 1 unless installed
+bun run install:uninstall   # removes the symlink, and only a symlink into this checkout
+```
+
+`--bin-dir DIR` puts the link somewhere other than `~/.local/bin`. Whatever else is at that path
+is never overwritten: `bun run install:user --force` replaces a foreign symlink or file, and a
+directory never. `bare-claude --doctor` then reports whether the result is actually on `PATH`.
+
 ## Command Line Usage
 
 ```shell
@@ -92,6 +105,8 @@ Options:
   [Git pathspec patterns](https://git-scm.com/docs/gitglossary#Documentation/gitglossary.txt-pathspec)
 
 - `--usage`: report subscription usage as JSON and exit (see [Usage Introspection](#usage-introspection))
+- `--doctor`: report what a run needs and exit 1 when something required is missing
+  (see [Doctor](#doctor))
 - `--effort [level]`: `low`, `medium`, `high` (default), `xhigh` or `max`
 - `--tools [list]`: comma-separated tools to allow; the empty string allows none
 - `--disallowed-tools [list]`: comma-separated tools to deny; `*` denies all
@@ -324,6 +339,40 @@ It deliberately does not call Anthropic's usage endpoint directly.
 
 Available programmatically as `readUsage()` from `@agladysh/bare-claude/usage`.
 
+## Doctor
+
+What a run needs, and which of it is missing:
+
+```bash
+bare-claude --doctor
+```
+
+```
+ok   bun: 1.3.13 at /opt/homebrew/bin/bun
+ok   claude: 2.1.268 at /Users/you/.local/bin/claude
+ok   git: 2.55.0 at /opt/homebrew/bin/git
+fail auth: CLAUDE_CODE_OAUTH_TOKEN absent
+       A bare run does not inherit the ambient login session:
+         claude setup-token                          # once; prints a long-lived OAuth token
+         export CLAUDE_CODE_OAUTH_TOKEN=<the token>  # inherited by the subprocess
+ok   install: /Users/you/.local/bin/bare-claude -> /Users/you/projects/bare-claude/bin/bare-claude.ts
+ok   preset: /Users/you/projects/bare-claude/bare-claude.yaml (presets: default, changelog)
+```
+
+One line per item, a hint beneath any that needs fixing. `bun` is the running runtime, checked
+against `engines.bun`. `claude` is the executable a run would spawn — `--claude-path` applies — and
+its version. `git` is what locates the preset file and resolves `--read`. `auth` says whether
+`CLAUDE_CODE_OAUTH_TOKEN` is present, never its value, and is a warning rather than a failure when
+`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` stands in. `install` is whether `bare-claude` is on
+`PATH`, and whether it is this checkout's symlink. `preset` is the `bare-claude.yaml` a run from
+the current directory would load, validated.
+
+Exits 1 when any item is `fail`. Nothing is repaired, and no model is spawned: the only
+subprocesses are `--version` probes and `git rev-parse`.
+
+Available programmatically as `runDoctor()` and `formatDoctorReport()` from
+`@agladysh/bare-claude/doctor`.
+
 ### What it cannot tell you
 
 Every source Claude Code has reports a **percentage of an opaque window**. There is no way to
@@ -533,9 +582,29 @@ value used when no file exists. The `effortLevel`/`permissionMode` arktype schem
 inferred `EffortLevel`/`PermissionMode` types — validate those two fields specifically and are
 exported too. See [Configuration](#configuration).
 
+`locateConfig(cwd?)` names the `bare-claude.yaml` a run from `cwd` would load — at the root of
+the enclosing Git working copy, whether or not the file exists — or `null` outside one;
+`configFileName` is the name it appends. The CLI and `--doctor` both resolve through it.
+
 `@agladysh/bare-claude/preset` exports `resolvePreset(preset, presets)`, which folds a
 `DynamicPreset`'s `use` chain and applies the CLI display defaults to produce a runnable `Preset`
 — the function behind the [preset resolution order](#preset-resolution-order) above.
+
+### runDoctor(options?) and formatDoctorReport(report)
+
+From `@agladysh/bare-claude/doctor`. `runDoctor` returns a `DoctorReport`: `items`, each
+`{ name, status: 'ok' | 'warn' | 'fail', detail, hint }` in print order, and `ok`, false when any
+item failed. Every input is an option — `claudePath`, `env`, `cwd`, `binDir` — so it can be run
+against a machine assembled in a test. `formatDoctorReport` renders what `--doctor` prints. See
+[Doctor](#doctor).
+
+### install(binDir, options?), status(binDir), uninstall(binDir)
+
+From `@agladysh/bare-claude/install`, the library behind `bun run install:user`. `status` reports
+`installed`, `absent` or `foreign` (with a `detail` naming what is there instead). `install`
+symlinks `commandSource` — this package's `bin/bare-claude.ts` — into `binDir` as `commandName`,
+replacing a foreign entry only with `{ force: true }` and a directory never; `uninstall` removes
+only that symlink. `defaultBinDir(env?)` is `~/.local/bin`. See [Installation](#installation).
 
 ### Examples
 
@@ -549,6 +618,8 @@ The current version of the Bare Claude makes the following assumptions:
   `claudePath`/`--claude-path`)
 - `bare-claude` is run inside a Git working copy
 - `git` is installed and available in `PATH`
+
+`bare-claude --doctor` checks each of these.
 
 ## License
 
