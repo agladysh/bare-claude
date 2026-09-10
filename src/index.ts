@@ -4,6 +4,10 @@ import path from 'node:path';
 
 import { deepmerge } from 'deepmerge-ts';
 
+import {
+  hasCredential, readTokenFile, resolveTokenFile, tokenVariable
+} from '@agladysh/bare-claude/token';
+
 /**
  * Represents a JSON structure that can be either an object or array.
  */
@@ -270,6 +274,18 @@ export interface LaunchOptions {
   linkAuth?: boolean,
 
   /**
+   * File holding the subscription token, bare and alone, read into the
+   * child's `CLAUDE_CODE_OAUTH_TOKEN` at spawn time when the child's
+   * environment carries neither that variable nor an alternate credential
+   * (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`), and only for the `claude`
+   * launcher. Defaults to `BARE_CLAUDE_TOKEN_FILE` from the child's
+   * environment, then `$XDG_CONFIG_HOME/bare-claude/oauth`, then
+   * `~/.config/bare-claude/oauth`. A missing file is fine; an empty or
+   * unreadable one is an error. The value is never surfaced anywhere.
+   */
+  tokenFile?: string | null,
+
+  /**
    * Tools the run may use, as passed to `--tools`. An empty array disables all
    * tools. Note that `--allowedTools ''` does *not*: it fails open, and the
    * model still reaches the filesystem. Defaults to null (Claude's default set).
@@ -375,6 +391,7 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
     noMothership: o.noMothership ?? ((o.launcher ?? 'claude') !== 'claude'),
     noProcessEnv: o.noProcessEnv ?? false,
     linkAuth: o.linkAuth ?? true,
+    tokenFile: o.tokenFile ?? null,
     tools: o.tools ?? null,
     disallowedTools: o.disallowedTools ?? null,
     addDirs: o.addDirs ?? [],
@@ -784,11 +801,26 @@ export async function spawnClaude<
   const projectHomePath = path.join(ephemeralClaudeHomePath, 'projects', pathToFilename(cwd));
   const sessionJsonlPath = path.join(projectHomePath, `${sessionId}.jsonl`)
 
+  const env = buildEnv(c, { ephemeralClaudeHomePath, spawnEnv: spawnOptions.env });
+
+  // The token file is the last resort and the last step: after buildEnv has
+  // had its say, so an explicit token in any layer wins, and only here, so
+  // the value exists in this process for exactly as long as the spawn takes
+  // and never reaches a preset, a --debug dump or a log. Not for the ollama
+  // launcher, and not beside an alternate credential: both mean the run is
+  // about to talk to something other than Anthropic.
+  if (c.launcher === 'claude' && !hasCredential(env)) {
+    const token = await readTokenFile(resolveTokenFile(c.tokenFile, env));
+    if (token !== null) {
+      env[tokenVariable] = token;
+    }
+  }
+
   const o: Bun.Spawn.SpawnOptions<In, Out, Err> & { cmd: string[] } = {
     ...spawnOptions,
     cwd,
     cmd,
-    env: buildEnv(c, { ephemeralClaudeHomePath, spawnEnv: spawnOptions.env }),
+    env,
   };
 
   // Creating unconditionally to simplify watch() logic. Must complete before

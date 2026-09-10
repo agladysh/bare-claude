@@ -1,4 +1,8 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
+
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 
 import {
   assertSafeCallToAction,
@@ -6,6 +10,7 @@ import {
   buildEnv,
   buildSettings,
   LaunchConfig,
+  spawnClaude,
   type JsonObject,
   type LaunchOptions,
 } from './index.ts';
@@ -77,6 +82,7 @@ describe('LaunchConfig', () => {
       noMothership: false,
       noProcessEnv: false,
       linkAuth: true,
+      tokenFile: null,
       tools: null,
       disallowedTools: null,
       addDirs: [],
@@ -689,5 +695,117 @@ describe('buildSettings extraSettings', () => {
     const extraSettings: JsonObject = { env: { MY_OWN: 'value' } };
     buildSettings(cfg({ extraSettings }));
     expect(extraSettings).toEqual({ env: { MY_OWN: 'value' } });
+  });
+});
+
+describe('spawnClaude and the token file', () => {
+  /**
+   * Every run here execs a shell script in place of `claude` that prints the
+   * child's CLAUDE_CODE_OAUTH_TOKEN and exits: what reached the child is the
+   * whole question. `noProcessEnv` keeps this process's environment out, so
+   * HOME and everything else the resolution reads is what the test supplies,
+   * and the operator's real token file is never in reach.
+   */
+  const roots: string[] = [];
+
+  async function tempDir(label: string): Promise<string> {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), `bare-claude-spawn-token-${label}-`));
+    roots.push(dir);
+    return dir;
+  }
+
+  afterEach(async () => {
+    while (roots.length > 0) {
+      const dir = roots.pop();
+      if (dir !== undefined) {
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  async function probeScript(): Promise<string> {
+    const script = path.join(await tempDir('probe'), 'claude');
+    await fs.writeFile(script, '#!/bin/sh\nprintf \'%s\' "${CLAUDE_CODE_OAUTH_TOKEN-<unset>}"\n', { mode: 0o755 });
+    await fs.chmod(script, 0o755);
+    return script;
+  }
+
+  /** A HOME whose default token file holds `content`, or none when null. */
+  async function homeWith(content: string | null): Promise<string> {
+    const home = await tempDir('home');
+    if (content !== null) {
+      const dir = path.join(home, '.config', 'bare-claude');
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, 'oauth'), content, { mode: 0o600 });
+    }
+    return home;
+  }
+
+  async function tokenSeenBy(options: Partial<LaunchOptions>): Promise<string> {
+    const claude = await spawnClaude({
+      callToAction: '# probe',
+      claudePath: await probeScript(),
+      noProcessEnv: true,
+      linkAuth: false,
+      ...options,
+    }, { stdout: 'pipe', stderr: 'ignore' });
+    try {
+      const [ stdout ] = await Promise.all([
+        new Response(claude.subprocess.stdout).text(),
+        claude.subprocess.exited,
+      ]);
+      return stdout;
+    } finally {
+      await claude.dispose();
+    }
+  }
+
+  test('reads the default file when the environment has no token', async () => {
+    const home = await homeWith('  sk-ant-oat01-from-default-file\n');
+    expect(await tokenSeenBy({ extraEnv: { HOME: home } })).toBe('sk-ant-oat01-from-default-file');
+  });
+
+  test('an explicit environment token wins over the file', async () => {
+    const home = await homeWith('sk-ant-oat01-from-default-file');
+    expect(await tokenSeenBy({ extraEnv: { HOME: home, CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-from-env' } }))
+      .toBe('sk-ant-oat01-from-env');
+  });
+
+  test('the tokenFile option beats BARE_CLAUDE_TOKEN_FILE, which beats the default', async () => {
+    const home = await homeWith('sk-ant-oat01-from-default-file');
+    const fromVariable = path.join(await tempDir('var'), 'oauth');
+    await fs.writeFile(fromVariable, 'sk-ant-oat01-from-variable\n', { mode: 0o600 });
+    const explicit = path.join(await tempDir('explicit'), 'oauth');
+    await fs.writeFile(explicit, 'sk-ant-oat01-from-option\n', { mode: 0o600 });
+
+    expect(await tokenSeenBy({ extraEnv: { HOME: home, BARE_CLAUDE_TOKEN_FILE: fromVariable } }))
+      .toBe('sk-ant-oat01-from-variable');
+    expect(await tokenSeenBy({ tokenFile: explicit, extraEnv: { HOME: home, BARE_CLAUDE_TOKEN_FILE: fromVariable } }))
+      .toBe('sk-ant-oat01-from-option');
+  });
+
+  test('honours XDG_CONFIG_HOME for the default location', async () => {
+    const xdg = await tempDir('xdg');
+    await fs.mkdir(path.join(xdg, 'bare-claude'), { recursive: true });
+    await fs.writeFile(path.join(xdg, 'bare-claude', 'oauth'), 'sk-ant-oat01-from-xdg', { mode: 0o600 });
+    const home = await homeWith('sk-ant-oat01-from-default-file');
+
+    expect(await tokenSeenBy({ extraEnv: { HOME: home, XDG_CONFIG_HOME: xdg } })).toBe('sk-ant-oat01-from-xdg');
+  });
+
+  test('leaves the child without a token when there is no file', async () => {
+    expect(await tokenSeenBy({ extraEnv: { HOME: await homeWith(null) } })).toBe('<unset>');
+  });
+
+  test('does not read the file beside an alternate credential', async () => {
+    const home = await homeWith('sk-ant-oat01-from-default-file');
+    expect(await tokenSeenBy({ extraEnv: { HOME: home, ANTHROPIC_AUTH_TOKEN: 'lmstudio' } })).toBe('<unset>');
+    expect(await tokenSeenBy({ extraEnv: { HOME: home, ANTHROPIC_API_KEY: 'sk-ant-api-not-real' } })).toBe('<unset>');
+  });
+
+  test('refuses an empty file before spawning, naming the path only', async () => {
+    const home = await homeWith('\n');
+    const file = path.join(home, '.config', 'bare-claude', 'oauth');
+    await expect(tokenSeenBy({ extraEnv: { HOME: home } })).rejects.toThrow(`token file ${file} is empty`);
   });
 });

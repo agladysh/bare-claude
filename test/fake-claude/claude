@@ -32,6 +32,11 @@
  *   FAKE_CLAUDE_VERSION        - what `--version` reports, in the real
  *                                binary's `X.Y.Z (Claude Code)` shape.
  *                                Default `'9.9.9'`.
+ *   FAKE_CLAUDE_ECHO_ENV       - name of a variable whose value in this
+ *                                process's environment is written to stdout
+ *                                as `NAME=<value>` (or `NAME=<unset>`),
+ *                                instead of FAKE_CLAUDE_STDOUT. How a test
+ *                                sees what the CLI put in the child's env.
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -89,5 +94,10 @@ if (process.env.FAKE_CLAUDE_WRITE_SESSION !== '0') {
   }
 }
 
-process.stdout.write(process.env.FAKE_CLAUDE_STDOUT ?? `${callToAction}\n\nDone.\n`);
+const echo = process.env.FAKE_CLAUDE_ECHO_ENV;
+process.stdout.write(
+  echo !== undefined
+    ? `${echo}=${process.env[echo] ?? '<unset>'}\n`
+    : process.env.FAKE_CLAUDE_STDOUT ?? `${callToAction}\n\nDone.\n`
+);
 process.exit(Number(process.env.FAKE_CLAUDE_EXIT_CODE ?? '0'));

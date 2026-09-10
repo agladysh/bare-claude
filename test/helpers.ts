@@ -63,7 +63,9 @@ function definedEnv(): Record<string, string> {
  * @param args - CLI arguments, e.g. `[ '--quiet', 'hello' ]`.
  * @param options.cwd - Working directory for the run; see {@link makeTempRepo}.
  * @param options.env - Extra environment variables layered over the current
- *   process environment. `PATH` is always rewritten so `fakeClaudeDir` comes
+ *   process environment. `BARE_CLAUDE_TOKEN_FILE` defaults to a file that
+ *   does not exist, so no test ever reads the operator's real token file.
+ *   `PATH` is always rewritten so `fakeClaudeDir` comes
  *   first — ahead of `options.env.PATH` when one is given, of the ambient
  *   `PATH` otherwise — which is what makes the subprocess's own `claude`
  *   invocation resolve to the fake binary instead of the real one.
@@ -77,6 +79,10 @@ export async function runCli(
 ): Promise<CliResult> {
   const env: Record<string, string> = {
     ...definedEnv(),
+    // Never the operator's real token file: unless a test names one, the
+    // CLI under test looks for a file that does not exist. A test that
+    // wants the default location sets this to '' (unset) and its own HOME.
+    BARE_CLAUDE_TOKEN_FILE: path.join(options.cwd, 'no-token-file'),
     ...options.env,
     PATH: `${fakeClaudeDir}:${options.env?.PATH ?? process.env.PATH ?? ''}`,
   };
