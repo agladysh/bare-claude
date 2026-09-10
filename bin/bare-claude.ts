@@ -232,7 +232,10 @@ async function loadPreset(): Promise<Startup> {
   }
 
   if (values.doctor) {
-    const report = await runDoctor({ claudePath: values['claude-path'] });
+    const report = await runDoctor({
+      claudePath: values['claude-path'],
+      tokenFile: values['token-file'],
+    });
     process.stdout.write(formatDoctorReport(report));
     return { kind: 'done', exitCode: report.ok ? 0 : 1 };
   }

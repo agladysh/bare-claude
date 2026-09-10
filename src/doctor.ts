@@ -3,6 +3,9 @@ import path from 'node:path';
 
 import { configFileName, locateConfig, parseConfig } from '@agladysh/bare-claude/config';
 import { commandName, commandSource, defaultBinDir, status } from '@agladysh/bare-claude/install';
+import {
+  alternateCredentialsIn, formatMode, hasToken, inspectTokenFile, resolveTokenFile, tokenVariable
+} from '@agladysh/bare-claude/token';
 
 import pkg from '../package.json';
 
@@ -14,7 +17,8 @@ import pkg from '../package.json';
  * the command on `PATH`, and the configuration file a run from here would
  * load. Each item says what was found; a failing one says what to do. The
  * doctor observes and never repairs, and it never prints a secret: the
- * credential item reports presence, not value.
+ * credential item reports presence, or the token file's path and mode, and
+ * never a value.
  */
 
 /** Outcome of one check. `fail` is what makes the doctor exit nonzero. */
@@ -64,6 +68,12 @@ export interface DoctorOptions {
 
   /** Where the command is expected on `PATH`. Defaults to `~/.local/bin`. */
   binDir?: string,
+
+  /**
+   * Token file to inspect, as `--token-file`. Defaults to
+   * `BARE_CLAUDE_TOKEN_FILE`, then the XDG config location.
+   */
+  tokenFile?: string,
 }
 
 /**
@@ -71,14 +81,14 @@ export interface DoctorOptions {
  * `CLAUDE_CONFIG_DIR` loses the ambient login session (measured 2026-07-26 on
  * 2.1.220), and this is the route that restores it.
  */
-const setupTokenHint = [
-  'A bare run does not inherit the ambient login session:',
-  '  claude setup-token                          # once; prints a long-lived OAuth token',
-  '  export CLAUDE_CODE_OAUTH_TOKEN=<the token>  # inherited by the subprocess',
-];
-
-/** Credentials Claude Code accepts instead of the subscription token. */
-const alternateCredentials = [ 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN' ];
+function setupTokenHint(tokenFile: string): string[] {
+  return [
+    'A bare run does not inherit the ambient login session:',
+    '  claude setup-token                          # once; prints a long-lived OAuth token',
+    '  export CLAUDE_CODE_OAUTH_TOKEN=<the token>  # inherited by the subprocess',
+    `or write the bare token, nothing else, to ${tokenFile} (chmod 600)`,
+  ];
+}
 
 /**
  * Runs `command --version` and returns its trimmed stdout, or null when the
@@ -179,24 +189,58 @@ async function checkGit(env: Record<string, string | undefined>, cwd: string): P
   };
 }
 
-function checkAuth(env: Record<string, string | undefined>): DoctorItem {
-  const present = (name: string) => (env[name] ?? '') !== '';
+/**
+ * Never the value. Presence in the environment, else the token file — its
+ * path, its mode, whether it is blank — else what to do.
+ */
+async function checkAuth(
+  env: Record<string, string | undefined>,
+  tokenFile: string | undefined
+): Promise<DoctorItem> {
+  const name = 'auth';
 
-  if (present('CLAUDE_CODE_OAUTH_TOKEN')) {
-    return { name: 'auth', status: 'ok', detail: 'CLAUDE_CODE_OAUTH_TOKEN present', hint: [] };
+  if (hasToken(env)) {
+    return { name, status: 'ok', detail: `${tokenVariable} present`, hint: [] };
   }
 
-  const alternates = alternateCredentials.filter(present);
-  if (alternates.length > 0) {
-    return {
-      name: 'auth',
-      status: 'warn',
-      detail: `CLAUDE_CODE_OAUTH_TOKEN absent; ${alternates.join(' and ')} present, so runs do not use the subscription`,
-      hint: setupTokenHint,
-    };
-  }
+  const filePath = resolveTokenFile(tokenFile, env);
+  const file = await inspectTokenFile(filePath);
 
-  return { name: 'auth', status: 'fail', detail: 'CLAUDE_CODE_OAUTH_TOKEN absent', hint: setupTokenHint };
+  switch (file.state) {
+    case 'present':
+      return file.exposed
+        ? {
+          name,
+          status: 'warn',
+          detail: `token file ${filePath} is mode ${formatMode(file.mode)}, readable beyond its owner`,
+          hint: [ `chmod 600 ${filePath}` ],
+        }
+        : { name, status: 'ok', detail: `token file ${filePath}`, hint: [] };
+
+    case 'empty':
+      return { name, status: 'fail', detail: `token file ${filePath} is empty`, hint: setupTokenHint(filePath) };
+
+    case 'unreadable':
+      return { name, status: 'fail', detail: `token file ${filePath}: ${file.reason}`, hint: [] };
+
+    case 'absent': {
+      const alternates = alternateCredentialsIn(env);
+      if (alternates.length > 0) {
+        return {
+          name,
+          status: 'warn',
+          detail: `${tokenVariable} absent, no token file at ${filePath}; ${alternates.join(' and ')} present, so runs do not use the subscription`,
+          hint: setupTokenHint(filePath),
+        };
+      }
+      return {
+        name,
+        status: 'fail',
+        detail: `${tokenVariable} absent, no token file at ${filePath}`,
+        hint: setupTokenHint(filePath),
+      };
+    }
+  }
 }
 
 async function checkInstall(
@@ -345,7 +389,7 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
     checkBun(),
     await checkClaude(claudePath, env, cwd),
     await checkGit(env, cwd),
-    checkAuth(env),
+    await checkAuth(env, options.tokenFile),
     await checkInstall(env, options.binDir),
     await checkPreset(cwd),
   ];
