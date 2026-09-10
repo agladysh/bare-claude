@@ -29,11 +29,21 @@
  *                                entirely, simulating a crash or a refused
  *                                launch before Claude Code ever created one.
  *                                Default writes it.
+ *   FAKE_CLAUDE_VERSION        - what `--version` reports, in the real
+ *                                binary's `X.Y.Z (Claude Code)` shape.
+ *                                Default `'9.9.9'`.
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
 const argv = process.argv.slice(2);
+
+// `claude --version` is what SessionBuilder and --doctor probe; it is the one
+// invocation with no session, no config dir and no call to action.
+if (argv[0] === '--version') {
+  process.stdout.write(`${process.env.FAKE_CLAUDE_VERSION ?? '9.9.9'} (Claude Code)\n`);
+  process.exit(0);
+}
 
 function flagValue(name: string): string | undefined {
   const i = argv.indexOf(name);

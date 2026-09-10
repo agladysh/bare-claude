@@ -64,8 +64,9 @@ function definedEnv(): Record<string, string> {
  * @param options.cwd - Working directory for the run; see {@link makeTempRepo}.
  * @param options.env - Extra environment variables layered over the current
  *   process environment. `PATH` is always rewritten so `fakeClaudeDir` comes
- *   first, which is what makes the subprocess's own `claude` invocation
- *   resolve to the fake binary instead of the real one.
+ *   first — ahead of `options.env.PATH` when one is given, of the ambient
+ *   `PATH` otherwise — which is what makes the subprocess's own `claude`
+ *   invocation resolve to the fake binary instead of the real one.
  * @param options.stdin - Text piped to the CLI's stdin. Omit to leave stdin
  *   closed, so a run with a positional call to action never blocks waiting
  *   for one that will not come.
@@ -77,7 +78,7 @@ export async function runCli(
   const env: Record<string, string> = {
     ...definedEnv(),
     ...options.env,
-    PATH: `${fakeClaudeDir}:${process.env.PATH ?? ''}`,
+    PATH: `${fakeClaudeDir}:${options.env?.PATH ?? process.env.PATH ?? ''}`,
   };
 
   // Always a pipe, closed immediately when the caller has nothing to write:
