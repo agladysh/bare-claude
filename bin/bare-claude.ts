@@ -21,6 +21,7 @@ import {
   configFileName, effortLevel, emptyConfig, locateConfig, parseConfig, type Config, type EffortLevel
 } from '@agladysh/bare-claude/config';
 import { resolvePreset, type DynamicPreset, type Preset } from '@agladysh/bare-claude/preset';
+import { formatDoctorReport, runDoctor } from '@agladysh/bare-claude/doctor';
 import { readUsage } from '@agladysh/bare-claude/usage';
 import { deepmerge } from 'deepmerge-ts';
 
@@ -55,11 +56,18 @@ function displayHelp() {
     '      --debug            Print the resolved configuration and unrecognized events',
     '      --display <file>   Render an existing session JSONL and exit',
     '      --usage            Report subscription usage as JSON and exit',
+    '      --doctor           Check bun, claude, git, the credential, the PATH install',
+    '                         and the preset file; exit 1 when something required is missing',
     '  -v, --version          Print the version and exit',
     '  -h, --help             Print this help and exit',
     '',
     'The call to action is read from stdin when no positional one is given.',
     'Exits with the exit code of the `claude` subprocess.',
+    '',
+    'A bare run does not inherit the ambient login session: set CLAUDE_CODE_OAUTH_TOKEN',
+    'from `claude setup-token`. Put bare-claude on PATH from a checkout with',
+    '`bun run install:user`; `bun run install:status` and `bun run install:uninstall`',
+    'inspect and remove it.',
     '',
   ].join('\n'));
 }
@@ -139,6 +147,9 @@ async function loadPreset(): Promise<Startup> {
       usage: {
         type: 'boolean',
       },
+      doctor: {
+        type: 'boolean',
+      },
       effort: {
         type: 'string',
       },
@@ -210,6 +221,12 @@ async function loadPreset(): Promise<Startup> {
     }
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     return { kind: 'done', exitCode: 0 };
+  }
+
+  if (values.doctor) {
+    const report = await runDoctor({ claudePath: values['claude-path'] });
+    process.stdout.write(formatDoctorReport(report));
+    return { kind: 'done', exitCode: report.ok ? 0 : 1 };
   }
 
   // No positional call to action: take it from stdin when piped into. Guarded

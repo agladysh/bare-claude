@@ -41,6 +41,7 @@
     "./config": "./src/config.ts",
     "./events": "./src/events.ts",
     "./display": "./src/display.ts",
+    "./doctor": "./src/doctor.ts",
     "./install": "./src/install.ts",
     "./preload": "./src/preload.ts",
     "./preset": "./src/preset.ts",
