@@ -18,7 +18,7 @@ import { SessionBuilder } from '@agladysh/bare-claude/SessionBuilder';
 
 import pkg from '../package.json';
 import {
-  effortLevel, emptyConfig, parseConfig, type Config, type EffortLevel
+  configFileName, effortLevel, emptyConfig, locateConfig, parseConfig, type Config, type EffortLevel
 } from '@agladysh/bare-claude/config';
 import { resolvePreset, type DynamicPreset, type Preset } from '@agladysh/bare-claude/preset';
 import { readUsage } from '@agladysh/bare-claude/usage';
@@ -65,10 +65,13 @@ function displayHelp() {
 }
 
 async function loadConfig(): Promise<Config> {
-  // TODO: Use cosmiconfig instead?
-  // TODO: Verify this handles git submodules and git worktrees correctly.
-  const rootDir = (await $ `git rev-parse --show-toplevel`.text()).trim();
-  const configPath = path.join(rootDir, 'bare-claude.yaml');
+  const configPath = await locateConfig();
+  if (configPath === null) {
+    throw new Error(
+      `${process.cwd()} is not inside a Git working copy, which is where ${configFileName} is looked up`
+    );
+  }
+
   const configFile = Bun.file(configPath);
   if (!await configFile.exists()) {
     return emptyConfig();
