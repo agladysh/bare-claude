@@ -51,6 +51,10 @@ function displayHelp() {
     '                         Cap tool output going into context',
     '      --claude-path <path>  Claude Code executable to run (default: claude on PATH)',
     '      --claude-arg <arg> Forward a flag to claude verbatim (repeatable)',
+    '      --token-file <path>',
+    '                         File holding the OAuth token, used when the environment',
+    '                         has none (default: $BARE_CLAUDE_TOKEN_FILE, then',
+    '                         ~/.config/bare-claude/oauth)',
     '',
     '      --verbose          Print more events in the transcript',
     '      --debug            Print the resolved configuration and unrecognized events',
@@ -65,7 +69,8 @@ function displayHelp() {
     'Exits with the exit code of the `claude` subprocess.',
     '',
     'A bare run does not inherit the ambient login session: set CLAUDE_CODE_OAUTH_TOKEN',
-    'from `claude setup-token`. Put bare-claude on PATH from a checkout with',
+    'from `claude setup-token`, or write the bare token to ~/.config/bare-claude/oauth',
+    '(chmod 600). Put bare-claude on PATH from a checkout with',
     '`bun run install:user`; `bun run install:status` and `bun run install:uninstall`',
     'inspect and remove it.',
     '',
@@ -107,6 +112,9 @@ async function loadPreset(): Promise<Startup> {
         short: 'l',
       },
       'claude-path': {
+        type: 'string',
+      },
+      'token-file': {
         type: 'string',
       },
       model: {
@@ -246,6 +254,7 @@ async function loadPreset(): Promise<Startup> {
   set('callToAction', callToAction);
   set('launcher', parseLauncher(values.launcher));
   set('claudePath', values['claude-path']);
+  set('tokenFile', values['token-file']);
   set('model', values.model);
   set('read', values.read);
   set('verbose', values.verbose);

@@ -106,6 +106,7 @@ const preset = type({
   'customSessionData?': type({ '+': 'reject', sessionId: 'string', value: 'string' }).or('null'),
   'addDirs?': 'string[]',
   'linkAuth?': 'boolean',
+  'tokenFile?': 'string | null',
   'noProcessEnv?': 'boolean',
 
   // What it may do.

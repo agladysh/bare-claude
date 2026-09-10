@@ -46,7 +46,8 @@
     "./preload": "./src/preload.ts",
     "./preset": "./src/preset.ts",
     "./usage": "./src/usage.ts",
-    "./SessionBuilder": "./src/SessionBuilder.ts"
+    "./SessionBuilder": "./src/SessionBuilder.ts",
+    "./token": "./src/token.ts"
   },
   "bin": {
     "bare-claude": "bin/bare-claude.ts"
