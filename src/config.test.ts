@@ -1,8 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 
+import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 
-import { emptyConfig, parseConfig } from './config.ts';
+import { emptyConfig, locateConfig, parseConfig } from './config.ts';
 
 const repositoryConfig = path.join(import.meta.dir, '..', 'bare-claude.yaml');
 
@@ -153,5 +155,32 @@ describe('parseConfig', () => {
   test('reports a YAML syntax error against the file, not as a crash', () => {
     expect(() => parseConfig('presets: [1, 2', 'broken.yaml'))
       .toThrow('broken.yaml is not valid YAML');
+  });
+});
+
+describe('locateConfig', () => {
+  test('names bare-claude.yaml at the root of the working copy, whether or not it exists', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'bare-claude-config-test-'));
+    try {
+      const init = Bun.spawn({ cmd: [ 'git', 'init', '-q' ], cwd: root, stdout: 'ignore', stderr: 'ignore' });
+      await init.exited;
+      const nested = path.join(root, 'a', 'b');
+      await fs.mkdir(nested, { recursive: true });
+
+      const expected = path.join(await fs.realpath(root), 'bare-claude.yaml');
+      expect(await locateConfig(nested)).toBe(expected);
+      expect(await Bun.file(expected).exists()).toBe(false);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('is null outside a Git working copy', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bare-claude-config-test-'));
+    try {
+      expect(await locateConfig(dir)).toBeNull();
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 });

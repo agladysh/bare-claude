@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 import { scope, type } from 'arktype';
 
 import type { DynamicPreset } from '@agladysh/bare-claude/preset';
@@ -170,6 +172,39 @@ export interface Config {
 
 /** The empty configuration, for when there is no file to read. */
 export const emptyConfig = (): Config => ({ configPreset: {}, presets: {} });
+
+/** Name of the configuration file, looked up at the root of the Git working copy. */
+export const configFileName = 'bare-claude.yaml';
+
+/**
+ * Where the configuration file would be read from: `bare-claude.yaml` at the
+ * root of the Git working copy containing `cwd`. The file need not exist —
+ * this answers "which file", and the caller decides what a missing one means.
+ *
+ * Both the CLI and `--doctor` resolve through here, so what the doctor
+ * reports is by construction what a run would load.
+ * @param cwd - Directory to resolve from; defaults to the process cwd
+ * @returns The configuration file path, or null when `cwd` is not inside a
+ *   Git working copy
+ */
+export async function locateConfig(cwd: string = process.cwd()): Promise<string | null> {
+  // TODO: Use cosmiconfig instead?
+  // TODO: Verify this handles git submodules and git worktrees correctly.
+  const git = Bun.spawn({
+    cmd: [ 'git', 'rev-parse', '--show-toplevel' ],
+    cwd,
+    stdout: 'pipe',
+    stderr: 'ignore',
+  });
+  const [ stdout, exitCode ] = await Promise.all([
+    new Response(git.stdout).text(),
+    git.exited,
+  ]);
+  if (exitCode !== 0) {
+    return null;
+  }
+  return path.join(stdout.trim(), configFileName);
+}
 
 /** A YAML mapping, the only shape a configuration file may have at its root. */
 function isMapping(value: unknown): value is Record<string, unknown> {
