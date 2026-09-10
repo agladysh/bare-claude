@@ -101,21 +101,113 @@ describe('runDoctor', () => {
   });
 
   describe('auth', () => {
-    test('an absent token fails with the setup-token guidance from the README', async () => {
-      const { env, cwd } = await healthy();
+    /** The default token file under a healthy() HOME, written with `content` and `mode`. */
+    async function defaultTokenFile(home: string, content: string, mode = 0o600): Promise<string> {
+      const dir = path.join(home, '.config', 'bare-claude');
+      await fs.mkdir(dir, { recursive: true });
+      const file = path.join(dir, 'oauth');
+      await fs.writeFile(file, content, { mode });
+      await fs.chmod(file, mode);
+      return file;
+    }
+
+    test('an absent token and no file fails, with the setup-token guidance extended by the file', async () => {
+      const { env, cwd, home } = await healthy();
       const { CLAUDE_CODE_OAUTH_TOKEN: _dropped, ...withoutToken } = env;
+      const report = await runDoctor({ env: withoutToken, cwd });
+      const expectedFile = path.join(home, '.config', 'bare-claude', 'oauth');
+
+      const auth = item(report, 'auth');
+      expect(auth.status).toBe('fail');
+      expect(auth.detail).toBe(`CLAUDE_CODE_OAUTH_TOKEN absent, no token file at ${expectedFile}`);
+      expect(auth.hint).toEqual([
+        'A bare run does not inherit the ambient login session:',
+        '  claude setup-token                          # once; prints a long-lived OAuth token',
+        '  export CLAUDE_CODE_OAUTH_TOKEN=<the token>  # inherited by the subprocess',
+        `or write the bare token, nothing else, to ${expectedFile} (chmod 600)`,
+      ]);
+      expect(report.ok).toBe(false);
+    });
+
+    test('a private token file is ok, reported by path', async () => {
+      const { env, cwd, home } = await healthy();
+      const { CLAUDE_CODE_OAUTH_TOKEN: _dropped, ...withoutToken } = env;
+      const file = await defaultTokenFile(home, 'sk-ant-oat01-from-file\n');
+      const report = await runDoctor({ env: withoutToken, cwd });
+
+      expect(item(report, 'auth')).toEqual({ name: 'auth', status: 'ok', detail: `token file ${file}`, hint: [] });
+      expect(report.ok).toBe(true);
+    });
+
+    test('a token file readable beyond its owner warns, with chmod as the remedy', async () => {
+      const { env, cwd, home } = await healthy();
+      const { CLAUDE_CODE_OAUTH_TOKEN: _dropped, ...withoutToken } = env;
+      const file = await defaultTokenFile(home, 'sk-ant-oat01-from-file', 0o644);
+      const report = await runDoctor({ env: withoutToken, cwd });
+
+      const auth = item(report, 'auth');
+      expect(auth.status).toBe('warn');
+      expect(auth.detail).toBe(`token file ${file} is mode 644, readable beyond its owner`);
+      expect(auth.hint).toEqual([ `chmod 600 ${file}` ]);
+      expect(report.ok).toBe(true);
+    });
+
+    test('an empty token file fails', async () => {
+      const { env, cwd, home } = await healthy();
+      const { CLAUDE_CODE_OAUTH_TOKEN: _dropped, ...withoutToken } = env;
+      const file = await defaultTokenFile(home, ' \n');
       const report = await runDoctor({ env: withoutToken, cwd });
 
       const auth = item(report, 'auth');
       expect(auth.status).toBe('fail');
-      expect(auth.detail).toBe('CLAUDE_CODE_OAUTH_TOKEN absent');
-      expect(auth.hint.join('\n')).toContain(
-        'claude setup-token                          # once; prints a long-lived OAuth token'
-      );
-      expect(auth.hint.join('\n')).toContain(
-        'export CLAUDE_CODE_OAUTH_TOKEN=<the token>  # inherited by the subprocess'
-      );
+      expect(auth.detail).toBe(`token file ${file} is empty`);
+      expect(auth.hint.join('\n')).toContain('claude setup-token');
       expect(report.ok).toBe(false);
+    });
+
+    test('an environment token wins, even over an exposed file', async () => {
+      const { env, cwd, home } = await healthy();
+      await defaultTokenFile(home, 'sk-ant-oat01-from-file', 0o644);
+      const report = await runDoctor({ env, cwd });
+
+      expect(item(report, 'auth')).toEqual({
+        name: 'auth', status: 'ok', detail: 'CLAUDE_CODE_OAUTH_TOKEN present', hint: [],
+      });
+    });
+
+    test('the tokenFile option beats BARE_CLAUDE_TOKEN_FILE, which beats XDG_CONFIG_HOME', async () => {
+      const { env, cwd } = await healthy();
+      const { CLAUDE_CODE_OAUTH_TOKEN: _dropped, ...withoutToken } = env;
+      const xdg = await tempDir('xdg');
+      const fromVariable = path.join(await tempDir('var'), 'oauth');
+      await fs.writeFile(fromVariable, 'sk-ant-oat01-a', { mode: 0o600 });
+      const explicit = path.join(await tempDir('explicit'), 'oauth');
+      await fs.writeFile(explicit, 'sk-ant-oat01-b', { mode: 0o600 });
+
+      const viaXdg = await runDoctor({ env: { ...withoutToken, XDG_CONFIG_HOME: xdg }, cwd });
+      expect(item(viaXdg, 'auth').detail).toBe(
+        `CLAUDE_CODE_OAUTH_TOKEN absent, no token file at ${path.join(xdg, 'bare-claude', 'oauth')}`
+      );
+
+      const viaVariable = await runDoctor({
+        env: { ...withoutToken, XDG_CONFIG_HOME: xdg, BARE_CLAUDE_TOKEN_FILE: fromVariable }, cwd,
+      });
+      expect(item(viaVariable, 'auth').detail).toBe(`token file ${fromVariable}`);
+
+      const viaOption = await runDoctor({
+        env: { ...withoutToken, XDG_CONFIG_HOME: xdg, BARE_CLAUDE_TOKEN_FILE: fromVariable }, cwd, tokenFile: explicit,
+      });
+      expect(item(viaOption, 'auth').detail).toBe(`token file ${explicit}`);
+    });
+
+    test('the rendered report never contains the file\'s content', async () => {
+      const { env, cwd, home } = await healthy();
+      const { CLAUDE_CODE_OAUTH_TOKEN: _dropped, ...withoutToken } = env;
+      await defaultTokenFile(home, 'sk-ant-oat01-from-file', 0o644);
+      const text = formatDoctorReport(await runDoctor({ env: withoutToken, cwd }));
+
+      expect(text).toContain('warn auth: token file');
+      expect(text).not.toContain('sk-ant-oat01');
     });
 
     test('an empty token is absent, not present', async () => {
@@ -125,13 +217,14 @@ describe('runDoctor', () => {
       expect(item(report, 'auth').status).toBe('fail');
     });
 
-    test('an alternate credential downgrades the missing token to a warning', async () => {
+    test('an alternate credential downgrades a missing token and file to a warning', async () => {
       const { env, cwd } = await healthy();
       const { CLAUDE_CODE_OAUTH_TOKEN: _dropped, ...withoutToken } = env;
       const report = await runDoctor({ env: { ...withoutToken, ANTHROPIC_API_KEY: 'sk-ant-api-not-real' }, cwd });
 
       const auth = item(report, 'auth');
       expect(auth.status).toBe('warn');
+      expect(auth.detail).toContain('no token file at');
       expect(auth.detail).toContain('ANTHROPIC_API_KEY present');
       expect(report.ok).toBe(true);
     });
