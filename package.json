@@ -41,6 +41,7 @@
     "./config": "./src/config.ts",
     "./events": "./src/events.ts",
     "./display": "./src/display.ts",
+    "./install": "./src/install.ts",
     "./preload": "./src/preload.ts",
     "./preset": "./src/preset.ts",
     "./usage": "./src/usage.ts",
@@ -60,7 +61,10 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "check": "bun run typecheck && bun test"
+    "check": "bun run typecheck && bun test",
+    "install:user": "bun bin/install-bare-claude.ts install",
+    "install:status": "bun bin/install-bare-claude.ts status",
+    "install:uninstall": "bun bin/install-bare-claude.ts uninstall"
   },
   "engines": {
     "bun": ">=1.3"
