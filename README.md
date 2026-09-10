@@ -23,6 +23,28 @@ export CLAUDE_CODE_OAUTH_TOKEN=<the token>  # inherited by the subprocess
 bare-claude -- 'Explain this project'
 ```
 
+The shell is not the only place the token can live. When the environment carries neither
+`CLAUDE_CODE_OAUTH_TOKEN` nor an alternate credential, `bare-claude` reads the token from a file —
+the bare token, nothing else, surrounding whitespace ignored — and puts it in the subprocess's
+environment at spawn time:
+
+```bash
+mkdir -p ~/.config/bare-claude
+chmod 700 ~/.config/bare-claude
+# put the token from `claude setup-token`, and nothing else, in this file:
+chmod 600 ~/.config/bare-claude/oauth
+bare-claude -- 'Explain this project'
+```
+
+The default is `$XDG_CONFIG_HOME/bare-claude/oauth` when `XDG_CONFIG_HOME` is set, else
+`~/.config/bare-claude/oauth`; `--token-file PATH`, the `tokenFile` launch option, or
+`BARE_CLAUDE_TOKEN_FILE` name another file, in that order of precedence. An explicit
+`CLAUDE_CODE_OAUTH_TOKEN` always wins. `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` in the
+environment disables the lookup — the token is never handed to a run pointed at another endpoint
+— and the `ollama` launcher never reads it. A missing file is fine; an empty or unreadable one is
+an error naming the path. The value is read at spawn time and goes nowhere else: not into
+`--debug` output, not into the doctor, not into an error message.
+
 Programmatically, pass it through `extraEnv` rather than relying on the ambient environment:
 
 ```typescript
@@ -115,6 +137,9 @@ Options:
 - `--max-tokens [n]`: cap model output. Note this *errors* the turn rather than truncating it
 - `--max-output-length [n]`: cap tool output going into context
 - `--claude-path [path]`: Claude Code executable to run (default: `claude` on `PATH`)
+- `--token-file [path]`: file holding the OAuth token, read when the environment has none
+  (default: `$BARE_CLAUDE_TOKEN_FILE`, then `~/.config/bare-claude/oauth`; see
+  [Authentication](#authentication))
 - `--claude-arg [arg]`: forward a flag to `claude` verbatim, may be included several times
 - `-v, --version`: print the version and exit
 - `-h, --help`: print this help and exit
@@ -351,10 +376,11 @@ bare-claude --doctor
 ok   bun: 1.3.13 at /opt/homebrew/bin/bun
 ok   claude: 2.1.268 at /Users/you/.local/bin/claude
 ok   git: 2.55.0 at /opt/homebrew/bin/git
-fail auth: CLAUDE_CODE_OAUTH_TOKEN absent
+fail auth: CLAUDE_CODE_OAUTH_TOKEN absent, no token file at /Users/you/.config/bare-claude/oauth
        A bare run does not inherit the ambient login session:
          claude setup-token                          # once; prints a long-lived OAuth token
          export CLAUDE_CODE_OAUTH_TOKEN=<the token>  # inherited by the subprocess
+       or write the bare token, nothing else, to /Users/you/.config/bare-claude/oauth (chmod 600)
 ok   install: /Users/you/.local/bin/bare-claude -> /Users/you/projects/bare-claude/bin/bare-claude.ts
 ok   preset: /Users/you/projects/bare-claude/bare-claude.yaml (presets: default, changelog)
 ```
@@ -362,8 +388,11 @@ ok   preset: /Users/you/projects/bare-claude/bare-claude.yaml (presets: default,
 One line per item, a hint beneath any that needs fixing. `bun` is the running runtime, checked
 against `engines.bun`. `claude` is the executable a run would spawn — `--claude-path` applies — and
 its version. `git` is what locates the preset file and resolves `--read`. `auth` says whether
-`CLAUDE_CODE_OAUTH_TOKEN` is present, never its value, and is a warning rather than a failure when
-`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` stands in. `install` is whether `bare-claude` is on
+`CLAUDE_CODE_OAUTH_TOKEN` is present in the environment; failing that, whether the token file is
+(`--token-file` applies) — by path, with a warning when its mode lets anyone but its owner read
+it and a failure when it is empty; failing both, what to do. It is a warning rather than a
+failure when `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` stands in. Never a value, from either
+source. `install` is whether `bare-claude` is on
 `PATH`, and whether it is this checkout's symlink. `preset` is the `bare-claude.yaml` a run from
 the current directory would load, validated.
 
@@ -486,6 +515,11 @@ Optional:
 - `linkAuth`: Whether to symlink the credential file from the real Claude config directory into the
   ephemeral one. Only helps where Claude Code keeps credentials in a file — on macOS they live in
   the login keychain, so use `CLAUDE_CODE_OAUTH_TOKEN` there. Defaults to `true`.
+- `tokenFile`: File holding the subscription token, read into the child's `CLAUDE_CODE_OAUTH_TOKEN`
+  at spawn time when the child's environment carries neither that variable nor an alternate
+  credential, for the `claude` launcher only. Defaults to `BARE_CLAUDE_TOKEN_FILE` from the
+  child's environment, then `$XDG_CONFIG_HOME/bare-claude/oauth`, then
+  `~/.config/bare-claude/oauth`. See [Authentication](#authentication). Defaults to `null`.
 - `tools`: Tools the run may use (`--tools`). `[]` allows none. Note `--allowedTools ''` does *not*
   achieve this: it fails open. Defaults to `null`.
 - `disallowedTools`: Tools the run may not use (`--disallowed-tools`). `['*']` denies all.
@@ -590,12 +624,24 @@ the enclosing Git working copy, whether or not the file exists — or `null` out
 `DynamicPreset`'s `use` chain and applies the CLI display defaults to produce a runnable `Preset`
 — the function behind the [preset resolution order](#preset-resolution-order) above.
 
+### Token file
+
+From `@agladysh/bare-claude/token`, what `spawnClaude` and the doctor share. `resolveTokenFile(explicit?, env?)`
+applies the precedence above and `defaultTokenFile(env?)` is its last step; `tokenVariable`,
+`tokenFileVariable` and `alternateCredentialVariables` name the variables involved. `hasToken(env)`,
+`alternateCredentialsIn(env)` and `hasCredential(env)` say what an environment already carries.
+`inspectTokenFile(path)` reports `present`, `empty`, `absent` or `unreadable` with the mode and whether
+it is `exposed` beyond its owner — never the content; `formatMode(mode)` prints the `chmod` digits.
+`readTokenFile(path)` is the one function that returns the value: trimmed, `null` when there is no
+file, throwing on an empty or unreadable one.
+
 ### runDoctor(options?) and formatDoctorReport(report)
 
 From `@agladysh/bare-claude/doctor`. `runDoctor` returns a `DoctorReport`: `items`, each
 `{ name, status: 'ok' | 'warn' | 'fail', detail, hint }` in print order, and `ok`, false when any
 item failed. Every input is an option — `claudePath`, `env`, `cwd`, `binDir` — so it can be run
-against a machine assembled in a test. `formatDoctorReport` renders what `--doctor` prints. See
+against a machine assembled in a test, plus `tokenFile`. `formatDoctorReport` renders what
+`--doctor` prints. See
 [Doctor](#doctor).
 
 ### install(binDir, options?), status(binDir), uninstall(binDir)

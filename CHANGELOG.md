@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- The subscription token can live in a file: `~/.config/bare-claude/oauth` (under
+  `XDG_CONFIG_HOME` when set), or the file named by `--token-file`, the `tokenFile` launch option
+  or `BARE_CLAUDE_TOKEN_FILE`. `spawnClaude()` reads it, trimmed, into the child's
+  `CLAUDE_CODE_OAUTH_TOKEN` at spawn time when the child's environment carries neither a token
+  nor an alternate credential, for the `claude` launcher only. An explicit environment token
+  wins; an empty or unreadable file is an error naming the path; the value reaches nothing but
+  the child. The library is `@agladysh/bare-claude/token`.
+- `--doctor`'s `auth` line reports the token file when the environment has no token: its path,
+  a warning when its mode lets anyone but its owner read it, a failure when it is empty, and the
+  file as a second route in the setup-token hint when neither is there.
+
 ## [v0.9.0] - 2026-09-11
 
 ### Added
