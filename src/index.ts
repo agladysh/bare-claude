@@ -251,6 +251,17 @@ export interface LaunchOptions {
   noHousekeeping?: boolean,
 
   /**
+   * Whether to disable the Bash tool's per-command changed-file diff by
+   * writing `CLAUDE_CODE_BASH_EDIT_DIFF=0` into the settings `env`. Defaults
+   * to true. Claude reads that variable before any `bashEditDiffEnabled`
+   * setting, so while it is set a caller's `bashEditDiffEnabled: true` does
+   * not re-enable the diff. False only omits the variable: a caller's
+   * `bashEditDiffEnabled: false` (or policy) still disables the diff, and
+   * otherwise Claude's own default applies.
+   */
+  noBashEditDiff?: boolean,
+
+  /**
    * Whether to disable calling the mothership.
    * Defaults to false when launcher is claude, true otherwise.
    */
@@ -386,6 +397,7 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
     noCompact: o.noCompact ?? true,
     noIntegrations: o.noIntegrations ?? true,
     noHousekeeping: o.noHousekeeping ?? true,
+    noBashEditDiff: o.noBashEditDiff ?? true,
     // Branches on the resolved launcher, not the raw option: omitting
     // `launcher` means `claude`, and must behave like passing it.
     noMothership: o.noMothership ?? ((o.launcher ?? 'claude') !== 'claude'),
@@ -675,6 +687,29 @@ export function buildSettings(config: LaunchConfig): JsonObject {
     settings.cleanupPeriodDays = 99999;
     env.DISABLE_AUTOUPDATER = '1';
     env.DISABLE_INSTALLATION_CHECKS = '1';
+  }
+
+  if (config.noBashEditDiff) {
+    // Read from claude 2.1.280 on 2026-09-23 (functions U2t, qGr, X2t). When
+    // the diff is enabled (by default only in `auto` and `bypassPermissions`
+    // modes, behind a server-side cohort flag), each process keeps one private
+    // Git store per repository it runs Bash in, under
+    // `$TMPDIR/claude-<uid>/bash-edit-diff/<session>-<repo>-<random>/`. The
+    // store is seeded from a copy of the repository index and updated around
+    // every Bash command. Where that baseline cannot be created (observed: one
+    // tracked path containing a TAB failed the index validation), the store
+    // re-hashes every tracked file into new loose objects and is abandoned.
+    // The reason was not recorded; a time limit is the inferred cause. A second
+    // store is made, and the process stops after two failures. Abandoned
+    // stores remain until Claude's own sweep removes those older than
+    // min(cleanupPeriodDays, 2) days. Headless runs on one repository
+    // accumulated tens of gigabytes. The diff is also cohort-dependent,
+    // which makes a run less reproducible.
+    //
+    // The `bashEditDiffEnabled: false` settings key has the same effect but is
+    // not in the schemastore schema yet, and this variable is checked before
+    // it (a tri-state: 0/false/no/off), so the variable is the route used.
+    env.CLAUDE_CODE_BASH_EDIT_DIFF = '0';
   }
 
   // If using with Anthropic models, best set to false.

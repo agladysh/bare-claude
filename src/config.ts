@@ -128,6 +128,7 @@ const preset = type({
   'noCompact?': 'boolean',
   'noIntegrations?': 'boolean',
   'noHousekeeping?': 'boolean',
+  'noBashEditDiff?': 'boolean',
   'noMothership?': 'boolean',
 
   // Escape hatches, deliberately unconstrained.
