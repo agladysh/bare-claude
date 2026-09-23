@@ -506,6 +506,19 @@ Optional:
 - `noCompact`: Whether to disable compact. Defaults to `true`.
 - `noIntegrations`: Whether to disable integrations. Defaults to `true`.
 - `noHousekeeping`: Whether to disable housekeeping. Defaults to `true`.
+- `noBashEditDiff`: Whether to disable the Bash tool's diff of the files each command changed, by
+  writing `CLAUDE_CODE_BASH_EDIT_DIFF=0` into the settings `env`. Defaults to `true`.
+  - **What the diff costs.** When enabled, each Claude process keeps one private Git store per
+    repository under its temporary directory (`bash-edit-diff/`) and updates it on every Bash
+    command. A store whose baseline cannot be created re-hashes the whole tree and is abandoned.
+    Abandoned stores stay until Claude's two-day sweep, and headless runs on one large repository
+    accumulated tens of gigabytes that way.
+  - **Composition.** Claude reads the variable before any `bashEditDiffEnabled` setting, so while
+    this option is on, `extraSettings: { bashEditDiffEnabled: true }` does not re-enable the diff.
+    Setting `noBashEditDiff: false` only omits the variable: a caller's
+    `extraSettings: { bashEditDiffEnabled: false }` still keeps the diff off, and without one
+    Claude's own default applies (on only in `auto`/`bypassPermissions` mode, for enabled
+    cohorts). `extraSettings.env.CLAUDE_CODE_BASH_EDIT_DIFF` is merged last and wins either way.
 - `noMothership`: Whether to disable calling the mothership.
   Defaults to `false` if `launcher` is `claude` (including when it is left unset), and `true` otherwise.
 - `noProcessEnv`: Whether to disable process environment inheritance. Defaults to `false`.

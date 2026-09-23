@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Changed
+
+- New `noBashEditDiff` launch option, default `true`, sets `CLAUDE_CODE_BASH_EDIT_DIFF=0` in the
+  settings `env`. Since 2.1.269, Claude Code in `auto`/`bypassPermissions` mode (for enabled
+  cohorts) keeps one private Git store per process and repository under
+  `$TMPDIR/claude-<uid>/bash-edit-diff/` to diff each Bash command. Where the store's baseline
+  cannot be created, it re-hashes the whole tree and is abandoned. Abandoned stores remain until
+  Claude's sweep of stores older than min(`cleanupPeriodDays`, 2) days. Headless runs on one
+  large repository accumulated tens of gigabytes. `noBashEditDiff: false` omits the variable; see the
+  README for how that composes with a caller's `bashEditDiffEnabled`.
+
 ### Added
 
 - The subscription token can live in a file: `~/.config/bare-claude/oauth` (under
