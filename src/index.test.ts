@@ -79,6 +79,7 @@ describe('LaunchConfig', () => {
       noCompact: true,
       noIntegrations: true,
       noHousekeeping: true,
+      noBashEditDiff: true,
       noMothership: false,
       noProcessEnv: false,
       linkAuth: true,
@@ -396,6 +397,7 @@ describe('buildSettings', () => {
         CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL: '1',
         DISABLE_AUTOUPDATER: '1',
         DISABLE_INSTALLATION_CHECKS: '1',
+        CLAUDE_CODE_BASH_EDIT_DIFF: '0',
       },
     });
   });
@@ -413,6 +415,7 @@ describe('buildSettings', () => {
       noCompact: false,
       noIntegrations: false,
       noHousekeeping: false,
+      noBashEditDiff: false,
       noMothership: false,
     }));
     expect(off).toEqual({
@@ -529,6 +532,33 @@ describe('buildSettings', () => {
     expect(off.cleanupPeriodDays).toBeUndefined();
     expect(settingsEnv(off).DISABLE_AUTOUPDATER).toBeUndefined();
     expect(settingsEnv(off).DISABLE_INSTALLATION_CHECKS).toBeUndefined();
+  });
+
+  test('noBashEditDiff composes with caller settings rather than replacing them', () => {
+    const grants = { permissions: { allow: [ 'Bash(git status:*)' ] }, env: { ROUTINE: '1' } };
+    // Default on, with a caller that also disables the diff and grants tools.
+    const both = buildSettings(cfg({ extraSettings: { ...grants, bashEditDiffEnabled: false } }));
+    expect(both.bashEditDiffEnabled).toBe(false);
+    expect(both.permissions).toEqual({
+      defaultMode: 'auto', disableBypassPermissionsMode: 'disable', allow: [ 'Bash(git status:*)' ],
+    });
+    expect(settingsEnv(both).ROUTINE).toBe('1');
+    expect(settingsEnv(both).CLAUDE_CODE_BASH_EDIT_DIFF).toBe('0');
+    // Opting out removes only this library's variable; the caller's false stands.
+    const optedOut = buildSettings(cfg({ noBashEditDiff: false, extraSettings: { bashEditDiffEnabled: false } }));
+    expect(settingsEnv(optedOut).CLAUDE_CODE_BASH_EDIT_DIFF).toBeUndefined();
+    expect(optedOut.bashEditDiffEnabled).toBe(false);
+    // A caller's settings key alone does not override the variable Claude reads first.
+    const keyOnly = buildSettings(cfg({ extraSettings: { bashEditDiffEnabled: true } }));
+    expect(settingsEnv(keyOnly).CLAUDE_CODE_BASH_EDIT_DIFF).toBe('0');
+  });
+
+  test('noBashEditDiff turns off the per-command working-tree snapshots', () => {
+    expect(settingsEnv(buildSettings(cfg())).CLAUDE_CODE_BASH_EDIT_DIFF).toBe('0');
+    expect(settingsEnv(buildSettings(cfg({ noBashEditDiff: false }))).CLAUDE_CODE_BASH_EDIT_DIFF).toBeUndefined();
+    // A caller's explicit settings still win, like every other key.
+    const kept = buildSettings(cfg({ extraSettings: { env: { CLAUDE_CODE_BASH_EDIT_DIFF: '1' } } }));
+    expect(settingsEnv(kept).CLAUDE_CODE_BASH_EDIT_DIFF).toBe('1');
   });
 
   test('noMothership silences attribution, nonessential traffic and telemetry', () => {
