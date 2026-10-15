@@ -110,6 +110,14 @@
     process group, then SIGKILL, each bounded, signalling nothing but that process and a group
     whose id is its PID.
   - `processGroup` on the value `spawnClaude` returns, set when spawned with `detached: true`.
+
+  A signal during any stop, one `finish()` started included, hurries that same stop to SIGKILL.
+  Both functions refuse a `graceMs` that is not a finite number from 0 up, and `superviseSignals`
+  a `signals` list naming anything else, before any handler is installed or anything signalled.
+  `release()` is refused once a run is attached.
+- When `claude` exits on its own but leaves processes in its group, the CLI says they were not
+  signalled and may still be running, keeps the home rather than removing it under them, and
+  stops reading the child's stdout, so one holding that pipe cannot keep the CLI from exiting.
 - `--stop-grace-ms`, and the CLI-only preset field `stopGraceMs`.
 - `mergeInvocation()` and `resolveInvocation()` from `@agladysh/bare-claude/preset`: one merge of
   configuration, command line and `--use`, shared by a run and `--doctor`. `runDoctor()` takes

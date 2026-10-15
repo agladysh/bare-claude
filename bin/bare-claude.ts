@@ -533,16 +533,11 @@ async function main() {
     throw error;
   });
 
-  // An unread pipe eventually fills and blocks the child, so drain it even
-  // when --print did not ask for it. What it says is the only diagnostic a
-  // failed launch produces — Claude Code reports "Not logged in" here and
-  // then exits 1, sometimes without writing a session file at all.
-  const stdout = claude.subprocess.stdout;
-  const captured = stdout instanceof ReadableStream ? captureTail(stdout) : null;
-
-  if (preset.verbose || preset.debug) {
-    process.stdout.write(`${claude.sessionJsonlPath}\n`);
-  }
+  // Attached before anything else can throw — a write to a closed stdout or
+  // stderr included — and everything after it is inside the try whose
+  // finally finishes supervision: a detached child is never left running
+  // with nobody to stop it.
+  supervisor.attach(claude);
 
   // A failed or inspected run keeps its ephemeral home: disposing it would
   // delete the very transcript the path above points at. A home the caller
@@ -551,22 +546,32 @@ async function main() {
   const callerHome = typeof preset.ephemeralClaudeHomePath === 'string';
   const keepDeclared = callerHome || preset.verbose || preset.debug;
   let keepHome = keepDeclared;
-
-  // Reported as soon as the child exists, not at the end only: a runner that
-  // has to kill this process outright still knows which process group to end
-  // — for every run, since the child is outside this process's own group and
-  // a kill aimed there no longer reaches it — and, for a kept home, where the
-  // session journal is (the child creates it, so it may not exist yet).
-  if (keepDeclared) {
-    process.stderr.write(`Claude session journal at ${claude.sessionJsonlPath}\n`);
-  }
-  process.stderr.write(claude.processGroup === null
-    ? `Claude process ${claude.subprocess.pid}\n`
-    : `Claude process group ${claude.processGroup}\n`);
-
-  supervisor.attach(claude);
+  let capture: Capture | null = null;
 
   try {
+    // An unread pipe eventually fills and blocks the child, so drain it even
+    // when --print did not ask for it. What it says is the only diagnostic a
+    // failed launch produces — Claude Code reports "Not logged in" here and
+    // then exits 1, sometimes without writing a session file at all.
+    const stdout = claude.subprocess.stdout;
+    capture = stdout instanceof ReadableStream ? captureTail(stdout) : null;
+
+    if (preset.verbose || preset.debug) {
+      process.stdout.write(`${claude.sessionJsonlPath}\n`);
+    }
+
+    // Reported as soon as the child exists, not at the end only: a runner that
+    // has to kill this process outright still knows which process group to end
+    // — for every run, since the child is outside this process's own group and
+    // a kill aimed there no longer reaches it — and, for a kept home, where the
+    // session journal is (the child creates it, so it may not exist yet).
+    if (keepDeclared) {
+      process.stderr.write(`Claude session journal at ${claude.sessionJsonlPath}\n`);
+    }
+    process.stderr.write(claude.processGroup === null
+      ? `Claude process ${claude.subprocess.pid}\n`
+      : `Claude process group ${claude.processGroup}\n`);
+
     if (!preset.quiet) {
       await renderTranscript(claude, preset);
     }
@@ -579,10 +584,10 @@ async function main() {
     if (exitCode !== 0 || stoppedBy !== null) {
       keepHome = true;
 
-      if (captured !== null) {
-        // Bounded: a descendant that left the process group can hold the
-        // pipe open long after the child has gone.
-        const tail = (await within(captured, capturedWaitMs, '')).trim();
+      if (capture !== null) {
+        // Bounded: a descendant can hold the pipe open long after the child
+        // has gone.
+        const tail = (await within(capture.tail, capturedWaitMs, '')).trim();
         if (tail !== '') {
           process.stderr.write(`${tail}\n`);
         }
@@ -599,16 +604,29 @@ async function main() {
     // Idempotent, so on the ordinary path this is the report awaited above.
     const report = await supervisor.finish();
 
+    // The pipe is this process's own, made for this run. Something the run
+    // left behind can hold it open indefinitely, and a read still pending on
+    // it would keep this process from exiting; nothing more is wanted from it.
+    capture?.stop();
+
+    // Something the run started outlived it. Reported, not acted on: nobody
+    // asked for a stop, and it may be work the run deliberately left running.
+    // Nor is the home removed under it, since it may still be using it.
+    const leftovers = report === null && claude.processGroup !== null
+      && processGroupState(claude.processGroup) === 'occupied';
+    if (leftovers) {
+      keepHome = true;
+    }
+
     if (report !== null || keepHome) {
       process.stderr.write(`Claude process ended: ${describeEnd(claude.subprocess)}\n`);
     }
     if (report !== null) {
       process.stderr.write(`${describeStop(report)}\n`);
-    } else if (claude.processGroup !== null && processGroupState(claude.processGroup) === 'occupied') {
-      // Reported, not acted on: nobody asked for a stop, and what is left
-      // may be something the run deliberately started.
+    } else if (leftovers) {
       process.stderr.write(
-        `bare-claude: process group ${claude.processGroup} still has processes after claude exited; not signalled\n`
+        `bare-claude: claude exited, but process group ${claude.processGroup} still has processes; `
+        + 'they were not signalled and may still be running\n'
       );
     }
 
@@ -695,14 +713,36 @@ function describeStop(report: StopReport): string {
 /** Longest run of child stdout kept for a failure diagnostic. */
 const maxCapturedStdout = 4096;
 
+/** A drain of the child's stdout, and the means to stop reading it. */
+interface Capture {
+  /** The last {@link maxCapturedStdout} characters, once the stream ends or reading stops. */
+  tail: Promise<string>,
+
+  /** Stops reading; the stream is cancelled and `tail` resolves with what was read. */
+  stop(): void,
+}
+
 /** Drains a stream, keeping only its last {@link maxCapturedStdout} characters. */
-async function captureTail(stream: ReadableStream<Uint8Array>): Promise<string> {
+function captureTail(stream: ReadableStream<Uint8Array>): Capture {
+  const reader = stream.getReader();
   const decoder = new TextDecoder();
   let tail = '';
-  for await (const chunk of stream) {
-    tail = (tail + decoder.decode(chunk, { stream: true })).slice(-maxCapturedStdout);
-  }
-  return (tail + decoder.decode()).slice(-maxCapturedStdout);
+  const read = async (): Promise<string> => {
+    try {
+      for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
+        tail = (tail + decoder.decode(chunk.value, { stream: true })).slice(-maxCapturedStdout);
+      }
+    } catch {
+      // A cancelled or broken pipe ends the capture; what was read stands.
+    }
+    return (tail + decoder.decode()).slice(-maxCapturedStdout);
+  };
+  return {
+    tail: read(),
+    stop: () => {
+      reader.cancel().catch(() => { /* Already closed. */ });
+    },
+  };
 }
 
 /**
