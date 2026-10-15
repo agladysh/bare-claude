@@ -39,7 +39,9 @@ test`:
 - **326fa42 (round three):** typecheck clean; 399 pass, 1 skip (the same conditional test), 0
   fail. The seed tests again took the clone branch, and SIGHUP on a run with a temporary home
   exited 129.
-- **Round four:** unrun at authoring. The operating session runs it and records the result here.
+- **Round four:** unrun at authoring; the operating session's run of it, 405 pass, 1 conditional
+  skip, 0 fail, is recorded at the end of this file.
+- **Round five** (a reporter's exception no longer stops a stop): unrun at authoring.
 
 What those passes establish is their scope: one macOS host, one Bun version, fakes for `claude`
 and for a launcher. In particular they show, on that host, that `process.kill` with a negative PID
@@ -238,4 +240,15 @@ is a clone. The platform does not decide it — macOS does not imply APFS. Test 
 
 ## Root verification of supervisor edge repairs
 
-On 16 October 2026 at 00:51 UTC+03:00, Codex (AI) ran `bun run typecheck` and `bun test` on the preceding source changes. Type checking passed; the suite reported 405 pass, 1 conditional skip and 0 fail across 20 files. These are synthetic process and wrapper checks, not native managed-launcher acceptance. The exact check outputs remain in the receiving maintainer's run custody. The new edge cases ran, including the signal during `finish()`, invalid inputs, duplicate-handler release and the natural-exit leftover holding the child pipe.
+On 16 October 2026 (UTC+03:00), Codex (AI) ran `bun run typecheck` and `bun test` on the
+preceding source changes. Type checking passed; the suite ran 406 tests across 20 files: 405
+pass, 1 conditional skip, 0 fail. The new edge cases ran, including the signal during
+`finish()`, invalid inputs, duplicate-handler release and the natural-exit leftover holding the
+child pipe. These are synthetic process and wrapper checks, not native managed-launcher
+acceptance.
+
+The final reporter-isolation repair then passed type checking and the affected
+`src/lifecycle.test.ts` and `test/termination.cli.test.ts` suites: 23 pass,
+0 fail. These include real process-group checks with reporters that always
+throw. The earlier 405-pass package result covers the preceding source cut;
+this focused run covers the final change. Native acceptance remains separate.
