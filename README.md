@@ -140,11 +140,13 @@ Options:
 - `-m, --model [model]`: model to be used
 - `--verbose`: print more events in transcript
 - `--debug`: print the resolved configuration, and render only events/blocks no rule recognizes.
-  In the configuration, the values of `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and
-  `ANTHROPIC_AUTH_TOKEN` are replaced by `<redacted>` wherever they appear, and an in-memory
-  session journal (`customSessionData.value`) by its length. Nothing else is: a secret under any
-  other name, `extraArgs`, `extraSettings` and the prompt are printed as given. `--debug` is for
-  someone allowed to see the invocation; it is not a sanitizer
+  In the configuration, every value of `extraEnv` and `extraSettings.env` is replaced by its
+  length, names kept; an in-memory session journal (`customSessionData.value`) likewise; and the
+  values of `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` by
+  `<redacted>` wherever else they appear. Nothing else is withheld: `extraArgs`, the rest of
+  `extraSettings`, the system prompt, the call to action and paths are printed as given, and
+  anything secret in them with them. `--debug` is for someone allowed to see the invocation; it is
+  not a sanitizer
 - `-q, --quiet`: do not print transcript at all
 - `-p, --print`: print Claude Code console output (what `claude --print` prints),
   use with `--quiet` when you need the last assistant message only
@@ -208,7 +210,12 @@ session seed that cannot be published — exits 1 with a one-line `bare-claude:`
 `bare-claude` spawns `claude` (or what `--claude-path` names) in a process group of its own, on
 macOS and Linux: Bun calls `setsid()` in the child. Whatever that process starts — the native
 Claude Code process under a managed launcher, the shells Claude Code runs — is in the group too,
-unless it starts a session of its own.
+unless it starts a session of its own. Every run reports that group on stderr as soon as it is
+spawned, whatever its home:
+
+```
+Claude process group 41321
+```
 
 On the first SIGTERM, SIGINT or SIGHUP, `bare-claude`:
 
@@ -218,7 +225,9 @@ On the first SIGTERM, SIGINT or SIGHUP, `bare-claude`:
 3. when `--stop-grace-ms` (10000 by default, chosen rather than measured) has passed with
    anything still running, sends SIGKILL to the whole group. A second signal sends it at once.
 
-It then reports and exits as usual, with the 128+n status above:
+A signal that arrives while `claude` is still being spawned is held and acted on as soon as it
+exists; one that arrives after `claude` has exited on its own stops nothing and does not change
+the exit status. It then reports and exits as usual, with the 128+n status above:
 
 ```
 bare-claude: received SIGTERM; sent it to claude (pid 41321), SIGKILL to process group 41321 after 10000 ms
@@ -226,6 +235,16 @@ Claude process ended: exit code 143
 Claude stop: SIGTERM; process group 41321 empty
 Claude home kept at /work/runs/0042/claude-home
 ```
+
+**What this asks of a supervisor.** Because `claude` is no longer in `bare-claude`'s own process
+group, a kill aimed at that group — `timeout -k`'s final SIGKILL, a job-control kill of a shell
+job — ends `bare-claude` alone, and the run goes on unreported. A supervisor must do one of:
+
+- signal `bare-claude` itself, and allow it at least `--stop-grace-ms` plus 5 seconds — the two
+  bounded 2-second waits after SIGKILL, and a second for the last of the child's output — before
+  any kill of its own, plus whatever removing a temporary home takes. With the default grace,
+  `timeout -k 20 60 bare-claude …` leaves room; `timeout -k 5` does not.
+- or signal the reported `Claude process group` directly.
 
 `Claude stop:` says whether SIGKILL was needed and what was left in the group: `empty`,
 `still occupied after SIGKILL`, or `holds processes this user may not signal; left alone`. A run
@@ -236,9 +255,8 @@ What a stop cannot do:
 
 - **SIGKILL to `bare-claude` itself** cannot be caught, so nothing is forwarded or reported, and
   the run carries on. A runner that may have to do that must record the process group from the
-  `Claude process group` line printed at spawn (see
-  [Keeping and continuing a run](#keeping-and-continuing-a-run)) and signal the group itself. Until
-  it reads the kept home back, the outcome of such a run is unknown, not failed and not done.
+  `Claude process group` line printed at spawn and signal the group itself. Until it reads the
+  kept home back, the outcome of such a run is unknown, not failed and not done.
 - **A descendant that started a session of its own** is outside the group and is not reached.
 - **Work already done stays done**: edits in the working directory, records in the session
   journal, requests already sent to a model provider, and anything another service was asked to
@@ -613,7 +631,11 @@ warning saying so: the caller's route is not this program's to check. `install` 
 `bare-claude.yaml` a run from the current directory would load, validated — or the file `--config`
 names, which must exist; under `--no-config` there is nothing to load and it is `ok`. When the
 invocation would be refused — an unknown `--use`, `auth: caller` beside a `tokenFile`, a session
-id that cannot name a file — `preset` fails with the refusal as its hint.
+id that cannot name a file, a named configuration that is missing or invalid — `preset` fails with
+the refusal as its hint, `claude` is checked from the command line alone and says so, and `auth`
+is a warning that checked nothing: the configuration that failed may be the one that says
+`auth: caller`, so no token file is opened. Outside a Git working copy, where there is no
+configuration to read, the command line is checked as it always was.
 
 Exits 1 when any item is `fail`. Nothing is repaired, and no model is spawned: the only
 subprocesses are `--version` probes and `git rev-parse`. The `--version` probe does run the
@@ -813,27 +835,51 @@ and the whole home if it created it. Whatever had to be left is named in the err
 `subprocess.exited` is the spawned process's exit code, nothing more: it does not say whether the
 task was done, nor that anyone has read the result.
 
-`spawnClaude` does not supervise what it spawned. The CLI forwards signals and ends the process
-group (see [Stopping a run](#stopping-a-run)); a library caller that wants the same spawns
-detached and calls `stopClaude` on its own signals and deadlines:
+`spawnClaude` does not supervise what it spawned. The CLI does, with `superviseSignals` from
+`@agladysh/bare-claude/lifecycle` (see [Stopping a run](#stopping-a-run)); a library caller that
+spawns detached should use the same supervisor rather than its own signal handlers:
 
 ```typescript
 import { spawnClaude } from '@agladysh/bare-claude';
-import { stopClaude } from '@agladysh/bare-claude/lifecycle';
+import { signalExitStatus, superviseSignals } from '@agladysh/bare-claude/lifecycle';
 
-const claude = await spawnClaude({ callToAction: 'Explain this project to me' }, { detached: true });
-const onSignal = () => void stopClaude(claude, { signal: 'SIGTERM', graceMs: 10_000 });
-process.once('SIGTERM', onSignal);
+// Before the spawn: SIGTERM, SIGINT or SIGHUP from now on stops the run instead of ending this
+// process, and one that arrives during the spawn is held until there is a run to stop.
+const supervisor = superviseSignals({ graceMs: 10_000 });
+const claude = await spawnClaude({ callToAction: 'Explain this project to me' }, { detached: true })
+  .catch((error: unknown) => {
+    supervisor.release();
+    throw error;
+  });
+supervisor.attach(claude);
 try {
   const exitCode = await claude.subprocess.exited;
+  await supervisor.finish();
+  process.exitCode = supervisor.stoppedBy === null ? exitCode : signalExitStatus(supervisor.stoppedBy);
 } finally {
-  process.off('SIGTERM', onSignal);
+  // Stops the run if it is still going, and waits for the stop, a further signal still escalating
+  // meanwhile; only then is the home removed.
+  await supervisor.finish();
   await claude.dispose();
 }
 ```
 
-Without `detached`, the child shares the caller's process group: a terminal's Ctrl-C reaches it
-directly, and nothing but the caller can end what it started once the caller is gone.
+`superviseSignals(options)` takes `graceMs`, and optionally `signals` (default all three),
+`onEvent` — told of each `SupervisorEvent`: `held`, `stopping` (with its `cause`, a signal or
+`'finish'`), `escalating`, `after-exit` — and `source`, where signals come from (default this
+process). The `Supervisor` it returns has:
+
+- `attach(run)`: hands over the run; a held signal starts its stop now. One run per supervisor.
+- `finish()`: if the run is still going and nothing stopped it, stops it with SIGTERM; waits for
+  any stop; then removes the handlers. Resolves with the `StopReport`, or `null` when there was no
+  stop. Idempotent. Call it before `dispose()`.
+- `release()`: removes the handlers without stopping anything, for a spawn that failed.
+- `stoppedBy`: the signal that stopped a running run, or `null`. A signal after the run had
+  already ended on its own is not one. `signalExitStatus(signal)` is the matching 128+n.
+
+Until `finish()` or `release()`, those signals do not end the calling process; it must end
+itself. Without `detached`, the child shares the caller's process group: a terminal's Ctrl-C
+reaches it directly, and a stop reaches only the spawned process, not what it started.
 
 ### stopClaude(run, options)
 

@@ -346,6 +346,36 @@ describe('runDoctor', () => {
       expect(preset.hint.join('\n')).toContain('cannot also take a tokenFile');
       expect(report.ok).toBe(false);
     });
+
+    test('a refused invocation does not inspect the token file: its auth mode is unknown', async () => {
+      // The configuration says caller-managed, and names a preset that is not
+      // there, so a run is refused. Falling back to the command line alone
+      // would read the default token file — empty here, so reading it fails
+      // the item — though the invocation declared that none is ever read.
+      const { env, cwd, home } = await healthy();
+      const { CLAUDE_CODE_OAUTH_TOKEN: _dropped, ...withoutToken } = env;
+      await fs.mkdir(path.join(home, '.config', 'bare-claude'), { recursive: true });
+      await fs.writeFile(path.join(home, '.config', 'bare-claude', 'oauth'), '\n', { mode: 0o600 });
+      const config = await invocation('auth: caller\nuse: absent\n');
+      const report = await runDoctor({ env: withoutToken, cwd, config });
+
+      const auth = item(report, 'auth');
+      expect(auth.status).toBe('warn');
+      expect(auth.detail).toStartWith('not checked: the invocation does not resolve');
+      expect(item(report, 'claude').detail).toEndWith('(from the command line alone: the invocation does not resolve)');
+      expect(item(report, 'preset').status).toBe('fail');
+    });
+
+    test('outside a Git working copy the command line alone is still checked, as before', async () => {
+      const { env, home } = await healthy();
+      const { CLAUDE_CODE_OAUTH_TOKEN: _dropped, ...withoutToken } = env;
+      const report = await runDoctor({ env: withoutToken, cwd: await tempDir('plain') });
+
+      expect(item(report, 'auth').status).toBe('fail');
+      expect(item(report, 'auth').detail)
+        .toBe(`CLAUDE_CODE_OAUTH_TOKEN absent, no token file at ${path.join(home, '.config', 'bare-claude', 'oauth')}`);
+      expect(item(report, 'preset').status).toBe('warn');
+    });
   });
 
   describe('claude', () => {

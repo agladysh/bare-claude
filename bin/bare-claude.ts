@@ -9,7 +9,7 @@ import { watch } from 'node:fs/promises';
 import TailFile from '@logdna/tail-file';
 import { type } from 'arktype';
 
-import { LaunchConfig, Launchers, spawnClaude, type Launcher } from '@agladysh/bare-claude';
+import { LaunchConfig, Launchers, spawnClaude, type Json, type Launcher } from '@agladysh/bare-claude';
 import { TranscriptRenderer } from '@agladysh/bare-claude/display';
 import {
   defaultMaxContentBytes, emitPreload, glob, type PreloadEntry
@@ -23,7 +23,9 @@ import {
 import type { AuthMode } from '@agladysh/bare-claude';
 import { resolveInvocation, type DynamicPreset, type Preset } from '@agladysh/bare-claude/preset';
 import { formatDoctorReport, runDoctor } from '@agladysh/bare-claude/doctor';
-import { processGroupState, stopClaude, type StopReport } from '@agladysh/bare-claude/lifecycle';
+import {
+  processGroupState, signalExitStatus, superviseSignals, type StopReport, type SupervisorEvent
+} from '@agladysh/bare-claude/lifecycle';
 import { alternateCredentialVariables, tokenVariable } from '@agladysh/bare-claude/token';
 import { readUsage } from '@agladysh/bare-claude/usage';
 
@@ -391,24 +393,48 @@ const credentialVariables = new Set([ tokenVariable, ...alternateCredentialVaria
 
 /**
  * `JSON.stringify` replacer hiding the value of any credential variable, at
- * any depth: a caller may pass one through `extraEnv` or `extraSettings.env`.
- * By name only — a secret under any other name is printed.
+ * any depth of the dump — beyond the environment blocks {@link debugView}
+ * already withholds. By name only: a secret under any other name, outside
+ * those blocks, is printed.
  */
 function redactCredentials(key: string, value: unknown): unknown {
   return credentialVariables.has(key) && typeof value === 'string' ? '<redacted>' : value;
 }
 
+/** How `--debug` shows a value it does not print. */
+function withheld(value: Json): string {
+  return typeof value === 'string' ? `<${value.length} characters, not printed>` : '<not printed>';
+}
+
+/** An environment block with its names kept and every value withheld. */
+function withheldEnv(env: Record<string, Json>): Record<string, string> {
+  return Object.fromEntries(Object.entries(env).map(([ name, value ]) => [ name, withheld(value) ]));
+}
+
 /**
- * The preset as `--debug` prints it: an in-memory session journal is a prior
- * conversation, which may hold anything anyone typed or any file a tool read,
- * so only its size is shown. The rest of the configuration is printed as is.
+ * The preset as `--debug` prints it. Withheld, by where they sit rather than
+ * by what they are called: every value of `extraEnv` and `extraSettings.env`
+ * — the two places a credential is passed, under whatever name — and an
+ * in-memory session journal, a prior conversation that may hold anything
+ * anyone typed or any tool read. Names and sizes are kept, so the dump still
+ * shows what was set. Everything else is printed as given: `extraArgs`, the
+ * rest of `extraSettings`, the prompt, paths.
  */
 function debugView(preset: Preset): Preset {
-  const seed = preset.customSessionData;
-  if (seed === undefined || seed === null || !('value' in seed)) {
-    return preset;
+  const view: Preset = { ...preset };
+  if (preset.extraEnv !== undefined) {
+    view.extraEnv = withheldEnv(preset.extraEnv);
   }
-  return { ...preset, customSessionData: { ...seed, value: `<${seed.value.length} characters, not printed>` } };
+  const settingsEnv = preset.extraSettings?.env;
+  if (preset.extraSettings !== undefined && typeof settingsEnv === 'object'
+    && settingsEnv !== null && !Array.isArray(settingsEnv)) {
+    view.extraSettings = { ...preset.extraSettings, env: withheldEnv(settingsEnv) };
+  }
+  const seed = preset.customSessionData;
+  if (seed !== undefined && seed !== null && 'value' in seed) {
+    view.customSessionData = { ...seed, value: withheld(seed.value) };
+  }
+  return view;
 }
 
 async function main() {
@@ -488,55 +514,24 @@ async function main() {
 
   preset.permissionMode ??= 'acceptEdits';
 
-  const graceMs = preset.stopGraceMs ?? defaultStopGraceMs;
-
-  // A signal that arrives while the child is being spawned is held, and acted
-  // on as soon as there is a child to stop.
-  const stop: { signal: StopSignal | null, report: Promise<StopReport> | null } = { signal: null, report: null };
-  const escalate = new AbortController();
-  const run: { claude: Awaited<ReturnType<typeof spawnClaude>> | null } = { claude: null };
-  const startStop = (signal: StopSignal) => {
-    if (run.claude !== null && stop.report === null) {
-      const { subprocess, processGroup } = run.claude;
-      process.stderr.write(
-        `bare-claude: received ${signal}; sent it to claude (pid ${subprocess.pid}), `
-        + `SIGKILL to ${processGroup === null ? 'it' : `process group ${processGroup}`} after ${graceMs} ms\n`
-      );
-      stop.report = stopClaude(run.claude, { signal, graceMs, escalate: escalate.signal });
-    }
-  };
-  const onSignal = (signal: StopSignal) => {
-    if (stop.signal === null) {
-      stop.signal = signal;
-      startStop(signal);
-    } else if (!escalate.signal.aborted) {
-      process.stderr.write(`bare-claude: received ${signal} again; sending SIGKILL now\n`);
-      escalate.abort();
-    }
-  };
-  const handlers = new Map<StopSignal, () => void>();
-  for (const signal of stopSignalNames) {
-    const handler = () => onSignal(signal);
-    handlers.set(signal, handler);
-    process.on(signal, handler);
-  }
-  const releaseSignals = () => {
-    for (const [ signal, handler ] of handlers) {
-      process.off(signal, handler);
-    }
-  };
+  // The library's own supervision, installed before the spawn so a signal
+  // that arrives meanwhile is held rather than ending this process and
+  // orphaning a child about to exist.
+  const supervisor = superviseSignals({
+    graceMs: preset.stopGraceMs ?? defaultStopGraceMs,
+    onEvent: event => process.stderr.write(describeSupervisorEvent(event)),
+  });
 
   // A process group of its own, so a stop reaches what the spawned process
   // starts — a launcher's native child included — and a terminal's Ctrl-C
-  // reaches the run only through the forwarding above, in order.
+  // reaches the run only through the supervisor, in order.
   const claude = await spawnClaude(preset, {
     stdout: preset.print ? 'inherit' : 'pipe',
     detached: process.platform !== 'win32',
   }).catch((error: unknown) => {
-    releaseSignals();
+    supervisor.release();
     throw error;
   });
-  run.claude = claude;
 
   // An unread pipe eventually fills and blocks the child, so drain it even
   // when --print did not ask for it. What it says is the only diagnostic a
@@ -558,19 +553,18 @@ async function main() {
   let keepHome = keepDeclared;
 
   // Reported as soon as the child exists, not at the end only: a runner that
-  // has to kill this process outright still knows where the session journal
-  // is (the child creates it, so it may not exist yet) and which process
-  // group to end.
+  // has to kill this process outright still knows which process group to end
+  // — for every run, since the child is outside this process's own group and
+  // a kill aimed there no longer reaches it — and, for a kept home, where the
+  // session journal is (the child creates it, so it may not exist yet).
   if (keepDeclared) {
     process.stderr.write(`Claude session journal at ${claude.sessionJsonlPath}\n`);
-    process.stderr.write(claude.processGroup === null
-      ? `Claude process ${claude.subprocess.pid}\n`
-      : `Claude process group ${claude.processGroup}\n`);
   }
+  process.stderr.write(claude.processGroup === null
+    ? `Claude process ${claude.subprocess.pid}\n`
+    : `Claude process group ${claude.processGroup}\n`);
 
-  if (stop.signal !== null) {
-    startStop(stop.signal);
-  }
+  supervisor.attach(claude);
 
   try {
     if (!preset.quiet) {
@@ -578,11 +572,11 @@ async function main() {
     }
 
     const exitCode = await claude.subprocess.exited;
-    if (stop.report !== null) {
-      await stop.report; // What the spawned process left in its group.
-    }
+    // What the spawned process left in its group, when a stop is under way.
+    await supervisor.finish();
+    const stoppedBy = supervisor.stoppedBy;
 
-    if (exitCode !== 0 || stop.signal !== null) {
+    if (exitCode !== 0 || stoppedBy !== null) {
       keepHome = true;
 
       if (captured !== null) {
@@ -598,15 +592,12 @@ async function main() {
     // The shell convention for a command ended by a signal, whatever the
     // child's own exit was: a runner must not read a stopped run as a
     // completed one.
-    return stop.signal === null ? exitCode : 128 + stopSignals[stop.signal];
+    return stoppedBy === null ? exitCode : signalExitStatus(stoppedBy);
   } finally {
     // Never rm a live config directory out from under a running child: a
     // failure above still ends the run in order before anything is removed.
-    if (stop.report === null && claude.subprocess.exitCode === null && claude.subprocess.signalCode === null) {
-      stop.report = stopClaude(claude, { signal: 'SIGTERM', graceMs, escalate: escalate.signal });
-    }
-    const report = stop.report === null ? null : await stop.report;
-    releaseSignals();
+    // Idempotent, so on the ordinary path this is the report awaited above.
+    const report = await supervisor.finish();
 
     if (report !== null || keepHome) {
       process.stderr.write(`Claude process ended: ${describeEnd(claude.subprocess)}\n`);
@@ -633,15 +624,24 @@ async function main() {
   }
 }
 
-/**
- * Signals the CLI turns into an orderly stop of the run, with their POSIX
- * numbers (the same on macOS and Linux), for the 128+n exit status.
- */
-const stopSignals = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 } satisfies Record<string, number>;
-
-type StopSignal = keyof typeof stopSignals;
-
-const stopSignalNames: readonly StopSignal[] = [ 'SIGHUP', 'SIGINT', 'SIGTERM' ];
+/** One stderr line for each thing the supervisor did. */
+function describeSupervisorEvent(event: SupervisorEvent): string {
+  switch (event.kind) {
+    case 'held':
+      return `bare-claude: received ${event.signal} while starting claude; stopping it once started\n`;
+    case 'stopping': {
+      const target = event.processGroup === null ? 'it' : `process group ${event.processGroup}`;
+      const why = event.cause === 'finish'
+        ? `bare-claude: claude is still running; sent SIGTERM to it (pid ${event.pid})`
+        : `bare-claude: received ${event.cause}; sent it to claude (pid ${event.pid})`;
+      return `${why}, SIGKILL to ${target} after ${event.graceMs} ms\n`;
+    }
+    case 'escalating':
+      return `bare-claude: received ${event.signal} again; sending SIGKILL now\n`;
+    case 'after-exit':
+      return `bare-claude: received ${event.signal} after claude had exited; nothing to stop\n`;
+  }
+}
 
 /**
  * How long a stopped run gets before SIGKILL, unless `--stop-grace-ms` says

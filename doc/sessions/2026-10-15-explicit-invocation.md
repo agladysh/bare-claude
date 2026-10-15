@@ -1,9 +1,11 @@
 # 2026-10-15 — explicit invocation, caller-managed auth, file session seed, stopping a run
 
 Started at public `main` 90a7ff6 (0.9.0, `[Unreleased]` carrying the token file and
-`noBashEditDiff`). Written over two rounds by Opus 5.5 with file tools only: the author ran no
-shell, no typecheck, no tests, no `claude`. Between the rounds an independent source review was
-made, and the operating session ran the checks recorded under "What was run".
+`noBashEditDiff`). Written over three rounds by Opus 5.5 with file tools only: the author ran no
+shell, no typecheck, no tests, no `claude`, in any round. Between rounds, independent source
+reviews were made and the operating session ran the checks recorded under "What was run". One
+change in the candidate is the operating session's, not the author's: `src/preset.ts`'s merge was
+rewritten to fix a typecheck failure (below).
 
 The ask: a consumer driving the CLI from another repository needs to declare one invocation —
 cwd, a home it keeps, tool and read scope, environment, auth and a continuation seed — without
@@ -20,12 +22,27 @@ credential, exit 5 before any model work. There was no way to say "not that file
 
 ## What was run, and what it establishes
 
-- **By the operating session, after round one plus its own platform guard (bd3ef2a):** `bun run
-  typecheck && bun test` on Bun 1.3.13 (bf2e2cec), macOS: typecheck clean, 363 pass, 0 fail, 1035
-  `expect()` calls. The seed tests then named no branch, so that log does not say whether the
-  clone or the refusal branch ran.
-- **This round:** nothing. Every test added here is unrun as written. Where a test rests on a Bun
-  behaviour not read in its source, that is listed under "Not established".
+All by the operating session, on macOS with Bun 1.3.13 (bf2e2cec), as `bun run typecheck && bun
+test`:
+
+- **After round one plus the operating session's platform guard (bd3ef2a):** typecheck clean,
+  363 pass, 0 fail, 1035 `expect()` calls. The seed tests then named no branch, so that log does
+  not say which ran.
+- **Round two as written:** typecheck failed, `src/preset.ts(83,17): error TS2589: Type
+  instantiation is excessively deep and possibly infinite`, and no test ran. The operating session
+  replaced the `deepmerge` call there with `deepmergeIntoCustom`, keeping its semantics; that code
+  and its test are not the author's.
+- **9742078 (round two, with that repair):** typecheck clean; 391 tests across 20 files, 390
+  pass, 1 skip, 0 fail, 1192 `expect()` calls. The skip is the test that runs only under
+  `BARE_CLAUDE_REQUIRE_CLONE=1`. Every seed test took the `[clone branch]`, so on that host the
+  forced clone ran and the published journals were clones. All five termination tests passed.
+- **Round three:** nothing. Its new and changed tests are unrun as written.
+
+What those passes establish is their scope: one macOS host, one Bun version, fakes for `claude`
+and for a launcher. In particular they show, on that host, that `process.kill` with a negative PID
+reaches a process group, that `detached` makes the spawned process lead one, and that `Bun.spawn`
+rejects for an executable that does not exist before anything is spawned. They say nothing about
+Linux, about the real `claude`, or about the real managed launcher.
 
 ## Bun's forced clone, from source
 
@@ -65,14 +82,16 @@ of it; `engines` admits any Bun from 1.3, and later versions have not been read.
   a path that does not exist. A managed launcher breaks the first premise: it brings its own
   credential, so the environment it is handed has none, and that absence is exactly what
   triggered the fallback. One field covers both of Bare Claude's own sources, the token file and
-  `linkAuth`. `LaunchConfig` now also refuses any other value at run time: an untyped caller's
+  `linkAuth`. `LaunchConfig` also refuses any other value at run time: an untyped caller's
   `'none'` turned every fallback off without a word.
-- **The doctor resolves the invocation, not the shell.** Round one gave it `--config`, `--auth`
-  and `--token-file` but still looked at the shell's environment and ignored the configuration's
-  `auth`, `claudePath`, `cwd`, `noProcessEnv`, `extraEnv` and `--use`. Each was a case where the
-  doctor and the run disagreed. Both now go through `mergeInvocation`, `LaunchConfig` and
-  `buildEnv`. Outside a Git working copy the located configuration is still a `warn`, as before,
-  rather than a failure: the doctor is also how an install is checked from anywhere.
+- **The doctor resolves the invocation, not the shell**, through the same `mergeInvocation`,
+  `LaunchConfig` and `buildEnv` as a run. When the invocation does not resolve, round two fell back
+  to the command line alone for every item, and so could open the default token file for an
+  invocation whose configuration declared `auth: caller`. Round three keeps that fallback only
+  where there is no configuration at all (outside a Git working copy, the located one asked for)
+  — what the doctor always did. Any other failure leaves the `auth` item a warning that checked
+  nothing; `claude` is still looked for from the command line, and says so, since a `--version`
+  probe touches no credential.
 - **The file seed's design predates this change and is reimplemented here.** Contract: regular
   single-link non-symlink source, optional full lowercase digest, hash before and after, forced
   clone into a private staging directory beside the destination, clone hashed, exclusive
@@ -83,91 +102,106 @@ of it; `engines` admits any Bun from 1.3, and later versions have not been read.
   the byte copy the file route exists to avoid.
 - **This repository's root `use: default` is gone.** A breaking change to an example file, made
   because the example was the failure above. `--use default` restores it.
-- **Stopping a run (reverses round one's "no signal handling").** Round one let a SIGTERM kill the
-  CLI alone; `claude` went on running and writing the kept journal, unreported. Now:
-  - The child is spawned `detached`: bun-types 1.3.13 documents that as `setsid()` on POSIX, so it
-    leads a group whose id is its PID, and everything it starts is in that group unless it calls
-    `setsid()` itself. The group is the boundary because the spawned process may be a launcher
-    that supervises the native process as a grandchild: a signal to one PID reaches neither the
-    grandchild nor its descendants.
+- **Stopping a run.** Round one let a SIGTERM kill the CLI alone; `claude` went on running and
+  writing the kept journal, unreported. From round two:
+  - The child is spawned `detached`, which bun-types 1.3.13 documents as `setsid()` on POSIX, so
+    it leads a group whose id is its PID, and everything it starts is in that group unless it
+    calls `setsid()` itself. The group is the boundary because the spawned process may be a
+    launcher supervising the native process as a grandchild.
   - The first signal goes to the spawned process alone, so a supervising launcher can shut down
     in its own order; then once to what is left in the group; then SIGKILL to the group at the
     grace (10 s, chosen, not measured) or a second signal. Every step is bounded.
   - Only the process Bun spawned is signalled, through Bun's handle, and only the group whose id
-    is its PID. 0, 1, negative ids and the CLI's own PID are refused. POSIX keeps a PID from being
-    reused while a process group of that id has members, so the group cannot change identity while
-    it is occupied; once it is empty, the stop stops probing it.
-  - Exit status 128+n of the signal the CLI received, whatever `claude` returned.
-  - The journal path and the process group are printed at spawn, not only at the end: a runner
-    that SIGKILLs the CLI — which nothing can catch — has only those.
-  - A run that ends on its own is not signalled; group members it leaves are reported, not killed.
-  - The library spawns nothing detached unless asked: a caller relying on its terminal's Ctrl-C
-    reaching the child would otherwise lose that. `stopClaude` is exported for callers who opt in.
+    is its PID; 0, 1, negative ids and the caller's own PID are refused. POSIX keeps a PID from
+    being reused while a process group of that id has members.
+  - Exit status 128+n of the signal received, whatever `claude` returned.
+- **The supervision is a library export the CLI consumes (round three).** Round two wrote the
+  signal policy — hold a signal that arrives during the spawn, escalate on a second, wait for the
+  stop before removing the home — inside the CLI, and the README showed library callers a handler
+  that had none of it: `process.once`, so a second SIGTERM killed the caller and orphaned the
+  detached child; only SIGTERM; `dispose()` without waiting for the stop. That example invited
+  exactly the copied and patched launcher this change exists to remove. `superviseSignals()` in
+  `@agladysh/bare-claude/lifecycle` is now that policy, the CLI runs on it unchanged, and the
+  README's example is a call to it. Its signal source is injectable, so its tests deliver signals
+  without sending any to the test process.
+- **Every run reports its process group at spawn (round three).** Detaching the child moved it out
+  of the CLI's own group, so a supervisor that kills that group — `timeout -k`'s final SIGKILL —
+  no longer reaches it. Round two reported the group only for kept homes. Now every run does; the
+  README and CHANGELOG state the contract: signal `bare-claude` itself and allow it
+  `--stop-grace-ms` plus 5 seconds before a kill of one's own, or signal the reported group.
+- **A signal after the run ended on its own is not its outcome (round three).** Round two turned
+  any first signal into 128+n, even one that arrived after `claude` had exited with its own code.
 - **A failed spawn takes back what it published.** The journal is removed only while the path
-  still names the file this call created (identity taken from the creating descriptor or the
-  staged clone); the history line is truncated away only while the file ends exactly where that
-  line ended, through the descriptor that wrote it. Anything else is left and named in the error.
-  The history line moved to just before the spawn, so a refused seed or settings write never adds
-  one. Between check and removal there is a window no POSIX call closes; one live run per home
-  is what keeps anything from using it, and it is documented as the runner's.
-- **`settings.json` is replaced atomically, mode 0600.** Claude Code drops a settings file that
-  fails validation whole and silently (CLAUDE.md), so a half-written one under a live run in the
-  same home is a run that is no longer bare; and it may carry `extraSettings.env` secrets.
-  Whether Claude Code reloads `settings.json` while running was not checked; atomic replacement
-  bounds what such a reader could see, the one-live-run rule is what keeps it from mattering.
+  still names the file this call created; the history line is truncated away only while the file
+  ends exactly where that line ended, through the descriptor that wrote it. Anything else is left
+  and named in the error. Between check and removal there is a window no POSIX call closes; one
+  live run per home keeps anything from using it, and it is documented as the runner's.
+- **`settings.json` is replaced atomically, mode 0600.** A half-written one under a live run in
+  the same home would be dropped whole by Claude Code (CLAUDE.md), and it may carry
+  `extraSettings.env` secrets. Whether Claude Code reloads it while running was not checked.
 - **No home lock.** One live run per home is documented as the runner's rule rather than enforced
   with a lock file, whose stale-lock handling after a SIGKILL would be its own design.
 - **`linkAuth` still defaults to true under `fallback`**, a caller's home included. Defaulting it
-  off there was suggested; it would change what `fallback` means by where the home came from.
-  Documented instead: a kept home may hold that symlink.
+  off there would change what `fallback` means by where the home came from. Documented instead.
 - **Session ids must be able to name a file**: a letter or digit, then letters, digits, `.`, `_`,
-  `-`, 128 at most. Not "a UUID", which Claude Code's own ids are: whether Claude Code refuses a
-  non-UUID `--resume` id was not checked, and the rule here is about the path, not about it.
-- **`--debug` bounds its redaction rather than claiming one.** Three credential variables by
-  name, and an in-memory session journal by length — a prior conversation can hold anything. The
-  docs say everything else is printed.
+  `-`, 128 at most. Whether Claude Code refuses a non-UUID `--resume` id was not checked.
+- **`--debug` withholds by place, and says what it does not (round three).** Round two redacted
+  three variable names; a credential under any other name in `extraEnv` or `extraSettings.env` was
+  printed. Every value in those two blocks is now shown as its length, names kept, as is an
+  in-memory session journal. `extraArgs`, the rest of `extraSettings`, prompts and paths are still
+  printed as given, and the docs say so: this is a bound on two known channels, not a sanitizer.
 
 ## The clone branch in tests
 
 Which branch a seed test takes is decided once per run by a probe on `os.tmpdir()`: a forced
 clone of a small file there either succeeds or fails, and by the source reading above a success
-is a clone. The platform does not decide it — macOS does not imply APFS. Test titles now carry
+is a clone. The platform does not decide it — macOS does not imply APFS. Test titles carry
 `[clone branch]` or `[refusal branch]`, so a log records which ran, and
-`BARE_CLAUDE_REQUIRE_CLONE=1` turns a refusal into a failure on a host known to clone. Suggested
-during review and not done: requiring the clone branch on every macOS host, and allocating a large
-file to observe sharing; neither is needed to tell the two branches apart.
+`BARE_CLAUDE_REQUIRE_CLONE=1` turns a refusal into a failure on a host known to clone.
 
 ## Where a review, or a previous report, was wrong
 
 - **Round one's report** cited a disk-sharing measurement it had not made, carried provenance
-  wording that does not belong in a public record, and said no signal handling was needed. The
-  first two are removed; the third is reversed above. Round one's summary also said nothing of
-  the kind was in the public docs, which was wrong.
+  wording that does not belong in a public record, and said no signal handling was needed. All
+  three were corrected in round two.
 - **Round one's adoption recipe** had a runner hash the journal named by the end-of-run line,
-  which a killed CLI never prints, and passed `USER` where the README's example did not. The
-  journal line is now printed at spawn, and the README's example passes `USER` and `TMPDIR` with a
-  note that a launcher's own documented requirements come first.
-- **Round one's `spawnClaude` TSDoc** split its own bullet list; rejoined.
-- **The first independent review** could not read the commission records and treated legal
-  permission for this public MIT package as open; it withdrew that once it had read them. It
-  also asked for a 1 GiB disk probe and a source lock, and withdrew both.
+  which a killed CLI never prints, and passed `USER` where the README's example did not.
+- **Round two's report misattributed the reviews.** It said a review had asked for "a 1 GiB disk
+  probe and a source lock, and withdrew both". What the records show: the first review, which
+  could not read the commission records, listed among native observations watching free space
+  while seeding about 1 GiB on APFS, and asked that the absence of a source lock be *documented* —
+  it never asked for a lock. A later review, after reading the records, corrected its earlier
+  treatment of this package's licensing as an open question and withdrew the 1 GiB observation as
+  unnecessary. The latest review confirms it never requested a lock.
+- **Round two's report** also listed as unestablished three Bun behaviours that the 9742078 run
+  then exercised, and said every test was unrun after that run existed.
+- **Round two's README library example** was unsafe (above); **its CHANGELOG** carried a truncated
+  duplicate of the `noBashEditDiff` entry, now removed.
 - **Review finding, rebutted in part:** "on macOS the clone tests must require the clone branch".
-  The branch is now recorded and can be required, but by an explicit switch, not by platform.
+  The branch is recorded and can be required, by an explicit switch, not by platform.
 
 ## Not established
 
 - **Native resume of a cloned journal**: that real Claude Code resumes from a journal published
   this way, appends to the reported path, and does so with the cwd given through a symlinked alias
   (`/tmp`, `/var` on macOS). `cwd` is `path.resolve`d, not realpath'd; whether the project key
-  needs the realpath is for that run to show, not for a guess here.
-- **Native stopping**: SIGTERM to a real run, under the real managed launcher, leaving no Claude
-  Code process in `ps`, exit 143, both report lines, and a journal that stops growing. The tests
-  model a supervising and an abandoning launcher in `sh`; the real one is not modelled.
+  needs the realpath is for that run to show.
+- **Native stopping**: SIGTERM to a real run under the real managed launcher, and SIGKILL to the
+  CLI followed by the runner signalling the reported group, each leaving the group empty.
 - **`setsid()` and Claude Code**: a detached child has no controlling terminal. That `claude
   --print` does not need one was not checked.
-- **Bun behaviours the new tests rest on without a source reading**: that `process.kill` accepts a
-  negative PID as a process group, that `Bun.spawn` throws synchronously for an executable that
-  does not exist, and that `detached` does what bun-types says.
-- **What a kept home holds**, file by file and mode by mode, beyond what Bare Claude itself writes.
-- **Windows**: file seeds are refused there; stopping signals the spawned process alone; nothing
-  was run.
+- **Round three's tests**, as said above, and in particular: a signal held during a CLI spawn is
+  tested only through the library supervisor, where the test controls the timing.
+- **Leftovers after a natural exit**: reported and left alone. Whether one holding the child's
+  stdout pipe keeps the CLI from exiting was not checked.
+- **A narrow window remains** where `claude` has exited but Bun has not yet observed it: a signal
+  then starts a stop of an exited process and the status is 128+n.
+- **A held signal followed by a failed spawn** exits 1 with the failure's message: there was
+  nothing to stop, and the failure is the outcome.
+- **What a kept home holds**, file by file and mode by mode, beyond what Bare Claude writes.
+- **Linux and Windows**: nothing was run. File seeds are refused on Windows; stopping there
+  signals the spawned process alone.
+- **Wording already on public `main`, not added here**: environment-specific phrasing and personal
+  paths in `src/token.ts`, `src/install.ts`, earlier session reports and
+  `session-events-example.txt`. The two `src/` files ship in the package; cleaning them is a
+  separate change.
