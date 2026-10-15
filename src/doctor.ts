@@ -336,15 +336,33 @@ async function checkInstall(
       };
     }
 
-    case 'foreign':
+    case 'foreign': {
+      const foreign = `${current.path} is ${current.detail}, not this checkout's ${commandName}`;
+      const replace = current.detail === 'a directory'
+        ? `Remove ${current.path}, then: ${installCommand}`
+        : `${installCommand} --force   # replaces it`;
+      // As for an absent entry: any bare-claude on PATH satisfies this item,
+      // whatever it is. A warning, not ok, because the entry in the bin
+      // directory is not this checkout's and someone may have expected it to
+      // be; nothing here says that command can run a given invocation.
+      if (onPath !== null) {
+        const resolved = await sameFile(onPath, commandSource)
+          ? `${onPath} -> ${commandSource}, this checkout's`
+          : `${onPath}, not an install of this checkout`;
+        return {
+          name,
+          status: 'warn',
+          detail: `${foreign}; PATH resolves ${commandName} to ${resolved}`,
+          hint: [ `To install this checkout's instead: ${replace}` ],
+        };
+      }
       return {
         name,
         status: 'fail',
-        detail: `${current.path} is ${current.detail}, not this checkout's ${commandName}`,
-        hint: current.detail === 'a directory'
-          ? [ `Remove ${current.path}, then: ${installCommand}` ]
-          : [ `${installCommand} --force   # replaces it` ],
+        detail: `${foreign}, and ${commandName} is not on PATH`,
+        hint: [ replace ],
       };
+    }
 
     case 'absent': {
       if (onPath !== null) {

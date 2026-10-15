@@ -955,6 +955,70 @@ describe('spawnClaude and a caller\'s Claude home', () => {
     return { claude, exitCode };
   }
 
+  /** A real directory under `root`, and a symbolic link to it beside it: a cwd and its alias. */
+  async function aliasedDir(root: string): Promise<{ real: string, alias: string }> {
+    const real = path.join(root, 'real');
+    const alias = path.join(root, 'alias');
+    await fs.mkdir(real);
+    await fs.symlink(real, alias);
+    return { real, alias };
+  }
+
+  /** The project key Claude Code uses for a short absolute path. */
+  const projectKey = (dir: string) => dir.replace(/[^a-zA-Z0-9]/g, '-');
+
+  test('a fresh run in a cwd given through an alias reports the journal the child actually writes', async () => {
+    // The fake writes where the real binary does: under the key of its own,
+    // physical cwd. A journal path keyed on the alias would not exist.
+    const root = await tempDir('root');
+    const { real, alias } = await aliasedDir(root);
+    const home = path.join(root, 'home');
+    const result = await run({ cwd: alias, ephemeralClaudeHomePath: home });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.claude.projectHomePath).toBe(path.join(home, 'projects', projectKey(real)));
+    expect(path.dirname(result.claude.sessionJsonlPath)).toBe(result.claude.projectHomePath);
+    expect(await Bun.file(result.claude.sessionJsonlPath).exists()).toBe(true);
+    expect(await fs.readdir(path.join(home, 'projects'))).toEqual([ projectKey(real) ]);
+  });
+
+  test('a relative cwd through an alias resolves against this process\'s cwd, then to the physical directory', async () => {
+    const root = await tempDir('root');
+    const { real, alias } = await aliasedDir(root);
+    const home = path.join(root, 'home');
+    const result = await run({ cwd: path.relative(process.cwd(), alias), ephemeralClaudeHomePath: home });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.claude.projectHomePath).toBe(path.join(home, 'projects', projectKey(real)));
+    expect(await Bun.file(result.claude.sessionJsonlPath).exists()).toBe(true);
+  });
+
+  test('a seed published for an aliased cwd lands where the child resumes it, and history names the real one', async () => {
+    const root = await tempDir('root');
+    const { real, alias } = await aliasedDir(root);
+    const home = path.join(root, 'home');
+    const seed = { sessionId: '01900000-0000-7000-8000-000000000005', value: '{"type":"user"}\n' };
+    const result = await run({ cwd: alias, ephemeralClaudeHomePath: home, customSessionData: seed });
+
+    expect(result.exitCode).toBe(0);
+    const journal = await fs.readFile(result.claude.sessionJsonlPath, 'utf8');
+    // The seed and the child's own appends are one file, not two.
+    expect(journal.startsWith(seed.value)).toBe(true);
+    expect(journal.length).toBeGreaterThan(seed.value.length);
+    expect(await fs.readdir(path.join(home, 'projects'))).toEqual([ projectKey(real) ]);
+    const history: unknown = JSON.parse((await fs.readFile(path.join(home, 'history.jsonl'), 'utf8')).trim());
+    expect(history).toMatchObject({ project: real, sessionId: seed.sessionId });
+  });
+
+  test('a cwd that does not exist is refused before anything is created', async () => {
+    const root = await tempDir('root');
+    const home = path.join(root, 'home');
+    const missing = path.join(root, 'missing');
+
+    await expect(run({ cwd: missing, ephemeralClaudeHomePath: home })).rejects.toThrow(`cwd ${missing} cannot be resolved`);
+    expect(await fs.readdir(root)).toEqual([]);
+  });
+
   test('a missing home is created, and dispose() leaves it, after success and failure alike', async () => {
     const root = await tempDir('root');
     for (const exitCode of [ '0', '3' ]) {

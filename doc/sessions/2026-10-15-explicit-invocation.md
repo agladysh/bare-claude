@@ -41,7 +41,20 @@ test`:
   exited 129.
 - **Round four:** unrun at authoring; the operating session's run of it, 405 pass, 1 conditional
   skip, 0 fail, is recorded at the end of this file.
-- **Round five** (a reporter's exception no longer stops a stop): unrun at authoring.
+- **Round five** (a reporter's exception no longer stops a stop): unrun at authoring; the operating
+  session's focused run of it is recorded at the end of this file.
+- **Round six** (physical cwd; the doctor's foreign-install item): unrun at authoring.
+
+Native runs, by the operating session on one macOS host with Claude Code 2.1.292 under a managed
+launcher, each a single sample: a fresh run; a resume through the `/tmp` alias, appending to the
+one reported journal; a SIGTERM stop, exit 143 with the group empty; and so `claude --print`
+under `setsid()`. A fresh run with a `/tmp` alias cwd then exited 0 while the journal it reported
+did not exist; the child had written under the `/private/tmp` key. That is round six's first fix.
+On credentials: the first decoy token file was not exercised — its variable sat in an
+environment the invocation drops — and is not evidence. A later run put a FIFO token file in the
+invocation's own `extraEnv` under `auth: caller`; the run completed, which a read of the FIFO
+would have blocked; and an explicit `tokenFile` beside `auth: caller` was refused before any
+provider request.
 
 What those passes establish is their scope: one macOS host, one Bun version, fakes for `claude`
 and for a launcher. In particular they show, on that host, that `process.kill` with a negative PID
@@ -157,6 +170,22 @@ of it; `engines` admits any Bun from 1.3, and later versions have not been read.
   signalled and possibly still running, and the home is kept rather than removed under them. The
   exit code stays the spawned process's own: it never says that everything the run started has
   ended.
+- **The cwd is physical (round six).** A native fresh run spawned in `/tmp/x` wrote its journal
+  under the key of `/private/tmp/x`, the directory it actually ran in, while `spawnClaude` keyed
+  and reported `-tmp-x`. Resume had hidden it: Claude Code finds a resumed session by its id. The
+  smallest coherent fix is one resolution, `physicalCwd()` — `path.resolve`, then `realpath` —
+  used by `spawnClaude` before it creates anything and by the CLI before any preload, so the
+  spawn, project key, seed destination, history line, synthetic records and reported paths all
+  name one directory. Relative cwds keep their meaning; a cwd that does not exist is now refused
+  up front rather than failing the spawn after the home was prepared. The fake `claude` now keys
+  its journal on its own cwd, as the real one does, so the tests see the mismatch the native run
+  saw. Exported because the CLI consumes it; nothing else about the API changed.
+- **A foreign bin entry with a `bare-claude` on `PATH` is a warning (round six).** The doctor
+  failed it, though an absent entry with one on `PATH` is fine, and the 2026-09-11 decision was
+  that any `bare-claude` on `PATH` satisfies the item. It now warns, naming what `PATH` resolves,
+  and fails only when nothing does. The item stays about the command, not the invocation: a
+  scrubbed environment without `bare-claude` on its `PATH` still fails it while the invocation's
+  own items pass, and a consumer reads those items rather than the exit status.
 - **A signal after the run ended on its own is not its outcome (round three).** Round two turned
   any first signal into 128+n, even one that arrived after `claude` had exited with its own code.
 - **A failed spawn takes back what it published.** The journal is removed only while the path
@@ -213,14 +242,12 @@ is a clone. The platform does not decide it — macOS does not imply APFS. Test 
 
 ## Not established
 
-- **Native resume of a cloned journal**: that real Claude Code resumes from a journal published
-  this way, appends to the reported path, and does so with the cwd given through a symlinked alias
-  (`/tmp`, `/var` on macOS). `cwd` is `path.resolve`d, not realpath'd; whether the project key
-  needs the realpath is for that run to show.
-- **Native stopping**: SIGTERM to a real run under the real managed launcher, and SIGKILL to the
-  CLI followed by the runner signalling the reported group, each leaving the group empty.
-- **`setsid()` and Claude Code**: a detached child has no controlling terminal. That `claude
-  --print` does not need one was not checked.
+- **Native runs after round six**: a fresh and a resumed run with an alias cwd, against the
+  physical-cwd fix; until then, the alias defect above stands for this source.
+- **Native stopping beyond one sample**: SIGKILL to the CLI followed by the runner signalling the
+  reported group; descendants listed before the signal; anything about the provider request.
+- **Claude Code's project key for very long paths**: `pathToFilename` truncates and hashes past
+  200 characters by its own scheme, which was never compared with Claude Code's.
 - **Round four's tests**, as said above. A signal held during a CLI spawn is tested only through
   the library supervisor, where the test controls the timing; a write failing between spawn and
   attach is not tested at all, only removed as a possibility by the order of the code.

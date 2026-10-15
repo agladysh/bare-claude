@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **A fresh run in a cwd given through a symbolic link reported a journal that did not exist.**
+  The project directory was keyed on the alias (`/tmp/…`), while Claude Code writes under the key
+  of the physical directory it runs in (`/private/tmp/…`). The cwd is now made physical, by
+  `physicalCwd()` (exported), before anything is created — a cwd that does not exist is refused
+  there — and the spawn, the project key, the `history.jsonl` line, the CLI's `--read`/`preload`
+  and its synthetic records all use it. Relative cwds still resolve against the calling
+  process's cwd. A resumed run was unaffected only because Claude Code finds a resumed session by
+  its id.
+- `--doctor`'s `install` item failed a foreign entry in the bin directory even when `PATH`
+  resolved some other `bare-claude`, contrary to the rule that any `bare-claude` on `PATH`
+  satisfies it. It now warns, naming what `PATH` resolves, and fails only when nothing does.
+
 ### Changed
 
 - **The CLI spawns `claude` in a process group of its own** (`detached`, so `setsid()`, on macOS

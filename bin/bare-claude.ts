@@ -9,7 +9,9 @@ import { watch } from 'node:fs/promises';
 import TailFile from '@logdna/tail-file';
 import { type } from 'arktype';
 
-import { LaunchConfig, Launchers, spawnClaude, type Json, type Launcher } from '@agladysh/bare-claude';
+import {
+  LaunchConfig, Launchers, physicalCwd, spawnClaude, type Json, type Launcher
+} from '@agladysh/bare-claude';
 import { TranscriptRenderer } from '@agladysh/bare-claude/display';
 import {
   defaultMaxContentBytes, emitPreload, glob, type PreloadEntry
@@ -453,9 +455,11 @@ async function main() {
   // preload has run anybody's shell command.
   LaunchConfig(preset);
 
-  // The run's own directory: what spawnClaude will give the child, and so
-  // what preloads resolve against and the synthetic records claim.
-  const cwd = path.resolve(preset.cwd ?? process.cwd());
+  // The run's own directory, resolved exactly as spawnClaude will resolve it:
+  // what the child runs in, and so what preloads resolve against and the
+  // synthetic records claim. A cwd that does not exist is refused here,
+  // before any preload has run.
+  const cwd = await physicalCwd(preset.cwd ?? process.cwd());
 
   // `--read` is preload's file/glob case; both routes go through the same
   // resolver so they share one byte budget and one set of skip rules.

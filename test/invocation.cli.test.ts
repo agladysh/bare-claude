@@ -194,6 +194,51 @@ describe('which configuration is read', () => {
   });
 });
 
+describe('a cwd declared through an alias', () => {
+  test('preloads, records and reports the physical directory the child writes in', async () => {
+    const work = await repo();
+    await Bun.file(path.join(work, 'notes.md')).write('only in the aliased cwd\n');
+    const alias = path.join(await tempDir('alias'), 'work');
+    await fs.symlink(work, alias);
+    const home = path.join(await tempDir('home'), 'claude');
+    const config = await configFile(`cwd: ${alias}\n`);
+
+    const result = await runCli([
+      '--config', config, '--claude-home', home, '--read', 'notes.md', '--quiet', 'hello',
+    ], { cwd: await repo() });
+
+    expect(result.exitCode).toBe(0);
+    const journal = reportedJournal(result.stderr) ?? '';
+    expect(path.dirname(journal)).toBe(path.join(home, 'projects', work.replace(/[^a-zA-Z0-9]/g, '-')));
+    // One journal: the preload and the child's own records, in the file reported.
+    expect(await fs.readdir(path.join(home, 'projects'))).toEqual([ path.basename(path.dirname(journal)) ]);
+    const text = await fs.readFile(journal, 'utf8');
+    expect(text).toContain('only in the aliased cwd');
+    expect(text).toContain(`"cwd":"${work}"`);
+    expect(text).not.toContain(`"cwd":"${alias}"`);
+    expect(text).toContain('"Done."');
+  });
+
+  test('a declared cwd that does not exist is refused before any preload runs or anything is spawned', async () => {
+    const cwd = await repo();
+    const argv = await argvProbe();
+    const home = path.join(await tempDir('home'), 'claude');
+    const missing = path.join(await tempDir('gone'), 'missing');
+    const marker = path.join(await tempDir('marker'), 'ran');
+    const config = await configFile(`cwd: ${missing}\npreload:\n  - type: shell\n    cmd: touch ${marker}\n`);
+
+    const result = await runCli([ '--config', config, '--claude-home', home, '--quiet', 'hello' ], {
+      cwd, env: { FAKE_CLAUDE_ARGV_FILE: argv.file },
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(`cwd ${missing} cannot be resolved`);
+    expect(await Bun.file(marker).exists()).toBe(false);
+    expect(await argv.read()).toBeNull();
+    expect(await Bun.file(path.join(home, 'settings.json')).exists()).toBe(false);
+  });
+});
+
 describe('refused before anything is spawned', () => {
   const cases: { name: string, yaml: string, args?: string[], message: string }[] = [
     { name: 'an unknown key', yaml: 'sessionSeed: x\n', message: 'sessionSeed must be removed' },
