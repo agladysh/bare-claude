@@ -1,7 +1,10 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { configFileName, locateConfig, parseConfig } from '@agladysh/bare-claude/config';
+import type { AuthMode } from '@agladysh/bare-claude';
+import {
+  configFileName, locateConfig, parseConfig, type ConfigSource
+} from '@agladysh/bare-claude/config';
 import { commandName, commandSource, defaultBinDir, status } from '@agladysh/bare-claude/install';
 import {
   alternateCredentialsIn, formatMode, hasToken, inspectTokenFile, resolveTokenFile, tokenVariable
@@ -74,6 +77,18 @@ export interface DoctorOptions {
    * `BARE_CLAUDE_TOKEN_FILE`, then the XDG config location.
    */
   tokenFile?: string,
+
+  /**
+   * Who supplies the credential, as `--auth`. Under `'caller'` the auth item
+   * inspects nothing and says so. Defaults to `'fallback'`.
+   */
+  auth?: AuthMode,
+
+  /**
+   * Which configuration to validate, as `--config`/`--no-config`. Defaults to
+   * the located `bare-claude.yaml`.
+   */
+  config?: ConfigSource,
 }
 
 /**
@@ -195,9 +210,21 @@ async function checkGit(env: Record<string, string | undefined>, cwd: string): P
  */
 async function checkAuth(
   env: Record<string, string | undefined>,
-  tokenFile: string | undefined
+  tokenFile: string | undefined,
+  auth: AuthMode
 ): Promise<DoctorItem> {
   const name = 'auth';
+
+  // A warning, not ok: the caller's route may well work, but nothing here
+  // has looked at it, and a variable's mere presence would prove nothing.
+  if (auth === 'caller') {
+    return {
+      name,
+      status: 'warn',
+      detail: `caller-managed: ${commandName} supplies no credential, and this does not check the caller's`,
+      hint: [],
+    };
+  }
 
   if (hasToken(env)) {
     return { name, status: 'ok', detail: `${tokenVariable} present`, hint: [] };
@@ -319,38 +346,48 @@ async function checkInstall(
   }
 }
 
-async function checkPreset(cwd: string): Promise<DoctorItem> {
+async function checkPreset(cwd: string, source: ConfigSource): Promise<DoctorItem> {
   const name = 'preset';
 
+  if (source.kind === 'none') {
+    return { name, status: 'ok', detail: 'no configuration file is read (--no-config)', hint: [] };
+  }
+
   let configPath: string | null;
-  try {
-    configPath = await locateConfig(cwd);
-  } catch (error) {
-    return {
-      name,
-      status: 'fail',
-      detail: `cannot locate ${configFileName}: ${error instanceof Error ? error.message : String(error)}`,
-      hint: [],
-    };
+  if (source.kind === 'file') {
+    configPath = source.path;
+  } else {
+    try {
+      configPath = await locateConfig(cwd);
+    } catch (error) {
+      return {
+        name,
+        status: 'fail',
+        detail: `cannot locate ${configFileName}: ${error instanceof Error ? error.message : String(error)}`,
+        hint: [],
+      };
+    }
   }
 
   if (configPath === null) {
     return {
       name,
       status: 'warn',
-      detail: `${cwd} is not inside a Git working copy; ${commandName} runs inside one and reads ${configFileName} at its root`,
-      hint: [],
+      detail: `${cwd} is not inside a Git working copy; ${commandName} reads ${configFileName} at the root of one`,
+      hint: [ 'Name a configuration file with --config, or read none with --no-config' ],
     };
   }
 
   const file = Bun.file(configPath);
   if (!await file.exists()) {
-    return {
-      name,
-      status: 'ok',
-      detail: `no ${configFileName} at ${path.dirname(configPath)} (optional)`,
-      hint: [],
-    };
+    return source.kind === 'file'
+      ? { name, status: 'fail', detail: `configuration file ${configPath} does not exist`, hint: [] }
+      : {
+        name,
+        status: 'ok',
+        detail: `no ${configFileName} at ${path.dirname(configPath)} (optional)`,
+        hint: [],
+      };
   }
 
   try {
@@ -389,9 +426,9 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
     checkBun(),
     await checkClaude(claudePath, env, cwd),
     await checkGit(env, cwd),
-    await checkAuth(env, options.tokenFile),
+    await checkAuth(env, options.tokenFile, options.auth ?? 'fallback'),
     await checkInstall(env, options.binDir),
-    await checkPreset(cwd),
+    await checkPreset(cwd, options.config ?? { kind: 'located' }),
   ];
 
   return { items, ok: items.every(item => item.status !== 'fail') };

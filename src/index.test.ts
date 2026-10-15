@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -82,6 +83,7 @@ describe('LaunchConfig', () => {
       noBashEditDiff: true,
       noMothership: false,
       noProcessEnv: false,
+      auth: 'fallback',
       linkAuth: true,
       tokenFile: null,
       tools: null,
@@ -104,6 +106,21 @@ describe('LaunchConfig', () => {
     expect(cfg({ launcher: 'ollama' }).noMothership).toBe(true);
     expect(cfg({ launcher: 'ollama', noMothership: false }).noMothership).toBe(false);
     expect(cfg({ noMothership: true }).noMothership).toBe(true);
+  });
+
+  test('caller-managed auth turns the credential link off by default', () => {
+    expect(cfg().linkAuth).toBe(true);
+    expect(cfg({ auth: 'caller' }).linkAuth).toBe(false);
+    expect(cfg({ auth: 'caller', linkAuth: false }).linkAuth).toBe(false);
+    expect(cfg({ auth: 'fallback', linkAuth: false }).linkAuth).toBe(false);
+  });
+
+  test('caller-managed auth refuses a credential source of Bare Claude\'s own', () => {
+    expect(() => cfg({ auth: 'caller', linkAuth: true })).toThrow('cannot also take linkAuth');
+    expect(() => cfg({ auth: 'caller', tokenFile: '/some/oauth' })).toThrow('cannot also take a tokenFile');
+    // Unset, in each of the ways the token file resolution treats as unset.
+    expect(cfg({ auth: 'caller', tokenFile: null }).tokenFile).toBeNull();
+    expect(cfg({ auth: 'caller', tokenFile: '' }).auth).toBe('caller');
   });
 
   test('keeps falsy values a caller passed explicitly', () => {
@@ -837,5 +854,179 @@ describe('spawnClaude and the token file', () => {
     const home = await homeWith('\n');
     const file = path.join(home, '.config', 'bare-claude', 'oauth');
     await expect(tokenSeenBy({ extraEnv: { HOME: home } })).rejects.toThrow(`token file ${file} is empty`);
+  });
+
+  test('caller-managed auth never puts a token file beside the caller\'s route', async () => {
+    // The case a managed launcher is in: it brings its own credential, so the
+    // environment it is handed carries none. Under 'fallback' that absence is
+    // exactly what triggers the file; under 'caller' nothing is read at all.
+    const home = await homeWith('sk-ant-oat01-from-default-file');
+    const fromVariable = path.join(await tempDir('var'), 'oauth');
+    await fs.writeFile(fromVariable, 'sk-ant-oat01-from-variable\n', { mode: 0o600 });
+
+    expect(await tokenSeenBy({ extraEnv: { HOME: home } })).toBe('sk-ant-oat01-from-default-file');
+    expect(await tokenSeenBy({ auth: 'caller', extraEnv: { HOME: home } })).toBe('<unset>');
+    expect(await tokenSeenBy({ auth: 'caller', extraEnv: { HOME: home, BARE_CLAUDE_TOKEN_FILE: fromVariable } }))
+      .toBe('<unset>');
+  });
+
+  test('caller-managed auth does not even inspect a broken token file', async () => {
+    // An empty file is an error under 'fallback'; under 'caller' it is not
+    // this run's business.
+    const home = await homeWith('\n');
+    expect(await tokenSeenBy({ auth: 'caller', extraEnv: { HOME: home } })).toBe('<unset>');
+  });
+
+  test('caller-managed auth passes the caller\'s own credential through untouched', async () => {
+    const home = await homeWith('sk-ant-oat01-from-default-file');
+    expect(await tokenSeenBy({
+      auth: 'caller',
+      extraEnv: { HOME: home, CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-from-caller' },
+    })).toBe('sk-ant-oat01-from-caller');
+  });
+});
+
+describe('spawnClaude and a caller\'s Claude home', () => {
+  /**
+   * The fake `claude` under test/ stands in for the child: it writes a
+   * two-record transcript into the session file under the home it is given
+   * (appending, as the real one does) and exits. `noProcessEnv` plus an
+   * explicit PATH keeps this process's environment, and with it any real
+   * credential, out of the child.
+   */
+  const fakeClaude = path.join(import.meta.dir, '..', 'test', 'fake-claude', 'claude');
+  const roots: string[] = [];
+
+  async function tempDir(label: string): Promise<string> {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), `bare-claude-spawn-home-${label}-`));
+    roots.push(dir);
+    return fs.realpath(dir);
+  }
+
+  afterEach(async () => {
+    while (roots.length > 0) {
+      const dir = roots.pop();
+      if (dir !== undefined) {
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  async function run(options: Partial<LaunchOptions>, env: Record<string, string> = {}) {
+    const claude = await spawnClaude({
+      callToAction: '# continue',
+      claudePath: fakeClaude,
+      noProcessEnv: true,
+      auth: 'caller',
+      ...options,
+    }, { env: { PATH: path.dirname(process.execPath), ...env }, stdout: 'ignore', stderr: 'ignore' });
+    const exitCode = await claude.subprocess.exited;
+    await claude.dispose();
+    return { claude, exitCode };
+  }
+
+  /** Whether `dir`'s filesystem accepts a forced copy-on-write clone. */
+  async function canClone(dir: string): Promise<boolean> {
+    const probe = await fs.mkdtemp(path.join(dir, 'probe-'));
+    try {
+      await fs.writeFile(path.join(probe, 'a'), 'probe');
+      await fs.copyFile(path.join(probe, 'a'), path.join(probe, 'b'), fs.constants.COPYFILE_FICLONE_FORCE);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      await fs.rm(probe, { recursive: true, force: true });
+    }
+  }
+
+  test('a missing home is created, and dispose() leaves it, after success and failure alike', async () => {
+    const root = await tempDir('root');
+    for (const exitCode of [ '0', '3' ]) {
+      const home = path.join(root, `home-${exitCode}`);
+      const result = await run({ cwd: root, ephemeralClaudeHomePath: home }, { FAKE_CLAUDE_EXIT_CODE: exitCode });
+
+      expect(result.exitCode).toBe(Number(exitCode));
+      expect(result.claude.ephemeralClaudeHomePath).toBe(home);
+      expect(await Bun.file(result.claude.sessionJsonlPath).exists()).toBe(true);
+      expect(await Bun.file(path.join(home, 'settings.json')).exists()).toBe(true);
+    }
+  });
+
+  test('a relative home is resolved before the child sees it', async () => {
+    // The child resolves CLAUDE_CONFIG_DIR against its own cwd; handing it a
+    // relative path would put the session somewhere the parent never looks.
+    const root = await tempDir('root');
+    const cwd = path.join(root, 'work');
+    await fs.mkdir(cwd);
+    const relative = path.relative(process.cwd(), path.join(root, 'home'));
+    const result = await run({ cwd, ephemeralClaudeHomePath: relative });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.claude.ephemeralClaudeHomePath).toBe(path.join(root, 'home'));
+    expect(await Bun.file(result.claude.sessionJsonlPath).exists()).toBe(true);
+  });
+
+  test('an in-memory seed never overwrites a journal already in the home', async () => {
+    const root = await tempDir('root');
+    const home = path.join(root, 'home');
+    const seed = { sessionId: '01900000-0000-7000-8000-000000000001', value: '{"type":"user"}\n' };
+    const first = await run({ cwd: root, ephemeralClaudeHomePath: home, customSessionData: seed });
+    expect(first.exitCode).toBe(0);
+    const journal = await fs.readFile(first.claude.sessionJsonlPath, 'utf8');
+    expect(journal.startsWith(seed.value)).toBe(true);
+    expect(journal.length).toBeGreaterThan(seed.value.length);
+
+    await expect(run({ cwd: root, ephemeralClaudeHomePath: home, customSessionData: seed }))
+      .rejects.toThrow('already exists');
+    expect(await fs.readFile(first.claude.sessionJsonlPath, 'utf8')).toBe(journal);
+    // The refused seed added nothing to the home's history either.
+    const history = await fs.readFile(path.join(home, 'history.jsonl'), 'utf8');
+    expect(history.trimEnd().split('\n')).toHaveLength(1);
+  });
+
+  test('a refused seed in a temporary home leaves no temporary home behind', async () => {
+    const root = await tempDir('root');
+    const seed = { sessionId: '01900000-0000-7000-8000-000000000002', sourcePath: path.join(root, 'absent.jsonl') };
+    const before = new Set(await fs.readdir(os.tmpdir()));
+
+    await expect(run({ cwd: root, customSessionData: seed })).rejects.toThrow();
+
+    // bun test runs one test at a time unless told otherwise, so any new
+    // home here is this refusal's.
+    const leaked = (await fs.readdir(os.tmpdir()))
+      .filter(name => name.startsWith('bare-claude-home-') && !before.has(name));
+    expect(leaked).toEqual([]);
+  });
+
+  test('a file seed resumes from an exact clone, and the source outlives the new appends', async () => {
+    const root = await tempDir('root');
+    const sessionId = '01900000-0000-7000-8000-000000000003';
+    const source = path.join(root, 'prior', `${sessionId}.jsonl`);
+    await fs.mkdir(path.dirname(source));
+    const prior = Buffer.from(`${JSON.stringify({ type: 'user', message: { role: 'user', content: 'before é' } })}\n`);
+    await fs.writeFile(source, prior);
+    const sourceSha256 = createHash('sha256').update(prior).digest('hex');
+    const home = path.join(root, 'next-home');
+    const options: Partial<LaunchOptions> = {
+      cwd: root, ephemeralClaudeHomePath: home, customSessionData: { sessionId, sourcePath: source, sourceSha256 },
+    };
+
+    if (!await canClone(root)) {
+      await expect(run(options)).rejects.toThrow('no byte copy is made');
+      expect((await fs.readFile(source)).equals(prior)).toBe(true);
+      const projects = path.join(home, 'projects');
+      for (const project of await fs.readdir(projects)) {
+        expect(await fs.readdir(path.join(projects, project))).toEqual([]);
+      }
+      return;
+    }
+
+    const result = await run(options);
+    expect(result.exitCode).toBe(0);
+    expect(result.claude.sessionId).toBe(sessionId);
+    const received = await fs.readFile(result.claude.sessionJsonlPath);
+    expect(received.subarray(0, prior.length).equals(prior)).toBe(true);
+    expect(received.length).toBeGreaterThan(prior.length);
+    expect((await fs.readFile(source)).equals(prior)).toBe(true);
   });
 });

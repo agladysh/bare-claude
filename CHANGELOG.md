@@ -13,8 +13,47 @@
   large repository accumulated tens of gigabytes. `noBashEditDiff: false` omits the variable; see the
   README for how that composes with a caller's `bashEditDiffEnabled`.
 
+- **`ephemeralClaudeHomePath` and `cwd` are made absolute**, and a caller's home is created when
+  missing. A relative home reached the child as a relative `CLAUDE_CONFIG_DIR`, which it
+  resolves against its own cwd, not the parent's; a relative `cwd` keyed the project directory
+  differently from what the child saw.
+- **An in-memory session seed no longer overwrites an existing journal.** It was written with a
+  truncating write, harmless in a fresh temporary home and destructive in a caller's. It is now
+  written exclusively, mode 0600, and the spawn rejects when a journal for that session exists.
+  `history.jsonl` is appended to rather than rewritten.
+- A spawn that fails before the child starts — token file, session seed, the spawn itself —
+  removes the temporary home it created instead of leaking it.
+- `--debug` prints the resolved configuration with the values of `CLAUDE_CODE_OAUTH_TOKEN`,
+  `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` replaced by `<redacted>`, wherever in it they
+  appear. A configuration passing a credential through `extraEnv` had it printed.
+- The CLI's `--read` and `preload` resolve against the run's `cwd`, as the child does, rather
+  than against the directory `bare-claude` was started in.
+- Documentation: `noProcessEnv` was described as never stripping authentication variables. With
+  it, nothing is inherited, credentials included; without it, credentials are inherited like
+  everything else. Neither governs the token file.
+
 ### Added
 
+- `--config FILE` and `--no-config`, and `loadConfig()` with a `ConfigSource` from
+  `@agladysh/bare-claude/config`: read a named configuration file instead of `bare-claude.yaml` at
+  the Git root, or none. Without them, a run from a working copy merged whatever that repository's
+  file said, its credentials and endpoint included. A named file needs no Git working copy, must
+  exist, and is validated the same way. `--doctor` validates the file a run would read.
+- `auth` launch option, preset key and `--auth`: `'fallback'` (default, the existing behaviour) or
+  `'caller'`, under which no token file is read or inspected and no credential file is linked,
+  for callers whose launcher or environment owns authentication. Combined with `linkAuth: true` or
+  a `tokenFile` it is refused. `--doctor --auth caller` reports the auth item as a warning that
+  inspects nothing.
+- `customSessionData` takes a file seed, `{ sessionId, sourcePath, sourceSha256? }`: the new
+  journal is an exclusive copy-on-write clone of a retained prior journal on the same filesystem,
+  with exact source checks and no byte-copy fallback. The source is never written; each side
+  appends independently. The in-memory `{ sessionId, value }` route is unchanged. `--read` and
+  `preload` refuse to extend a file seed.
+- `--claude-home DIR`, the CLI side of `ephemeralClaudeHomePath`: a caller's Claude home, kept
+  whatever the outcome. The CLI reports `Claude home kept at` and, when the child wrote one,
+  `Claude session journal at` on stderr for every kept home.
+- `SessionSeed`, `InMemorySessionSeed`, `FileSessionSeed` and `AuthMode` types; `authMode`
+  schema from `@agladysh/bare-claude/config`.
 - The subscription token can live in a file: `~/.config/bare-claude/oauth` (under
   `XDG_CONFIG_HOME` when set), or the file named by `--token-file`, the `tokenFile` launch option
   or `BARE_CLAUDE_TOKEN_FILE`. `spawnClaude()` reads it, trimmed, into the child's

@@ -9,7 +9,7 @@ import { watch } from 'node:fs/promises';
 import TailFile from '@logdna/tail-file';
 import { type } from 'arktype';
 
-import { Launchers, spawnClaude, type Launcher } from '@agladysh/bare-claude';
+import { LaunchConfig, Launchers, spawnClaude, type Launcher } from '@agladysh/bare-claude';
 import { TranscriptRenderer } from '@agladysh/bare-claude/display';
 import {
   defaultMaxContentBytes, emitPreload, glob, type PreloadEntry
@@ -18,10 +18,12 @@ import { SessionBuilder } from '@agladysh/bare-claude/SessionBuilder';
 
 import pkg from '../package.json';
 import {
-  configFileName, effortLevel, emptyConfig, locateConfig, parseConfig, type Config, type EffortLevel
+  authMode, effortLevel, loadConfig, type ConfigSource, type EffortLevel
 } from '@agladysh/bare-claude/config';
+import type { AuthMode } from '@agladysh/bare-claude';
 import { resolvePreset, type DynamicPreset, type Preset } from '@agladysh/bare-claude/preset';
 import { formatDoctorReport, runDoctor } from '@agladysh/bare-claude/doctor';
+import { alternateCredentialVariables, tokenVariable } from '@agladysh/bare-claude/token';
 import { readUsage } from '@agladysh/bare-claude/usage';
 import { deepmerge } from 'deepmerge-ts';
 
@@ -33,6 +35,9 @@ function displayHelp() {
     '',
     'Options:',
     '  -u, --use <preset>     Use configuration preset from bare-claude.yaml',
+    '      --config <file>    Read this configuration file instead of bare-claude.yaml',
+    '                         at the Git root; it must exist',
+    '      --no-config        Read no configuration file at all',
     '  -l, --launcher <name>  claude (default) or ollama',
     '  -m, --model <model>    Model to use',
     '  -r, --read <pathspec>  Preload a file into a synthetic session (repeatable,',
@@ -55,6 +60,12 @@ function displayHelp() {
     '                         File holding the OAuth token, used when the environment',
     '                         has none (default: $BARE_CLAUDE_TOKEN_FILE, then',
     '                         ~/.config/bare-claude/oauth)',
+    '      --auth <mode>      fallback (default): the environment\'s credential, else',
+    '                         the token file; caller: the caller\'s environment or',
+    '                         launcher alone, with no token file and no credential link',
+    '      --claude-home <dir>',
+    '                         Claude home for the run, created if missing and kept',
+    '                         whatever the outcome (default: a temporary directory)',
     '',
     '      --verbose          Print more events in the transcript',
     '      --debug            Print the resolved configuration and unrecognized events',
@@ -66,7 +77,8 @@ function displayHelp() {
     '  -h, --help             Print this help and exit',
     '',
     'The call to action is read from stdin when no positional one is given.',
-    'Exits with the exit code of the `claude` subprocess.',
+    'Exits with the exit code of the `claude` subprocess, which says the process',
+    'ended, not that the task was done.',
     '',
     'A bare run does not inherit the ambient login session: set CLAUDE_CODE_OAUTH_TOKEN',
     'from `claude setup-token`, or write the bare token to ~/.config/bare-claude/oauth',
@@ -77,20 +89,24 @@ function displayHelp() {
   ].join('\n'));
 }
 
-async function loadConfig(): Promise<Config> {
-  const configPath = await locateConfig();
-  if (configPath === null) {
-    throw new Error(
-      `${process.cwd()} is not inside a Git working copy, which is where ${configFileName} is looked up`
-    );
+/**
+ * `--config` and `--no-config` as a {@link ConfigSource}. Neither means the
+ * located `bare-claude.yaml`; both is a contradiction, refused.
+ */
+function configSource(file: string | undefined, none: boolean | undefined): ConfigSource {
+  if (file !== undefined && none) {
+    throw new Error('--config and --no-config cannot be given together');
   }
-
-  const configFile = Bun.file(configPath);
-  if (!await configFile.exists()) {
-    return emptyConfig();
+  if (none) {
+    return { kind: 'none' };
   }
-
-  return parseConfig(await configFile.text(), configPath);
+  if (file === undefined) {
+    return { kind: 'located' };
+  }
+  if (file === '') {
+    throw new Error('--config needs a file');
+  }
+  return { kind: 'file', path: path.resolve(file) };
 }
 
 /**
@@ -107,6 +123,12 @@ async function loadPreset(): Promise<Startup> {
         type: 'string',
         short: 'u',
       },
+      config: {
+        type: 'string',
+      },
+      'no-config': {
+        type: 'boolean',
+      },
       launcher: {
         type: 'string',
         short: 'l',
@@ -115,6 +137,12 @@ async function loadPreset(): Promise<Startup> {
         type: 'string',
       },
       'token-file': {
+        type: 'string',
+      },
+      auth: {
+        type: 'string',
+      },
+      'claude-home': {
         type: 'string',
       },
       model: {
@@ -231,10 +259,14 @@ async function loadPreset(): Promise<Startup> {
     return { kind: 'done', exitCode: 0 };
   }
 
+  const source = configSource(values.config, values['no-config']);
+
   if (values.doctor) {
     const report = await runDoctor({
       claudePath: values['claude-path'],
       tokenFile: values['token-file'],
+      auth: parseAuth(values.auth),
+      config: source,
     });
     process.stdout.write(formatDoctorReport(report));
     return { kind: 'done', exitCode: report.ok ? 0 : 1 };
@@ -258,6 +290,8 @@ async function loadPreset(): Promise<Startup> {
   set('launcher', parseLauncher(values.launcher));
   set('claudePath', values['claude-path']);
   set('tokenFile', values['token-file']);
+  set('auth', parseAuth(values.auth));
+  set('ephemeralClaudeHomePath', values['claude-home']);
   set('model', values.model);
   set('read', values.read);
   set('verbose', values.verbose);
@@ -273,7 +307,7 @@ async function loadPreset(): Promise<Startup> {
   set('maxOutputLength', parseNumber('max-output-length', values['max-output-length']));
   set('extraArgs', values['claude-arg']);
 
-  const { configPreset, presets } = await loadConfig();
+  const { configPreset, presets } = await loadConfig(source);
   const preset = deepmerge(configPreset, fromCli);
   if (values.use) {
     preset.use = values.use; // The use field is not merged.
@@ -296,6 +330,17 @@ function parseLauncher(value: string | undefined): Launcher | undefined {
     );
   }
   return value;
+}
+
+function parseAuth(value: string | undefined): AuthMode | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const mode = authMode(value);
+  if (mode instanceof type.errors) {
+    throw new Error(`--auth ${mode.summary}`);
+  }
+  return mode;
 }
 
 /**
@@ -333,6 +378,17 @@ function parseNumber(name: string, value: string | undefined): number | undefine
   return parsed;
 }
 
+/** Credential variables, whose values a `--debug` dump of the preset must not print. */
+const credentialVariables = new Set([ tokenVariable, ...alternateCredentialVariables ]);
+
+/**
+ * `JSON.stringify` replacer hiding the value of any credential variable, at
+ * any depth: a caller may pass one through `extraEnv` or `extraSettings.env`.
+ */
+function redactCredentials(key: string, value: unknown): unknown {
+  return credentialVariables.has(key) && typeof value === 'string' ? '<redacted>' : value;
+}
+
 async function main() {
   const startup = await loadPreset();
   if (startup.kind === 'done') {
@@ -341,8 +397,16 @@ async function main() {
   const { preset } = startup;
 
   if (preset.debug) {
-    process.stdout.write(`Configuration:\n${JSON.stringify(preset, null, 2)}\n`);
+    process.stdout.write(`Configuration:\n${JSON.stringify(preset, redactCredentials, 2)}\n`);
   }
+
+  // Resolved now for its refusals alone — contradictory auth options — so
+  // they land before a preload has run anybody's shell command.
+  LaunchConfig(preset);
+
+  // The run's own directory: what spawnClaude will give the child, and so
+  // what preloads resolve against and the synthetic records claim.
+  const cwd = path.resolve(preset.cwd ?? process.cwd());
 
   // `--read` is preload's file/glob case; both routes go through the same
   // resolver so they share one byte budget and one set of skip rules.
@@ -352,7 +416,18 @@ async function main() {
   ];
 
   if (entries.length > 0) {
-    const sessionId = preset.customSessionData?.sessionId ?? Bun.randomUUIDv7();
+    const seed = preset.customSessionData;
+    if (seed !== undefined && seed !== null && 'sourcePath' in seed) {
+      // A file seed is cloned, never read into memory, and preloads would
+      // have to be appended to a journal that does not exist until spawn.
+      throw new Error(
+        'read and preload cannot extend a file session seed (customSessionData.sourcePath): '
+        + 'it is cloned, never byte-copied; give the prior journal as customSessionData.value '
+        + 'to rebuild it in memory instead'
+      );
+    }
+
+    const sessionId = seed?.sessionId ?? Bun.randomUUIDv7();
 
     const claudePath = preset.claudePath ?? 'claude';
 
@@ -361,8 +436,8 @@ async function main() {
     const builder = new SessionBuilder(
       sessionId,
       (await $ `${claudePath} --version`.text()).replace(' (Claude Code)', '').trim(),
-      process.cwd(),
-      (await $`git branch --show-current`.text()).trim(),
+      cwd,
+      (await $`git branch --show-current`.cwd(cwd).text()).trim(),
       // Not '<synthetic>': Claude Code reserves that marker for API-error
       // messages, and every assistant display rule excludes it, so preloaded
       // tool calls would render as raw JSON or not at all.
@@ -372,7 +447,7 @@ async function main() {
 
     const spent = { bytes: 0 };
     for (const entry of entries) {
-      await emitPreload(builder, entry, { cwd: process.cwd() }, spent);
+      await emitPreload(builder, entry, { cwd }, spent);
     }
 
     // TODO: Weirdly convoluted. Redesign?
@@ -380,7 +455,7 @@ async function main() {
     // appends to this file, and without it the child's first record lands on
     // the same physical line as ours, where JSONL parsing silently loses one
     // of the two.
-    const previous = preset.customSessionData?.value ?? '';
+    const previous = seed?.value ?? '';
     const prefix = (previous === '' || previous.endsWith('\n')) ? previous : `${previous}\n`;
     preset.customSessionData = {
       sessionId,
@@ -404,8 +479,11 @@ async function main() {
   }
 
   // A failed or inspected run keeps its ephemeral home: disposing it would
-  // delete the very transcript the path above points at.
-  let keepHome = preset.verbose || preset.debug;
+  // delete the very transcript the path above points at. A home the caller
+  // named is theirs and is always kept; dispose() would not touch it anyway,
+  // but the report below should say where it is.
+  const callerHome = typeof preset.ephemeralClaudeHomePath === 'string';
+  let keepHome = callerHome || preset.verbose || preset.debug;
 
   try {
     if (!preset.quiet) {
@@ -435,6 +513,10 @@ async function main() {
 
     if (keepHome) {
       process.stderr.write(`Claude home kept at ${claude.ephemeralClaudeHomePath}\n`);
+      // A fresh handle: the child created this file after any earlier check.
+      if (await Bun.file(claude.sessionJsonlPath).exists()) {
+        process.stderr.write(`Claude session journal at ${claude.sessionJsonlPath}\n`);
+      }
     } else {
       await claude.dispose();
     }

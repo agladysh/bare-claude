@@ -237,6 +237,24 @@ describe('runDoctor', () => {
       expect(text).not.toContain('sk-ant-oat01-not-a-real-token');
       expect(text).not.toContain('sk-ant-api-not-real');
     });
+
+    test('caller-managed auth is a warning that inspects nothing, token or file', async () => {
+      // Neither a present token nor a missing one changes the answer: under
+      // auth 'caller' the credential is not this program's to judge.
+      const { env, cwd, home } = await healthy();
+      const { CLAUDE_CODE_OAUTH_TOKEN: _dropped, ...withoutToken } = env;
+      await defaultTokenFile(home, '\n');
+
+      for (const report of [
+        await runDoctor({ env, cwd, auth: 'caller' }),
+        await runDoctor({ env: withoutToken, cwd, auth: 'caller' }),
+      ]) {
+        const auth = item(report, 'auth');
+        expect(auth.status).toBe('warn');
+        expect(auth.detail).toBe('caller-managed: bare-claude supplies no credential, and this does not check the caller\'s');
+        expect(report.ok).toBe(true);
+      }
+    });
   });
 
   describe('claude', () => {
@@ -380,6 +398,34 @@ describe('runDoctor', () => {
       const report = await runDoctor({ env, cwd: nested });
 
       expect(item(report, 'preset').detail).toBe(path.join(root, 'bare-claude.yaml'));
+    });
+
+    test('a named configuration file is validated instead of the located one', async () => {
+      const { env, cwd } = await healthy();
+      const named = path.join(await tempDir('named'), 'invocation.yaml');
+      await Bun.file(named).write('presets:\n  only:\n    quiet: true\n');
+      const report = await runDoctor({ env, cwd, config: { kind: 'file', path: named } });
+
+      expect(item(report, 'preset').detail).toBe(`${named} (presets: only)`);
+    });
+
+    test('a named configuration file that does not exist fails', async () => {
+      const { env, cwd } = await healthy();
+      const missing = path.join(await tempDir('named'), 'absent.yaml');
+      const report = await runDoctor({ env, cwd, config: { kind: 'file', path: missing } });
+
+      expect(item(report, 'preset').status).toBe('fail');
+      expect(item(report, 'preset').detail).toBe(`configuration file ${missing} does not exist`);
+      expect(report.ok).toBe(false);
+    });
+
+    test('no configuration is fine, even beside an invalid located file', async () => {
+      const { env } = await healthy();
+      const cwd = await tempRepo('quite: true\n');
+      const report = await runDoctor({ env, cwd, config: { kind: 'none' } });
+
+      expect(item(report, 'preset').status).toBe('ok');
+      expect(item(report, 'preset').detail).toBe('no configuration file is read (--no-config)');
     });
 
     test('an invalid preset file fails, with the validator\'s complaint as the hint', async () => {

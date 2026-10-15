@@ -37,6 +37,13 @@
  *                                as `NAME=<value>` (or `NAME=<unset>`),
  *                                instead of FAKE_CLAUDE_STDOUT. How a test
  *                                sees what the CLI put in the child's env.
+ *   FAKE_CLAUDE_ARGV_FILE      - path this process writes its argv to, as a
+ *                                JSON array, before anything else. How a test
+ *                                sees the flags it was given — and, when the
+ *                                file is absent, that it never ran at all.
+ *   FAKE_CLAUDE_SLEEP_MS       - milliseconds to wait after writing the
+ *                                session file and before exiting, so a test
+ *                                can interrupt a run that is still going.
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -48,6 +55,11 @@ const argv = process.argv.slice(2);
 if (argv[0] === '--version') {
   process.stdout.write(`${process.env.FAKE_CLAUDE_VERSION ?? '9.9.9'} (Claude Code)\n`);
   process.exit(0);
+}
+
+const argvFile = process.env.FAKE_CLAUDE_ARGV_FILE;
+if (argvFile !== undefined) {
+  await fs.writeFile(argvFile, JSON.stringify(argv));
 }
 
 function flagValue(name: string): string | undefined {
@@ -92,6 +104,11 @@ if (process.env.FAKE_CLAUDE_WRITE_SESSION !== '0') {
   for (const record of records) {
     await fs.appendFile(sessionPath, `${JSON.stringify(record)}\n`);
   }
+}
+
+const sleepMs = Number(process.env.FAKE_CLAUDE_SLEEP_MS ?? '0');
+if (sleepMs > 0) {
+  await Bun.sleep(sleepMs);
 }
 
 const echo = process.env.FAKE_CLAUDE_ECHO_ENV;
