@@ -85,6 +85,7 @@ function flagValues(argv: string[], flag: string): string[] {
 
 /** Whether `dir`'s filesystem accepts a forced copy-on-write clone. */
 async function canClone(dir: string): Promise<boolean> {
+  if (process.platform !== 'darwin' && process.platform !== 'linux') return false;
   const probe = await fs.mkdtemp(path.join(dir, 'probe-'));
   try {
     await fs.writeFile(path.join(probe, 'a'), 'probe');
