@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- File-based session continuation refuses unsupported platforms before filesystem effects; a forced-copy flag alone does not guarantee cloning on Windows.
+
 ### Changed
 
 - New `noBashEditDiff` launch option, default `true`, sets `CLAUDE_CODE_BASH_EDIT_DIFF=0` in the

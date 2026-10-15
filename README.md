@@ -386,10 +386,11 @@ record of the session; what the task produced, and whether anyone has received i
 To continue that session in a new run, seed the new run from the journal by path
 (`customSessionData` with `sessionId` and `sourcePath`, optionally `sourceSha256`) and give the new
 run a home of its own. The new journal is a copy-on-write clone of the old one, on the same
-filesystem, so a continuation costs no disk until it appends; the source is never written, and
+filesystem, so the continuation initially shares its existing file data; the source is never written, and
 each side appends independently afterwards. It is refused, before `claude` is spawned and with
 nothing published, when:
 
+- the platform is neither macOS nor Linux, where the forced-clone implementation was checked;
 - the filesystem cannot clone, or the source and the new home are on different filesystems — there
   is no byte-copy fallback;
 - the source is a symbolic link, or has a second hard link;

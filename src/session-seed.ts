@@ -12,9 +12,11 @@ import path from 'node:path';
  * resumed run needs a writable journal of its own under its own Claude home;
  * this module publishes one without writing to the source, as a copy-on-write
  * clone on the same filesystem, so the two share every existing byte and each
- * appends independently afterwards. Observed 2026-10-14 on APFS with Bun
- * 1.3.13 and an 8 MiB synthetic journal: the fresh clone held zero private
- * bytes, and one appended turn made 4 KiB of them.
+ * appends independently afterwards.
+ *
+ * File seeds are supported only on macOS and Linux. Bun 1.3.13's
+ * `copyFileInner` uses clonefile/ioctl_ficlone for a forced clone there,
+ * while its Windows branch calls CopyFileW without enforcing that flag.
  *
  * There is no byte-copy fallback. A filesystem that cannot clone, a source on
  * another filesystem, a source that changes while it is read, and a journal
@@ -100,6 +102,12 @@ function refuseLinkedPath(filePath: string): void {
  *   `destination` then
  */
 export function cloneSessionSeed(sourcePath: string, destination: string, expectedSha256?: string): void {
+  if (process.platform !== 'darwin' && process.platform !== 'linux') {
+    throw new Error(
+      `copy-on-write session seeds are unsupported on ${process.platform}; no byte copy is made`
+    );
+  }
+
   if (expectedSha256 !== undefined && !sha256Pattern.test(expectedSha256)) {
     throw new Error('session seed sourceSha256 must be a full lowercase SHA-256 hex digest');
   }
