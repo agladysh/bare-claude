@@ -177,6 +177,69 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('supe
     expect(await eventually(() => processGone(run.subprocess.pid), 5_000)).toBe(true);
   }, 20_000);
 
+  test('a reporter that always throws does not keep a held signal from stopping the run and its group', async () => {
+    // Every emit comes before the effect it reports; a throw there used to
+    // abort attach() with the run set and no stop started.
+    const signals = new TestSignals();
+    const reported: SupervisorEvent['kind'][] = [];
+    const supervisor = superviseSignals({
+      graceMs: 5_000,
+      source: signals,
+      onEvent: event => {
+        reported.push(event.kind);
+        throw new Error('reporter failed');
+      },
+    });
+
+    expect(() => signals.send('SIGTERM')).not.toThrow();
+    const childFile = path.join(await tempDir(), 'child.pid');
+    const run = detachedRun(`sleep 30 & echo $! > '${childFile}'; wait`);
+    const child = await pidIn(childFile);
+    expect(() => supervisor.attach(run)).not.toThrow();
+
+    const report = await supervisor.finish();
+    expect(report?.signal).toBe('SIGTERM');
+    expect(report?.groupState).toBe('empty');
+    expect(supervisor.stoppedBy).toBe('SIGTERM');
+    expect(reported).toEqual([ 'held', 'stopping' ]);
+    expect(await eventually(() => processGone(run.subprocess.pid) && processGone(child), 5_000)).toBe(true);
+    expect(signals.listening).toBe(0);
+  }, 20_000);
+
+  test('a reporter that always throws does not keep a second signal from escalating under a long grace', async () => {
+    const signals = new TestSignals();
+    const reported: SupervisorEvent['kind'][] = [];
+    const supervisor = superviseSignals({
+      graceMs: 60_000,
+      source: signals,
+      onEvent: event => {
+        reported.push(event.kind);
+        throw new Error('reporter failed');
+      },
+    });
+    const dir = await tempDir();
+    const readyFile = path.join(dir, 'ready');
+    const childFile = path.join(dir, 'child.pid');
+    // Neither ends on SIGTERM; only the escalation's SIGKILL ends them inside the grace.
+    const run = detachedRun(`trap '' TERM; sleep 30 & echo $! > '${childFile}'; echo ready > '${readyFile}'; wait`);
+    expect(await eventually(() => Bun.file(readyFile).exists(), 10_000)).toBe(true);
+    const child = await pidIn(childFile);
+    expect(() => supervisor.attach(run)).not.toThrow();
+
+    const startedAt = Date.now();
+    expect(() => signals.send('SIGTERM')).not.toThrow();
+    expect(() => signals.send('SIGINT')).not.toThrow();
+    const report = await supervisor.finish();
+
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
+    expect(report?.escalated).toBe(true);
+    expect(report?.groupState).toBe('empty');
+    expect(supervisor.stoppedBy).toBe('SIGTERM');
+    expect(reported).toEqual([ 'stopping', 'escalating' ]);
+    expect(await eventually(() => processGone(run.subprocess.pid) && processGone(child), 5_000)).toBe(true);
+    expect(signals.listening).toBe(0);
+  }, 20_000);
+
   test('a signal after the run ended on its own stops nothing and is not the run\'s outcome', async () => {
     const signals = new TestSignals();
     const events: SupervisorEvent[] = [];

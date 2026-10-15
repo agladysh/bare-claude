@@ -367,7 +367,13 @@ export interface SupervisorOptions {
   /** Which signals start a stop. Defaults to {@link stopSignals}, all three. */
   signals?: readonly StopSignal[],
 
-  /** Told of every {@link SupervisorEvent}, synchronously, as it happens. */
+  /**
+   * Told of every {@link SupervisorEvent}, synchronously, just before the
+   * effect it reports. Best-effort reporting, not proof of delivery: an
+   * exception it throws is ignored, so a failing reporter cannot keep a run
+   * from being stopped or a stop from escalating. Anything it starts
+   * asynchronously, a stream write's later error included, is its own.
+   */
   onEvent?: (event: SupervisorEvent) => void,
 
   /** Where signals come from. Defaults to this process. */
@@ -438,7 +444,14 @@ export function superviseSignals(options: SupervisorOptions): Supervisor {
   const supervised = signalsToSupervise(options.signals);
   const source = options.source ?? processSignals;
   const escalate = new AbortController();
-  const emit = (event: SupervisorEvent) => options.onEvent?.(event);
+  const emit = (event: SupervisorEvent) => {
+    try {
+      options.onEvent?.(event);
+    } catch {
+      // A reporter that fails must not keep a run from being stopped: every
+      // emit comes before the effect it reports.
+    }
+  };
 
   let run: StoppableRun | null = null;
   let requested: StopSignal | null = null;

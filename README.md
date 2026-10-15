@@ -879,7 +879,11 @@ try {
 `superviseSignals(options)` takes `graceMs`, and optionally `signals` (default all three),
 `onEvent` — told of each `SupervisorEvent`: `held`, `stopping` (with its `cause`, a signal or
 `'finish'`), `escalating`, `after-exit` — and `source`, where signals come from (default this
-process). It throws, before installing any handler, when `graceMs` is not a finite number from 0
+process). `onEvent` is called synchronously just before each effect and is best-effort: an
+exception it throws is ignored, so a failing reporter never keeps a run from being stopped or a
+stop from escalating, and a call is not proof that the report reached anyone. What it does
+asynchronously, such as a stream write that fails later, is its own to handle.
+`superviseSignals` throws, before installing any handler, when `graceMs` is not a finite number from 0
 up or `signals` is not a list of SIGHUP, SIGINT and SIGTERM; a signal named twice is listened for
 once. `stopClaude` refuses such a `graceMs` too, before signalling anything. The `Supervisor` it
 returns has:
