@@ -7,9 +7,68 @@
  * tests structurally cannot: a wrong exit code, a hang, output routed to the
  * wrong stream.
  */
+import { constants, copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+
+/**
+ * Which way a copy-on-write session seed goes on this host's temporary
+ * directory: `clone` when a forced clone of a small file succeeds there, else
+ * `refusal`. Every temporary directory the tests create is under
+ * `os.tmpdir()`, so this is the branch every seed test on this host takes.
+ *
+ * Decided by a probe, not by the platform: macOS does not imply APFS, and
+ * Linux implies no particular filesystem. A forced clone in Bun 1.3.13 either
+ * clones or fails — `clonefile()` on macOS, `ioctl_ficlone` on Linux, with no
+ * byte-copy fallback in either branch of `copyFileInner` — so a probe that
+ * succeeds is a clone. Tests name the branch in their titles, so a test log
+ * records which one ran. Set `BARE_CLAUDE_REQUIRE_CLONE=1` on a host known to
+ * clone, and the seed tests fail instead of taking the refusal branch.
+ */
+export const cloneBranch: 'clone' | 'refusal' = (() => {
+  if (process.platform !== 'darwin' && process.platform !== 'linux') {
+    return 'refusal';
+  }
+  const probe = mkdtempSync(path.join(os.tmpdir(), 'bare-claude-clone-probe-'));
+  try {
+    writeFileSync(path.join(probe, 'a'), 'probe');
+    copyFileSync(path.join(probe, 'a'), path.join(probe, 'b'), constants.COPYFILE_FICLONE_FORCE);
+    return 'clone';
+  } catch {
+    return 'refusal';
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+})();
+
+/** Whether this run must take the clone branch, by `BARE_CLAUDE_REQUIRE_CLONE=1`. */
+export const cloneRequired = process.env.BARE_CLAUDE_REQUIRE_CLONE === '1';
+
+/**
+ * Whether process `pid` no longer exists, probed with signal 0. A zombie
+ * still exists; callers poll until its parent reaps it.
+ */
+export function processGone(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return error instanceof Error && 'code' in error && error.code === 'ESRCH';
+  }
+}
+
+/** Polls `condition` every 25 ms until it holds or `ms` pass; returns whether it held. */
+export async function eventually(condition: () => boolean | Promise<boolean>, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await condition()) {
+      return true;
+    }
+    await Bun.sleep(25);
+  }
+  return condition();
+}
 
 /** Absolute path to the CLI entry point under test. */
 export const cliPath = path.join(import.meta.dir, '..', 'bin', 'bare-claude.ts');

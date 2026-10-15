@@ -29,6 +29,16 @@ import path from 'node:path';
  * between two checks: this is not a filesystem compare-and-swap.
  */
 
+/**
+ * A file a spawn published, by path and identity, so that taking it back can
+ * check it is still that file.
+ */
+export interface PublishedFile {
+  path: string,
+  dev: bigint,
+  ino: bigint,
+}
+
 /** A full lowercase SHA-256 hex digest, the only form `sourceSha256` takes. */
 export const sha256Pattern = /^[a-f0-9]{64}$/;
 
@@ -98,10 +108,12 @@ function refuseLinkedPath(filePath: string): void {
  * @param destination - Where the new journal goes; must not exist
  * @param expectedSha256 - Digest the source must have, when the caller
  *   recorded one
+ * @returns The published journal: its real path and its identity, taken from
+ *   the staged clone before it was linked into place
  * @throws When any of the above does not hold; nothing is left at
  *   `destination` then
  */
-export function cloneSessionSeed(sourcePath: string, destination: string, expectedSha256?: string): void {
+export function cloneSessionSeed(sourcePath: string, destination: string, expectedSha256?: string): PublishedFile {
   if (process.platform !== 'darwin' && process.platform !== 'linux') {
     throw new Error(
       `copy-on-write session seeds are unsupported on ${process.platform}; no byte copy is made`
@@ -174,6 +186,9 @@ export function cloneSessionSeed(sourcePath: string, destination: string, expect
       throw new Error(`session seed ${source} changed while it was cloned`);
     }
 
+    // The staging directory is private to this call, so the file there is
+    // the clone, and a hard link keeps its identity.
+    const published = lstatSync(staged, { bigint: true });
     try {
       linkSync(staged, target);
     } catch (error) {
@@ -182,6 +197,7 @@ export function cloneSessionSeed(sourcePath: string, destination: string, expect
       }
       throw error;
     }
+    return { path: target, dev: published.dev, ino: published.ino };
   } finally {
     closeSync(fd);
     if (staging !== null) {

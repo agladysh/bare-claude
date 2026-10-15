@@ -1,11 +1,12 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import type { AuthMode } from '@agladysh/bare-claude';
+import { buildEnv, LaunchConfig, type AuthMode } from '@agladysh/bare-claude';
 import {
-  configFileName, locateConfig, parseConfig, type ConfigSource
+  configFileName, loadConfig, locateConfig, parseConfig, type ConfigSource
 } from '@agladysh/bare-claude/config';
 import { commandName, commandSource, defaultBinDir, status } from '@agladysh/bare-claude/install';
+import { mergeInvocation, type DynamicPreset } from '@agladysh/bare-claude/preset';
 import {
   alternateCredentialsIn, formatMode, hasToken, inspectTokenFile, resolveTokenFile, tokenVariable
 } from '@agladysh/bare-claude/token';
@@ -55,40 +56,61 @@ export interface DoctorReport {
  * Options for {@link runDoctor}. Every input the checks read from the
  * outside world can be supplied, which is what makes the doctor testable
  * against a temporary home and a fake `claude` without touching the machine.
+ *
+ * The doctor checks the invocation a run with the same options would make:
+ * the configuration `config` selects, `overrides` on top of it and `use`
+ * folded in, exactly as the CLI merges them. The `claude` and `auth` items
+ * then look at that invocation's `claudePath`, `cwd`, `auth`, `tokenFile`,
+ * and at the environment its child would get — `env` filtered by
+ * `noProcessEnv`, plus its `extraEnv`.
  */
 export interface DoctorOptions {
-  /** Claude Code executable, as `--claude-path`. Defaults to `claude` on `PATH`. */
+  /**
+   * Claude Code executable, as `--claude-path`; wins over the invocation's.
+   * Defaults to the invocation's, else `claude` on `PATH`.
+   */
   claudePath?: string,
 
   /**
-   * Environment to inspect and to resolve executables in. Defaults to the
-   * process environment.
+   * The environment the doctor runs in, which a run would inherit unless it
+   * sets `noProcessEnv`. Defaults to the process environment.
    */
   env?: Record<string, string | undefined>,
 
-  /** Directory the configuration file is resolved from. Defaults to the process cwd. */
+  /**
+   * Directory the doctor runs in: where the configuration file is located
+   * from, and what a relative `cwd` in it is resolved against. Defaults to
+   * the process cwd.
+   */
   cwd?: string,
 
   /** Where the command is expected on `PATH`. Defaults to `~/.local/bin`. */
   binDir?: string,
 
   /**
-   * Token file to inspect, as `--token-file`. Defaults to
-   * `BARE_CLAUDE_TOKEN_FILE`, then the XDG config location.
+   * Token file to inspect, as `--token-file`; wins over the invocation's.
+   * Defaults to the invocation's, else `BARE_CLAUDE_TOKEN_FILE`, then the XDG
+   * config location.
    */
   tokenFile?: string,
 
   /**
-   * Who supplies the credential, as `--auth`. Under `'caller'` the auth item
-   * inspects nothing and says so. Defaults to `'fallback'`.
+   * Who supplies the credential, as `--auth`; wins over the invocation's.
+   * Under `'caller'` the auth item inspects nothing and says so.
    */
   auth?: AuthMode,
 
   /**
-   * Which configuration to validate, as `--config`/`--no-config`. Defaults to
+   * Which configuration to read, as `--config`/`--no-config`. Defaults to
    * the located `bare-claude.yaml`.
    */
   config?: ConfigSource,
+
+  /** The preset id `--use` names, replacing the configuration's root `use`. */
+  use?: string,
+
+  /** Fields the command line sets, merged over the configuration as a run merges them. */
+  overrides?: DynamicPreset,
 }
 
 /**
@@ -410,6 +432,37 @@ async function checkPreset(cwd: string, source: ConfigSource): Promise<DoctorIte
   }
 }
 
+/** An invocation resolved as a run would resolve it, or why it cannot be. */
+type ResolvedRun = { launch: LaunchConfig } | { launch: LaunchConfig, error: string };
+
+/**
+ * Resolves the invocation: configuration, overrides, `use`, then
+ * `LaunchConfig`, the same steps and refusals as a run. When that fails, the
+ * other checks still run against the overrides alone, so one bad key does not
+ * hide a missing `claude`.
+ */
+async function resolveRun(
+  source: ConfigSource,
+  cwd: string,
+  overrides: DynamicPreset,
+  use: string | undefined
+): Promise<ResolvedRun> {
+  try {
+    const merged = mergeInvocation(await loadConfig(source, cwd), overrides, use);
+    return { launch: LaunchConfig({ ...merged, callToAction: '' }) };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    let launch: LaunchConfig;
+    try {
+      const { use: _ignored, read: _read, ...fields } = overrides;
+      launch = LaunchConfig({ ...fields, callToAction: '' });
+    } catch {
+      launch = LaunchConfig({ callToAction: '' });
+    }
+    return { launch, error: message };
+  }
+}
+
 /**
  * Checks everything a `bare-claude` run relies on, without repairing any of
  * it and without spawning a model: the only subprocesses are `--version`
@@ -420,15 +473,55 @@ async function checkPreset(cwd: string, source: ConfigSource): Promise<DoctorIte
 export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorReport> {
   const env = options.env ?? process.env;
   const cwd = options.cwd ?? process.cwd();
-  const claudePath = options.claudePath ?? 'claude';
+  const source = options.config ?? { kind: 'located' };
+
+  const overrides: DynamicPreset = { ...options.overrides };
+  if (options.claudePath !== undefined) {
+    overrides.claudePath = options.claudePath;
+  }
+  if (options.tokenFile !== undefined) {
+    overrides.tokenFile = options.tokenFile;
+  }
+  if (options.auth !== undefined) {
+    overrides.auth = options.auth;
+  }
+
+  const run = await resolveRun(source, cwd, overrides, options.use);
+  const { launch } = run;
+
+  // The child's environment, as buildEnv would give it; CLAUDE_CONFIG_DIR is
+  // the run's temporary home, which does not exist yet and matters to neither
+  // check below.
+  const runEnv = buildEnv(launch, { ephemeralClaudeHomePath: '', processEnv: env });
+  delete runEnv.CLAUDE_CONFIG_DIR;
+  const runCwd = path.resolve(cwd, launch.cwd ?? cwd);
+
+  // With no PATH in the child's environment, which PATH the spawn would
+  // search was not established; this doctor's own is used, and says so.
+  const claudeEnv = runEnv.PATH === undefined ? { ...runEnv, PATH: env.PATH } : runEnv;
+  const claude = await checkClaude(launch.claudePath, claudeEnv, runCwd);
+  if (runEnv.PATH === undefined) {
+    claude.detail += ' (the run\'s environment sets no PATH; resolved with the doctor\'s)';
+  }
+
+  let preset = await checkPreset(cwd, source);
+  const outsideWorkingCopy = source.kind === 'located' && preset.status === 'warn';
+  if ('error' in run && preset.status !== 'fail' && !outsideWorkingCopy) {
+    preset = {
+      name: 'preset',
+      status: 'fail',
+      detail: 'the invocation does not resolve; a run with these options would be refused',
+      hint: run.error.split('\n').map(line => line.trim()).filter(line => line !== ''),
+    };
+  }
 
   const items: DoctorItem[] = [
     checkBun(),
-    await checkClaude(claudePath, env, cwd),
+    claude,
     await checkGit(env, cwd),
-    await checkAuth(env, options.tokenFile, options.auth ?? 'fallback'),
+    await checkAuth(runEnv, launch.tokenFile ?? undefined, launch.auth),
     await checkInstall(env, options.binDir),
-    await checkPreset(cwd, options.config ?? { kind: 'located' }),
+    preset,
   ];
 
   return { items, ok: items.every(item => item.status !== 'fail') };

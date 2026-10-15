@@ -1,4 +1,5 @@
-import fs from 'node:fs/promises';
+import { closeSync, fstatSync, ftruncateSync, openSync, writeSync, type BigIntStats } from 'node:fs';
+import fs, { type FileHandle } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -6,7 +7,7 @@ import { deepmerge } from 'deepmerge-ts';
 
 // Relative, not by package name: the module is not in package.json `exports`,
 // and a self-reference by name resolves through `exports` once installed.
-import { cloneSessionSeed } from './session-seed.ts';
+import { cloneSessionSeed, type PublishedFile } from './session-seed.ts';
 import {
   hasCredential, readTokenFile, resolveTokenFile, tokenVariable
 } from '@agladysh/bare-claude/token';
@@ -161,6 +162,24 @@ type SystemPromptOp = 'appendString' | 'setString' | 'appendFile' | 'setFile';
  */
 export type AuthMode = 'fallback' | 'caller';
 
+/** The two {@link AuthMode} values, for checking one that came from untyped code. */
+const authModes: readonly AuthMode[] = [ 'fallback', 'caller' ];
+
+/** Narrows a value from untyped code, a JavaScript caller's for one, to an {@link AuthMode}. */
+function isAuthMode(value: unknown): value is AuthMode {
+  return authModes.some(mode => mode === value);
+}
+
+/**
+ * What a session id may look like. It names the journal file
+ * (`<sessionId>.jsonl`) inside the Claude home, so a separator or a leading
+ * dot would place that file somewhere else: one leading letter or digit, then
+ * letters, digits, `.`, `_` or `-`, 128 characters at most. Claude Code's own
+ * ids are UUIDs, which match. Whether Claude Code accepts a non-UUID id for
+ * `--resume` is not checked here.
+ */
+export const sessionIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
 /**
  * A prior session continued from memory. `value` is written whole as the new
  * run's journal: the caller has already allocated those bytes, and this route
@@ -209,15 +228,18 @@ export interface LaunchOptions {
    * Claude home directory (`CLAUDE_CONFIG_DIR`) for the run, owned by the
    * caller: resolved to an absolute path, created when missing, and never
    * removed by this library, whether the run succeeds, fails or is
-   * interrupted. Its `settings.json` is rewritten on every spawn. If not
-   * provided, a temporary directory is created, and `dispose()` removes it.
+   * interrupted. Its `settings.json` is replaced on every spawn. Nothing here
+   * stops two runs sharing a home; keeping to one live run per home is the
+   * caller's. If not provided, a temporary directory is created, and
+   * `dispose()` removes it.
    */
   ephemeralClaudeHomePath?: string | null,
 
   /**
-   * A prior session to continue under its own session id. Either route
-   * refuses to replace a journal already at the destination, which can only
-   * happen in a caller-supplied home.
+   * A prior session to continue under its own session id, which must match
+   * {@link sessionIdPattern}. Either route refuses to replace a journal
+   * already at the destination, which can only happen in a caller-supplied
+   * home.
    */
   customSessionData?: null | SessionSeed,
 
@@ -453,11 +475,30 @@ export type LaunchConfig = Required<LaunchOptions>;
  * Converts LaunchOptions to a fully resolved LaunchConfig by applying defaults.
  * @param o - The launch options to convert
  * @returns A LaunchConfig with all fields resolved to non-optional values
- * @throws When `auth: 'caller'` is combined with a credential source of
- *   Bare Claude's own, `linkAuth: true` or a `tokenFile`
+ * @throws When `auth` is neither `'fallback'` nor `'caller'`; when
+ *   `auth: 'caller'` is combined with a credential source of Bare Claude's
+ *   own, `linkAuth: true` or a `tokenFile`; when a session seed's
+ *   `sessionId` does not match {@link sessionIdPattern}
  */
 export function LaunchConfig(o: LaunchOptions): LaunchConfig {
-  const auth = o.auth ?? 'fallback';
+  // Checked at run time because a JavaScript caller is not held to the type,
+  // and an unknown mode would otherwise turn every fallback off unannounced.
+  // Only an absent mode defaults: `??` would also let a null through.
+  const requested: unknown = o.auth === undefined ? 'fallback' : o.auth;
+  if (!isAuthMode(requested)) {
+    throw new Error(`auth must be "fallback" or "caller", got ${JSON.stringify(requested)}`);
+  }
+  const auth = requested;
+
+  const sessionId: unknown = o.customSessionData?.sessionId;
+  if (o.customSessionData !== undefined && o.customSessionData !== null
+    && (typeof sessionId !== 'string' || !sessionIdPattern.test(sessionId))) {
+    throw new Error(
+      `customSessionData.sessionId ${JSON.stringify(sessionId)} cannot name a journal file: `
+      + 'it must be a letter or digit followed by letters, digits, ".", "_" or "-", 128 characters at most'
+    );
+  }
+
   if (auth === 'caller') {
     if (o.linkAuth === true) {
       throw new Error('auth "caller" leaves authentication to the caller, so it cannot also take linkAuth');
@@ -848,12 +889,147 @@ interface ClaudeSubprocess<
   /** Path to the JSONL session file */
   sessionJsonlPath: string,
   /**
+   * The process group the spawned process leads — its own PID — when it was
+   * spawned with `spawnOptions.detached: true` on macOS or Linux; null
+   * otherwise. Pass the whole value to `stopClaude` from
+   * `@agladysh/bare-claude/lifecycle` to end the run and its descendants.
+   */
+  processGroup: number | null,
+  /**
    * Removes the ephemeral Claude home directory, but only when spawnClaude
    * created it: a caller-supplied `ephemeralClaudeHomePath` is left alone.
    * Idempotent. Without this every spawn leaks a temporary directory.
    */
   dispose: () => Promise<void>,
 };
+
+/** Narrows a thrown value to the errno `code` a Node system error carries. */
+function errorCode(error: unknown): string | null {
+  return error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : null;
+}
+
+/**
+ * Creates the journal for an in-memory seed, exclusively and mode 0600, and
+ * returns its identity. The identity is taken from the descriptor that
+ * created the file, before a byte is written, so a failed write can still be
+ * taken back.
+ */
+async function writeNewJournal(filePath: string, value: string): Promise<PublishedFile> {
+  let handle: FileHandle;
+  try {
+    handle = await fs.open(filePath, 'wx', 0o600);
+  } catch (error) {
+    if (errorCode(error) === 'EEXIST') {
+      throw new Error(`session journal ${filePath} already exists; a seed never overwrites one`);
+    }
+    throw error;
+  }
+  const stats = await handle.stat({ bigint: true });
+  const published: PublishedFile = { path: filePath, dev: stats.dev, ino: stats.ino };
+  try {
+    await handle.writeFile(value);
+  } catch (error) {
+    await handle.close();
+    await removeIfUnchanged(published);
+    throw error;
+  }
+  await handle.close();
+  return published;
+}
+
+/**
+ * Removes a file this call published, but only while the path still names
+ * that file. Resolves true when it is gone, false when something else is at
+ * the path now and was left alone. Between the check and the unlink there is
+ * a window no POSIX call closes; one live run per Claude home is what keeps
+ * anything from using it.
+ */
+async function removeIfUnchanged(file: PublishedFile): Promise<boolean> {
+  let now: BigIntStats;
+  try {
+    now = await fs.lstat(file.path, { bigint: true });
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') {
+      return true;
+    }
+    throw error;
+  }
+  if (!now.isFile() || now.dev !== file.dev || now.ino !== file.ino) {
+    return false;
+  }
+  await fs.unlink(file.path);
+  return true;
+}
+
+/**
+ * Replaces `filePath` with `text` atomically: written to a new private file
+ * in the same directory, mode 0600, then renamed over the old one. A reader
+ * sees the old file or the new one, never a partial write.
+ */
+async function replaceFile(filePath: string, text: string): Promise<void> {
+  const temporary = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${Bun.randomUUIDv7()}`);
+  try {
+    await fs.writeFile(temporary, text, { flag: 'wx', mode: 0o600 });
+    await fs.rename(temporary, filePath);
+  } catch (error) {
+    await fs.rm(temporary, { force: true });
+    throw error;
+  }
+}
+
+/** One line this call appended, and the means to take exactly that line back. */
+interface HistoryLine {
+  /** The file appended to. */
+  path: string,
+
+  /**
+   * Truncates the file back to its length before the append, but only when
+   * the append landed whole at the end and nothing was appended after it.
+   * Returns whether the line is gone.
+   */
+  retract(): boolean,
+
+  /** Releases the descriptor. Idempotent. */
+  close(): void,
+}
+
+/**
+ * Appends `line` to `filePath`, keeping the descriptor so the line can be
+ * retracted through the very file it went into, whatever has been renamed
+ * since. Never rewrites what was there before.
+ */
+function appendHistoryLine(filePath: string, line: string): HistoryLine {
+  const fd = openSync(filePath, 'a', 0o600);
+  let open = true;
+  const close = () => {
+    if (open) {
+      open = false;
+      closeSync(fd);
+    }
+  };
+  try {
+    const bytes = Buffer.from(line);
+    const before = fstatSync(fd, { bigint: true }).size;
+    const written = writeSync(fd, bytes);
+    const after = fstatSync(fd, { bigint: true }).size;
+    // Only a whole line, alone at the end, is provably ours to take back.
+    const whole = written === bytes.length && after === before + BigInt(bytes.length);
+    return {
+      path: filePath,
+      retract: () => {
+        if (!whole || !open || fstatSync(fd, { bigint: true }).size !== after) {
+          return false;
+        }
+        ftruncateSync(fd, Number(before));
+        return true;
+      },
+      close,
+    };
+  } catch (error) {
+    close();
+    throw error;
+  }
+}
 
 /**
  * Spawns a Claude subprocess with the given launch options.
@@ -871,17 +1047,28 @@ interface ClaudeSubprocess<
  *   absolute. The winner is also what the ephemeral project directory is
  *   keyed on, so the spawn cwd and the session transcript path can never
  *   disagree.
- *
- * Whatever fails before the child is spawned — a token file, a session seed,
- * the spawn itself — rejects, and removes the home only when this function
- * created it. Once spawned, the returned process's exit is the native
- * process's exit and nothing more: it does not say whether the task was done,
- * nor that anyone has read the result.
  * - `env` — layered, later wins: the inherited process environment (unless
  *   `noProcessEnv`, and always minus the parent-session markers), then
  *   `spawnOptions.env`, then `launchOptions.extraEnv`, then
  *   `CLAUDE_CONFIG_DIR`. The last is forced and not overridable: pointing the
  *   child at the ephemeral config dir is what makes the run bare.
+ *
+ * Before spawning, in this order: the project directory is created, the
+ * credential file linked (`linkAuth`), the token file read, the session seed
+ * published, `settings.json` replaced atomically (written to a private file
+ * beside it, mode 0600, then renamed over it), and, for a seeded run, one
+ * line appended to `history.jsonl`. If any of that or the spawn itself fails, the call
+ * rejects and takes back what it published: the journal, when the file at
+ * that path is still the one it wrote; the history line, when nothing was
+ * appended after it; and the whole home, when this call created it. A file
+ * that was replaced meanwhile is left, and the error says so.
+ *
+ * The spawned process is not supervised. Ending it, and anything it started,
+ * is the caller's: pass `detached: true` in `spawnOptions` to give it a
+ * process group of its own, and `stopClaude` from
+ * `@agladysh/bare-claude/lifecycle` to end that group. Its exit code is the
+ * spawned process's own and nothing more: it does not say whether the task
+ * was done, nor that anyone has read the result.
  * @template In - The type of writable stdin stream
  * @template Out - The type of readable stdout stream
  * @template Err - The type of readable stderr stream
@@ -927,6 +1114,11 @@ export async function spawnClaude<
 
   const projectHomePath = path.join(ephemeralClaudeHomePath, 'projects', pathToFilename(cwd));
   const sessionJsonlPath = path.join(projectHomePath, `${sessionId}.jsonl`)
+
+  // What this call has published so far, so a failure can take back exactly
+  // that and nothing else.
+  let journal: PublishedFile | null = null;
+  let history: HistoryLine | null = null;
 
   let subprocess: Bun.Subprocess<In, Out, Err>;
   try {
@@ -974,22 +1166,25 @@ export async function spawnClaude<
         if ('value' in seed) {
           throw new Error('customSessionData names both a value and a sourcePath; give one');
         }
-        cloneSessionSeed(seed.sourcePath, sessionJsonlPath, seed.sourceSha256);
+        journal = cloneSessionSeed(seed.sourcePath, sessionJsonlPath, seed.sourceSha256);
       } else {
-        try {
-          await fs.writeFile(sessionJsonlPath, seed.value, { flag: 'wx', mode: 0o600 });
-        } catch (error) {
-          if (error instanceof Error && 'code' in error && error.code === 'EEXIST') {
-            throw new Error(`session journal ${sessionJsonlPath} already exists; a seed never overwrites one`);
-          }
-          throw error;
-        }
+        journal = await writeNewJournal(sessionJsonlPath, seed.value);
       }
+    }
 
-      // After the journal, so a refused seed leaves no history behind, and
-      // appended, not written: a caller's home may already hold history
-      // Claude Code wrote for earlier sessions.
-      await fs.appendFile(path.join(ephemeralClaudeHomePath, 'history.jsonl'), `${JSON.stringify({
+    // Replaced, never rewritten in place: a run still using this home would
+    // otherwise read a half-written file, and Claude Code drops a settings
+    // file that fails validation whole and silently.
+    await replaceFile(
+      path.join(ephemeralClaudeHomePath, 'settings.json'),
+      `${JSON.stringify(settings, null, 2)}\n`
+    );
+
+    if (seed !== null) {
+      // Last before the spawn, so a refused seed or settings write leaves no
+      // history behind, and appended, not written: a caller's home may already
+      // hold history Claude Code wrote for earlier sessions.
+      history = appendHistoryLine(path.join(ephemeralClaudeHomePath, 'history.jsonl'), `${JSON.stringify({
         display: 'bare-claude',
         pastedContents: {},
         timestamp: Date.now(),
@@ -997,9 +1192,6 @@ export async function spawnClaude<
         sessionId: seed.sessionId,
       })}\n`);
     }
-
-    await Bun.file(path.join(ephemeralClaudeHomePath, 'settings.json'))
-      .write(`${JSON.stringify(settings, null, 2)}\n`);
 
     const o: Bun.Spawn.SpawnOptions<In, Out, Err> & { cmd: string[] } = {
       ...spawnOptions,
@@ -1009,13 +1201,29 @@ export async function spawnClaude<
     };
     subprocess = Bun.spawn(o);
   } catch (error) {
-    // Nothing was spawned, so nothing can need the home we made. A caller's
-    // home is theirs, whatever state this left it in.
+    // Nothing was spawned, so nothing can need what this call published.
+    const left: string[] = [];
+    if (history !== null && !history.retract()) {
+      left.push(`a line in ${history.path}, which was appended to after it`);
+    }
+    if (journal !== null && !await removeIfUnchanged(journal)) {
+      left.push(`${journal.path}, which is no longer the file this call wrote`);
+    }
+    // A caller's home is theirs, whatever state this left it in.
     if (ownsClaudeHome) {
       await fs.rm(ephemeralClaudeHomePath, { recursive: true, force: true });
     }
+    if (left.length > 0) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`${message}; left in place: ${left.join('; ')}`, { cause: error });
+    }
     throw error;
+  } finally {
+    history?.close();
   }
+
+  // setsid() makes the spawned process lead a group whose id is its PID.
+  const processGroup = spawnOptions.detached === true && process.platform !== 'win32' ? subprocess.pid : null;
 
   let disposed = false;
 
@@ -1025,6 +1233,7 @@ export async function spawnClaude<
     sessionId,
     projectHomePath,
     sessionJsonlPath,
+    processGroup,
     dispose: async () => {
       if (disposed || !ownsClaudeHome) {
         return;

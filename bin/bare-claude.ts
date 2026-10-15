@@ -21,11 +21,11 @@ import {
   authMode, effortLevel, loadConfig, type ConfigSource, type EffortLevel
 } from '@agladysh/bare-claude/config';
 import type { AuthMode } from '@agladysh/bare-claude';
-import { resolvePreset, type DynamicPreset, type Preset } from '@agladysh/bare-claude/preset';
+import { resolveInvocation, type DynamicPreset, type Preset } from '@agladysh/bare-claude/preset';
 import { formatDoctorReport, runDoctor } from '@agladysh/bare-claude/doctor';
+import { processGroupState, stopClaude, type StopReport } from '@agladysh/bare-claude/lifecycle';
 import { alternateCredentialVariables, tokenVariable } from '@agladysh/bare-claude/token';
 import { readUsage } from '@agladysh/bare-claude/usage';
-import { deepmerge } from 'deepmerge-ts';
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -66,6 +66,9 @@ function displayHelp() {
     '      --claude-home <dir>',
     '                         Claude home for the run, created if missing and kept',
     '                         whatever the outcome (default: a temporary directory)',
+    '      --stop-grace-ms <n>',
+    '                         After SIGTERM, SIGINT or SIGHUP, how long the run gets',
+    '                         before its process group is sent SIGKILL (default 10000)',
     '',
     '      --verbose          Print more events in the transcript',
     '      --debug            Print the resolved configuration and unrecognized events',
@@ -78,7 +81,10 @@ function displayHelp() {
     '',
     'The call to action is read from stdin when no positional one is given.',
     'Exits with the exit code of the `claude` subprocess, which says the process',
-    'ended, not that the task was done.',
+    'ended, not that the task was done; after a stop signal, with 128 plus its number.',
+    'SIGTERM, SIGINT and SIGHUP go to claude first; a second one sends SIGKILL at once.',
+    'SIGKILL to bare-claude itself cannot be forwarded: signal the process group it',
+    'reports instead.',
     '',
     'A bare run does not inherit the ambient login session: set CLAUDE_CODE_OAUTH_TOKEN',
     'from `claude setup-token`, or write the bare token to ~/.config/bare-claude/oauth',
@@ -215,6 +221,9 @@ async function loadPreset(): Promise<Startup> {
         type: 'string',
         multiple: true,
       },
+      'stop-grace-ms': {
+        type: 'string',
+      },
     },
     strict: true,
     allowPositionals: true,
@@ -261,24 +270,6 @@ async function loadPreset(): Promise<Startup> {
 
   const source = configSource(values.config, values['no-config']);
 
-  if (values.doctor) {
-    const report = await runDoctor({
-      claudePath: values['claude-path'],
-      tokenFile: values['token-file'],
-      auth: parseAuth(values.auth),
-      config: source,
-    });
-    process.stdout.write(formatDoctorReport(report));
-    return { kind: 'done', exitCode: report.ok ? 0 : 1 };
-  }
-
-  // No positional call to action: take it from stdin when piped into. Guarded
-  // on isTTY, or an interactive `bare-claude --use=x` would block on a
-  // terminal read instead of reporting the missing callToAction.
-  const callToAction = positionals.length > 0
-    ? positionals.join(' ')
-    : (process.stdin.isTTY ? undefined : (await Bun.stdin.text()).trim() || undefined);
-
   const fromCli: DynamicPreset = {};
   const set = <K extends keyof DynamicPreset>(key: K, value: DynamicPreset[K] | undefined) => {
     if (value !== undefined) {
@@ -286,7 +277,6 @@ async function loadPreset(): Promise<Startup> {
     }
   };
 
-  set('callToAction', callToAction);
   set('launcher', parseLauncher(values.launcher));
   set('claudePath', values['claude-path']);
   set('tokenFile', values['token-file']);
@@ -306,14 +296,24 @@ async function loadPreset(): Promise<Startup> {
   set('maxTokens', parseNumber('max-tokens', values['max-tokens']));
   set('maxOutputLength', parseNumber('max-output-length', values['max-output-length']));
   set('extraArgs', values['claude-arg']);
+  set('stopGraceMs', parseGrace(values['stop-grace-ms']));
 
-  const { configPreset, presets } = await loadConfig(source);
-  const preset = deepmerge(configPreset, fromCli);
-  if (values.use) {
-    preset.use = values.use; // The use field is not merged.
+  if (values.doctor) {
+    // The same configuration, overrides and `use` a run would merge, so the
+    // doctor checks the invocation a run would make, not the shell around it.
+    const report = await runDoctor({ config: source, use: values.use, overrides: fromCli });
+    process.stdout.write(formatDoctorReport(report));
+    return { kind: 'done', exitCode: report.ok ? 0 : 1 };
   }
 
-  return { kind: 'run', preset: resolvePreset(preset, presets) };
+  // No positional call to action: take it from stdin when piped into. Guarded
+  // on isTTY, or an interactive `bare-claude --use=x` would block on a
+  // terminal read instead of reporting the missing callToAction.
+  set('callToAction', positionals.length > 0
+    ? positionals.join(' ')
+    : (process.stdin.isTTY ? undefined : (await Bun.stdin.text()).trim() || undefined));
+
+  return { kind: 'run', preset: resolveInvocation(await loadConfig(source), fromCli, values.use) };
 }
 
 function isLauncher(value: string): value is Launcher {
@@ -367,6 +367,14 @@ function parseToolList(value: string | undefined): string[] | undefined {
   return value === '' ? [] : value.split(',');
 }
 
+function parseGrace(value: string | undefined): number | undefined {
+  const parsed = parseNumber('stop-grace-ms', value);
+  if (parsed !== undefined && (!Number.isSafeInteger(parsed) || parsed < 0)) {
+    throw new Error(`--stop-grace-ms expects a whole number of milliseconds, got "${value}"`);
+  }
+  return parsed;
+}
+
 function parseNumber(name: string, value: string | undefined): number | undefined {
   if (value === undefined) {
     return undefined;
@@ -384,9 +392,23 @@ const credentialVariables = new Set([ tokenVariable, ...alternateCredentialVaria
 /**
  * `JSON.stringify` replacer hiding the value of any credential variable, at
  * any depth: a caller may pass one through `extraEnv` or `extraSettings.env`.
+ * By name only — a secret under any other name is printed.
  */
 function redactCredentials(key: string, value: unknown): unknown {
   return credentialVariables.has(key) && typeof value === 'string' ? '<redacted>' : value;
+}
+
+/**
+ * The preset as `--debug` prints it: an in-memory session journal is a prior
+ * conversation, which may hold anything anyone typed or any file a tool read,
+ * so only its size is shown. The rest of the configuration is printed as is.
+ */
+function debugView(preset: Preset): Preset {
+  const seed = preset.customSessionData;
+  if (seed === undefined || seed === null || !('value' in seed)) {
+    return preset;
+  }
+  return { ...preset, customSessionData: { ...seed, value: `<${seed.value.length} characters, not printed>` } };
 }
 
 async function main() {
@@ -397,11 +419,12 @@ async function main() {
   const { preset } = startup;
 
   if (preset.debug) {
-    process.stdout.write(`Configuration:\n${JSON.stringify(preset, redactCredentials, 2)}\n`);
+    process.stdout.write(`Configuration:\n${JSON.stringify(debugView(preset), redactCredentials, 2)}\n`);
   }
 
-  // Resolved now for its refusals alone — contradictory auth options — so
-  // they land before a preload has run anybody's shell command.
+  // Resolved now for its refusals alone — an unknown or contradictory auth
+  // mode, a session id that cannot name a file — so they land before a
+  // preload has run anybody's shell command.
   LaunchConfig(preset);
 
   // The run's own directory: what spawnClaude will give the child, and so
@@ -465,7 +488,55 @@ async function main() {
 
   preset.permissionMode ??= 'acceptEdits';
 
-  const claude = await spawnClaude(preset, { stdout: preset.print ? 'inherit' : 'pipe' });
+  const graceMs = preset.stopGraceMs ?? defaultStopGraceMs;
+
+  // A signal that arrives while the child is being spawned is held, and acted
+  // on as soon as there is a child to stop.
+  const stop: { signal: StopSignal | null, report: Promise<StopReport> | null } = { signal: null, report: null };
+  const escalate = new AbortController();
+  const run: { claude: Awaited<ReturnType<typeof spawnClaude>> | null } = { claude: null };
+  const startStop = (signal: StopSignal) => {
+    if (run.claude !== null && stop.report === null) {
+      const { subprocess, processGroup } = run.claude;
+      process.stderr.write(
+        `bare-claude: received ${signal}; sent it to claude (pid ${subprocess.pid}), `
+        + `SIGKILL to ${processGroup === null ? 'it' : `process group ${processGroup}`} after ${graceMs} ms\n`
+      );
+      stop.report = stopClaude(run.claude, { signal, graceMs, escalate: escalate.signal });
+    }
+  };
+  const onSignal = (signal: StopSignal) => {
+    if (stop.signal === null) {
+      stop.signal = signal;
+      startStop(signal);
+    } else if (!escalate.signal.aborted) {
+      process.stderr.write(`bare-claude: received ${signal} again; sending SIGKILL now\n`);
+      escalate.abort();
+    }
+  };
+  const handlers = new Map<StopSignal, () => void>();
+  for (const signal of stopSignalNames) {
+    const handler = () => onSignal(signal);
+    handlers.set(signal, handler);
+    process.on(signal, handler);
+  }
+  const releaseSignals = () => {
+    for (const [ signal, handler ] of handlers) {
+      process.off(signal, handler);
+    }
+  };
+
+  // A process group of its own, so a stop reaches what the spawned process
+  // starts — a launcher's native child included — and a terminal's Ctrl-C
+  // reaches the run only through the forwarding above, in order.
+  const claude = await spawnClaude(preset, {
+    stdout: preset.print ? 'inherit' : 'pipe',
+    detached: process.platform !== 'win32',
+  }).catch((error: unknown) => {
+    releaseSignals();
+    throw error;
+  });
+  run.claude = claude;
 
   // An unread pipe eventually fills and blocks the child, so drain it even
   // when --print did not ask for it. What it says is the only diagnostic a
@@ -483,7 +554,23 @@ async function main() {
   // named is theirs and is always kept; dispose() would not touch it anyway,
   // but the report below should say where it is.
   const callerHome = typeof preset.ephemeralClaudeHomePath === 'string';
-  let keepHome = callerHome || preset.verbose || preset.debug;
+  const keepDeclared = callerHome || preset.verbose || preset.debug;
+  let keepHome = keepDeclared;
+
+  // Reported as soon as the child exists, not at the end only: a runner that
+  // has to kill this process outright still knows where the session journal
+  // is (the child creates it, so it may not exist yet) and which process
+  // group to end.
+  if (keepDeclared) {
+    process.stderr.write(`Claude session journal at ${claude.sessionJsonlPath}\n`);
+    process.stderr.write(claude.processGroup === null
+      ? `Claude process ${claude.subprocess.pid}\n`
+      : `Claude process group ${claude.processGroup}\n`);
+  }
+
+  if (stop.signal !== null) {
+    startStop(stop.signal);
+  }
 
   try {
     if (!preset.quiet) {
@@ -491,36 +578,118 @@ async function main() {
     }
 
     const exitCode = await claude.subprocess.exited;
+    if (stop.report !== null) {
+      await stop.report; // What the spawned process left in its group.
+    }
 
-    if (exitCode !== 0) {
+    if (exitCode !== 0 || stop.signal !== null) {
       keepHome = true;
 
       if (captured !== null) {
-        const tail = (await captured).trim();
+        // Bounded: a descendant that left the process group can hold the
+        // pipe open long after the child has gone.
+        const tail = (await within(captured, capturedWaitMs, '')).trim();
         if (tail !== '') {
           process.stderr.write(`${tail}\n`);
         }
       }
     }
 
-    return exitCode;
+    // The shell convention for a command ended by a signal, whatever the
+    // child's own exit was: a runner must not read a stopped run as a
+    // completed one.
+    return stop.signal === null ? exitCode : 128 + stopSignals[stop.signal];
   } finally {
-    // Never rm a live config directory out from under a running child.
-    if (claude.subprocess.exitCode === null) {
-      claude.subprocess.kill();
-      await claude.subprocess.exited;
+    // Never rm a live config directory out from under a running child: a
+    // failure above still ends the run in order before anything is removed.
+    if (stop.report === null && claude.subprocess.exitCode === null && claude.subprocess.signalCode === null) {
+      stop.report = stopClaude(claude, { signal: 'SIGTERM', graceMs, escalate: escalate.signal });
+    }
+    const report = stop.report === null ? null : await stop.report;
+    releaseSignals();
+
+    if (report !== null || keepHome) {
+      process.stderr.write(`Claude process ended: ${describeEnd(claude.subprocess)}\n`);
+    }
+    if (report !== null) {
+      process.stderr.write(`${describeStop(report)}\n`);
+    } else if (claude.processGroup !== null && processGroupState(claude.processGroup) === 'occupied') {
+      // Reported, not acted on: nobody asked for a stop, and what is left
+      // may be something the run deliberately started.
+      process.stderr.write(
+        `bare-claude: process group ${claude.processGroup} still has processes after claude exited; not signalled\n`
+      );
     }
 
     if (keepHome) {
       process.stderr.write(`Claude home kept at ${claude.ephemeralClaudeHomePath}\n`);
       // A fresh handle: the child created this file after any earlier check.
-      if (await Bun.file(claude.sessionJsonlPath).exists()) {
+      if (!keepDeclared && await Bun.file(claude.sessionJsonlPath).exists()) {
         process.stderr.write(`Claude session journal at ${claude.sessionJsonlPath}\n`);
       }
     } else {
       await claude.dispose();
     }
   }
+}
+
+/**
+ * Signals the CLI turns into an orderly stop of the run, with their POSIX
+ * numbers (the same on macOS and Linux), for the 128+n exit status.
+ */
+const stopSignals = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 } satisfies Record<string, number>;
+
+type StopSignal = keyof typeof stopSignals;
+
+const stopSignalNames: readonly StopSignal[] = [ 'SIGHUP', 'SIGINT', 'SIGTERM' ];
+
+/**
+ * How long a stopped run gets before SIGKILL, unless `--stop-grace-ms` says
+ * otherwise. Chosen, not measured: how long Claude Code takes to shut down
+ * on SIGTERM has not been observed.
+ */
+const defaultStopGraceMs = 10_000;
+
+/** How long to wait for the child's stdout to close once the child has exited. */
+const capturedWaitMs = 1_000;
+
+/** `promise`'s value, or `fallback` once `ms` have passed; no timer is left behind. */
+async function within<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>(resolve => {
+        timers.push(setTimeout(() => resolve(fallback), ms));
+      }),
+    ]);
+  } finally {
+    for (const timer of timers) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/** How the spawned process ended, as Bun reports it. */
+function describeEnd(subprocess: { exitCode: number | null, signalCode: NodeJS.Signals | null }): string {
+  if (subprocess.signalCode !== null) {
+    return `signal ${subprocess.signalCode}`;
+  }
+  return subprocess.exitCode === null ? 'not observed' : `exit code ${subprocess.exitCode}`;
+}
+
+/** One line saying how a stop went, and what it left. */
+function describeStop(report: StopReport): string {
+  const sent = report.escalated ? `${report.signal}, then SIGKILL` : report.signal;
+  if (report.processGroup === null) {
+    return `Claude stop: ${sent}; no process group, so descendants of the spawned process were not signalled`;
+  }
+  const left = {
+    'empty': 'empty',
+    'occupied': 'still occupied after SIGKILL',
+    'not-permitted': 'holds processes this user may not signal; left alone',
+  } satisfies Record<NonNullable<StopReport['groupState']>, string>;
+  return `Claude stop: ${sent}; process group ${report.processGroup} ${left[report.groupState ?? 'empty']}`;
 }
 
 /** Longest run of child stdout kept for a failure diagnostic. */

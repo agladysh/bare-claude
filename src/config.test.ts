@@ -4,7 +4,10 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { emptyConfig, loadConfig, locateConfig, parseConfig } from './config.ts';
+import { type } from 'arktype';
+
+import { emptyConfig, loadConfig, locateConfig, parseConfig, sessionIdSchema } from './config.ts';
+import { sessionIdPattern } from './index.ts';
 
 const repositoryConfig = path.join(import.meta.dir, '..', 'bare-claude.yaml');
 
@@ -28,7 +31,9 @@ describe('parseConfig', () => {
       await Bun.file(repositoryConfig).text(),
       repositoryConfig
     );
-    expect(configPreset.use).toBe('default');
+    // No root preset: every run from a checkout reads this file, and the
+    // LM Studio endpoint and credential must not apply to all of them.
+    expect(configPreset).toEqual({});
     expect(Object.keys(presets)).toContain('changelog');
   });
 
@@ -167,6 +172,25 @@ describe('parseConfig', () => {
       .toThrow('customSessionData');
     expect(() => parseConfig('customSessionData:\n  sessionId: s\n  sourcePath: /p\n  sha256: abc\n'))
       .toThrow('customSessionData');
+  });
+
+  test('rejects a session id that cannot name a journal file, by the same rule as LaunchConfig', () => {
+    const samples = [
+      '01900000-0000-7000-8000-000000000001', 's', 'seed_1.v2', 'x'.repeat(128),
+      '../escape', 'a/b', 'a\\b', '', '.', '..', '.hidden', '-flag', 'x'.repeat(129),
+    ];
+    for (const sample of samples) {
+      expect(`${sample}: ${!(sessionIdSchema(sample) instanceof type.errors)}`)
+        .toBe(`${sample}: ${sessionIdPattern.test(sample)}`);
+    }
+    expect(() => parseConfig('customSessionData:\n  sessionId: ../escape\n  value: "{}"\n'))
+      .toThrow('customSessionData');
+  });
+
+  test('takes a stop grace in whole milliseconds', () => {
+    expect(parseConfig('stopGraceMs: 500').configPreset.stopGraceMs).toBe(500);
+    expect(() => parseConfig('stopGraceMs: -1')).toThrow('stopGraceMs');
+    expect(() => parseConfig('stopGraceMs: 1.5')).toThrow('stopGraceMs');
   });
 
   test('accepts the two auth modes and nothing else', () => {

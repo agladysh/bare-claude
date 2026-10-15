@@ -43,6 +43,7 @@
     "./display": "./src/display.ts",
     "./doctor": "./src/doctor.ts",
     "./install": "./src/install.ts",
+    "./lifecycle": "./src/lifecycle.ts",
     "./preload": "./src/preload.ts",
     "./preset": "./src/preset.ts",
     "./usage": "./src/usage.ts",

@@ -1,18 +1,19 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 
 import { createHash } from 'node:crypto';
-import { constants, copyFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+import { cloneBranch, cloneRequired } from '../test/helpers.ts';
 import { cloneSessionSeed } from './session-seed.ts';
 
 /**
  * Every journal here is a few bytes in a fresh temporary directory. Whether
  * the filesystem under the temporary directory can clone at all differs by
- * host — APFS can, the ext4 under CI cannot — so each test that needs a clone
- * asks first, and on a host without one asserts the refusal instead. Either
+ * host, and is decided once by the probe in `test/helpers.ts`, not by the
+ * platform. The tests that need a clone take that branch, named in their
+ * titles; on a host that cannot clone they assert the refusal instead. Either
  * way the source must come out byte-identical and nothing may be left at the
  * destination unless a clone was actually published.
  */
@@ -36,22 +37,11 @@ afterEach(async () => {
 
 const sha256 = (bytes: Uint8Array | string): string => createHash('sha256').update(bytes).digest('hex');
 
-/** Whether `dir`'s filesystem accepts a forced copy-on-write clone. */
-async function canClone(dir: string): Promise<boolean> {
-  if (process.platform !== 'darwin' && process.platform !== 'linux') return false;
-  const probe = await fs.mkdtemp(path.join(dir, 'probe-'));
-  try {
-    await fs.writeFile(path.join(probe, 'a'), 'probe');
-    copyFileSync(path.join(probe, 'a'), path.join(probe, 'b'), constants.COPYFILE_FICLONE_FORCE);
-    return true;
-  } catch {
-    return false;
-  } finally {
-    await fs.rm(probe, { recursive: true, force: true });
-  }
-}
-
 describe('cloneSessionSeed', () => {
+  test.if(cloneRequired)('takes the clone branch where BARE_CLAUDE_REQUIRE_CLONE=1 says it must', () => {
+    expect(cloneBranch).toBe('clone');
+  });
+
   test('an unsupported platform refuses before creating a destination', async () => {
     const root = await tempDir();
     const source = path.join(root, 'prior');
@@ -72,14 +62,14 @@ describe('cloneSessionSeed', () => {
   });
 
   describe.if(process.platform === 'darwin' || process.platform === 'linux')('supported file-seed platforms', () => {
-    test('publishes a clone that appends independently of its source', async () => {
+    test(`publishes a clone that appends independently of its source [${cloneBranch} branch]`, async () => {
       const root = await tempDir();
       const source = path.join(root, 'prior.jsonl');
       const target = path.join(root, 'home', 'projects', 'p', 'next.jsonl');
       const prior = `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'before é' } })}\n`;
       await fs.writeFile(source, prior);
 
-      if (!await canClone(root)) {
+      if (cloneBranch === 'refusal') {
         expect(() => cloneSessionSeed(source, target, sha256(prior))).toThrow('no byte copy is made');
         expect(await Bun.file(target).exists()).toBe(false);
         expect(await fs.readdir(path.dirname(target))).toEqual([]);
@@ -87,7 +77,9 @@ describe('cloneSessionSeed', () => {
         return;
       }
 
-      cloneSessionSeed(source, target, sha256(prior));
+      const published = cloneSessionSeed(source, target, sha256(prior));
+      const stats = await fs.stat(target, { bigint: true });
+      expect([ published.dev, published.ino ]).toEqual([ stats.dev, stats.ino ]);
       await fs.appendFile(target, 'next\n');
       await fs.appendFile(source, 'prior again\n');
 
@@ -98,13 +90,13 @@ describe('cloneSessionSeed', () => {
       expect(await fs.readdir(path.dirname(target))).toEqual([ 'next.jsonl' ]);
     });
 
-    test('works without a recorded digest', async () => {
+    test(`works without a recorded digest [${cloneBranch} branch]`, async () => {
       const root = await tempDir();
       const source = path.join(root, 'prior');
       const target = path.join(root, 'next');
       await fs.writeFile(source, 'prior');
 
-      if (!await canClone(root)) {
+      if (cloneBranch === 'refusal') {
         expect(() => cloneSessionSeed(source, target)).toThrow('no byte copy is made');
         return;
       }
