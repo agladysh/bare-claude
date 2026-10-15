@@ -446,11 +446,51 @@ describe('runDoctor', () => {
       await fs.unlink(target);
       await Bun.file(target).write('#!/bin/sh\necho not ours\n');
 
+      // Not executable, so nothing named bare-claude resolves on PATH.
       const report = await runDoctor({ env, cwd });
       const install = item(report, 'install');
       expect(install.status).toBe('fail');
       expect(install.detail).toContain('not a symlink');
+      expect(install.detail).toEndWith(`and ${commandName} is not on PATH`);
       expect(install.hint.join('\n')).toContain('bun run install:user --force');
+    });
+
+    test('a foreign entry that PATH resolves, such as another install\'s link, warns rather than fails', async () => {
+      const { env, cwd, binDir } = await healthy();
+      const target = path.join(binDir, commandName);
+      await fs.unlink(target);
+      const elsewhere = await tempDir('elsewhere');
+      const other = path.join(elsewhere, commandName);
+      await Bun.file(other).write('#!/bin/sh\necho elsewhere\n');
+      await fs.chmod(other, 0o755);
+      await fs.symlink(other, target);
+
+      const report = await runDoctor({ env, cwd });
+      const install = item(report, 'install');
+      expect(install.status).toBe('warn');
+      expect(install.detail).toStartWith(`${target} is `);
+      // The link itself, or what it points to, whichever form PATH lookup reports.
+      expect([ target, other ].map(found => `PATH resolves ${commandName} to ${found}, not an install of this checkout`)
+        .some(ending => install.detail.endsWith(ending))).toBe(true);
+      expect(install.hint).toEqual([ `To install this checkout's instead: cd ${path.dirname(path.dirname(commandSource))} && bun run install:user --force   # replaces it` ]);
+      expect(report.ok).toBe(true);
+    });
+
+    test('a foreign entry PATH does not resolve, beside another bare-claude that it does, warns naming that one', async () => {
+      const { env, cwd, binDir } = await healthy();
+      const target = path.join(binDir, commandName);
+      await fs.unlink(target);
+      await Bun.file(target).write('#!/bin/sh\necho not ours\n'); // Not executable.
+      const elsewhere = await tempDir('elsewhere');
+      const other = path.join(elsewhere, commandName);
+      await Bun.file(other).write('#!/bin/sh\necho elsewhere\n');
+      await fs.chmod(other, 0o755);
+
+      const report = await runDoctor({ env: { ...env, PATH: pathOf(fakeClaudeDir, binDir, elsewhere, bunDir, gitDir) }, cwd });
+      const install = item(report, 'install');
+      expect(install.status).toBe('warn');
+      expect(install.detail).toContain('not a symlink');
+      expect(install.detail).toEndWith(`PATH resolves ${commandName} to ${other}, not an install of this checkout`);
     });
 
     test('accepts another bare-claude on PATH, such as a global package install', async () => {

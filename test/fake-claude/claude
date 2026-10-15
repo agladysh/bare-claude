@@ -8,11 +8,11 @@
  * resolves the literal `claude` in `buildArgv`'s command vector to this file
  * instead of the real binary. What it needs to fake:
  *
- * - `spawnClaude` creates `CLAUDE_CONFIG_DIR/projects/<cwd>/` before spawning
- *   (so a session-file watcher has something to watch), and passes the
- *   session id via `--session-id` (fresh run) or `--resume` (resumed run).
- *   This finds that one directory and writes `<sessionId>.jsonl` into it —
- *   a real run's session transcript, in miniature.
+ * - `spawnClaude` passes the session id via `--session-id` (fresh run) or
+ *   `--resume` (resumed run). This writes `<sessionId>.jsonl` under
+ *   `CLAUDE_CONFIG_DIR/projects/<key of its own physical cwd>/`, as the real
+ *   binary does — a real run's session transcript, in miniature — so a test
+ *   sees whether the path `spawnClaude` reported is the one written.
  * - `--print` is always the flag immediately before the call to action, and
  *   the call to action is always the last argv element (measured constraint
  *   in `buildArgv`), so `argv.at(-1)` recovers it without flag parsing.
@@ -96,16 +96,16 @@ if (configDir === undefined) {
 let sessionPath: string | null = null;
 
 if (process.env.FAKE_CLAUDE_WRITE_SESSION !== '0') {
-  const projectsDir = path.join(configDir, 'projects');
-  const projectDirs = await fs.readdir(projectsDir);
-  if (projectDirs.length !== 1) {
-    process.stderr.write(
-      `fake claude: expected exactly one project directory under ${projectsDir}, found ${projectDirs.length}\n`
-    );
-    process.exit(1);
-  }
+  // Keyed as Claude Code keys it, on the directory this process actually runs
+  // in: process.cwd() reads back the physical path whatever alias the spawn
+  // was given (observed of the real binary 2026-10-16, see physicalCwd in
+  // src/index.ts). The directory is made if missing, as the real one makes
+  // it, so a wrapper that keys elsewhere reports a journal that is not there.
+  // Short paths only: Claude Code's scheme for very long ones is not modelled.
+  const projectDir = path.join(configDir, 'projects', process.cwd().replace(/[^a-zA-Z0-9]/g, '-'));
+  await fs.mkdir(projectDir, { recursive: true });
 
-  sessionPath = path.join(projectsDir, projectDirs[0] ?? '', `${sessionId}.jsonl`);
+  sessionPath = path.join(projectDir, `${sessionId}.jsonl`);
 
   // A small, plausible transcript: the prompt echoed back, then a reply.
   // Real enough for TranscriptRenderer to recognize both records.

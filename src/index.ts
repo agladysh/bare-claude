@@ -219,8 +219,9 @@ export type SessionSeed = InMemorySessionSeed | FileSessionSeed;
  */
 export interface LaunchOptions {
   /**
-   * Working directory for the Claude process, resolved to an absolute path.
-   * Defaults to process.cwd().
+   * Working directory for the Claude process, resolved to an absolute,
+   * physical path (see {@link physicalCwd}); it must exist. Defaults to
+   * process.cwd().
    */
   cwd?: string | null,
 
@@ -904,6 +905,32 @@ interface ClaudeSubprocess<
   dispose: () => Promise<void>,
 };
 
+/**
+ * The directory a run happens in, as the child will see it: made absolute
+ * against this process's cwd, then with every symbolic link resolved.
+ *
+ * Observed 2026-10-16 in a native run on macOS (Claude Code 2.1.292): spawned
+ * in `/tmp/x`, an alias of `/private/tmp/x`, Claude Code wrote its journal
+ * under the project key of `/private/tmp/x` and recorded that as its cwd —
+ * the kernel's view, since a directory change follows links and the working
+ * directory reads back physical. Keyed on the alias, the journal path this
+ * library reported never existed. `spawnClaude` and the CLI's preloads both
+ * resolve through here, so the spawn, the project key, the synthetic records
+ * and the reported paths agree.
+ * @param cwd - Absolute, or relative to this process's cwd
+ * @returns The physical absolute path
+ * @throws When it does not exist or cannot be resolved
+ */
+export async function physicalCwd(cwd: string): Promise<string> {
+  const absolute = path.resolve(cwd);
+  try {
+    return await fs.realpath(absolute);
+  } catch (error) {
+    throw new Error(`cwd ${absolute} cannot be resolved (${errorCode(error) ?? 'unknown error'}); `
+      + 'a run needs an existing directory to work in');
+  }
+}
+
 /** Narrows a thrown value to the errno `code` a Node system error carries. */
 function errorCode(error: unknown): string | null {
   return error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : null;
@@ -1045,9 +1072,10 @@ function appendHistoryLine(filePath: string, line: string): HistoryLine {
  * function resolves rather than passes through:
  *
  * - `cwd` — `launchOptions.cwd ?? spawnOptions.cwd ?? process.cwd()`, made
- *   absolute. The winner is also what the ephemeral project directory is
- *   keyed on, so the spawn cwd and the session transcript path can never
- *   disagree.
+ *   absolute and physical by {@link physicalCwd}, before anything is created;
+ *   one that does not exist is refused. The winner is also what the
+ *   ephemeral project directory is keyed on, so the spawn cwd and the
+ *   session transcript path can never disagree.
  * - `env` — layered, later wins: the inherited process environment (unless
  *   `noProcessEnv`, and always minus the parent-session markers), then
  *   `spawnOptions.env`, then `launchOptions.extraEnv`, then
@@ -1090,9 +1118,11 @@ export async function spawnClaude<
 
   assertSafeCallToAction(c.callToAction); // Before any filesystem work, so a refusal leaves nothing behind.
 
-  // Absolute, because the winner keys the project directory and a relative
-  // path would key it differently from what the child sees as its cwd.
-  const cwd = path.resolve(c.cwd ?? spawnOptions.cwd ?? process.cwd());
+  // Physical, because the winner keys the project directory, and the child
+  // keys it on the directory it actually runs in: an alias or a relative path
+  // here would report a journal the child never writes. Resolved before any
+  // filesystem work, so a cwd that does not exist leaves nothing behind.
+  const cwd = await physicalCwd(c.cwd ?? spawnOptions.cwd ?? process.cwd());
   const sessionId = c.customSessionData?.sessionId ?? Bun.randomUUIDv7();
 
   // Built before the filesystem work below for the same reason

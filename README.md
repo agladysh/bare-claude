@@ -637,7 +637,13 @@ when its mode lets anyone but its owner read it and a failure when it is empty; 
 to do. It is a warning rather than a failure when `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`
 stands in. Never a value, from either source. Under `auth: caller` it inspects nothing and is a
 warning saying so: the caller's route is not this program's to check. `install` is whether
-`bare-claude` is on `PATH`, and whether it is this checkout's symlink. `preset` is the
+`bare-claude` is on `PATH`, and whether it is this checkout's symlink: any `bare-claude` on `PATH`
+satisfies it, so an entry in the bin directory that is not this checkout's is a warning naming
+what `PATH` resolves instead, and a failure only when nothing does. It says whether the command
+can be run from this environment, nothing about whether a given invocation is ready — a scrubbed
+environment with no `bare-claude` on its `PATH` fails it however ready its invocation is. A
+consumer judging an invocation reads the `claude`, `auth` and `preset` items from `runDoctor()`
+rather than the overall exit status. `preset` is the
 `bare-claude.yaml` a run from the current directory would load, validated — or the file `--config`
 names, which must exist; under `--no-config` there is nothing to load and it is `ok`. When the
 invocation would be refused — an unknown `--use`, `auth: caller` beside a `tokenFile`, a session
@@ -739,7 +745,10 @@ Optional:
   also written to `permissions.defaultMode`, and the two accept different sets. `'manual'` is valid
   for the flag only, and `'default'` and `'delegate'` for the setting only — using one of those
   would make Claude Code reject the whole settings file, silently, in `--print` mode.
-- `cwd`: Working directory for the Claude process, made absolute. Defaults to `process.cwd()`.
+- `cwd`: Working directory for the Claude process, made absolute and physical — every symbolic link
+  resolved — by `physicalCwd(cwd)` (exported), because Claude Code keys its journal on the
+  directory it actually runs in. It must exist; one that does not is refused before anything is
+  created. Defaults to `process.cwd()`.
 - `ephemeralClaudeHomePath`: Claude home directory (`CLAUDE_CONFIG_DIR`) owned by the caller: made
   absolute, created when missing, never removed by this library whatever the outcome. Its
   `settings.json` is replaced atomically on every spawn; one live run per home is the caller's to
@@ -933,8 +942,12 @@ All three are pure — no filesystem, no clock, no subprocess.
 
 #### Precedence
 
-`cwd` is `launchOptions.cwd ?? spawnOptions.cwd ?? process.cwd()`, made absolute, and the winner
-also determines the session transcript path, so the two can never disagree.
+`cwd` is `launchOptions.cwd ?? spawnOptions.cwd ?? process.cwd()`, made absolute and physical, and
+the winner also determines the session transcript path, so the two can never disagree. A relative
+one is resolved against the calling process's cwd first. Observed in a native run on macOS: given
+`/tmp/x`, an alias of `/private/tmp/x`, Claude Code wrote its journal under the project key of
+`/private/tmp/x`, so a path keyed on the alias would name a journal that never exists. The CLI
+resolves `--read` and `preload` against the same physical directory.
 
 Environment, later wins: inherited process environment (unless `noProcessEnv`, and always minus
 the parent session markers) → `spawnOptions.env` → `extraEnv` → `CLAUDE_CONFIG_DIR`. The last is

@@ -113,6 +113,10 @@ Verified against `claude` 2.1.220 on macOS. Re-verify, with a dated note, when t
   must use zeros, or they lie to the resumed run about its context size.
 - Real Read tool results are `1<tab>line` — 1-based, one tab, no padding. Real message ids are
   `msg_` plus 24 base62 characters, tool ids `toolu_` plus 24; neither ever contains `-` or `_`.
+- Claude Code keys `projects/<key>/` on the **physical** cwd. Observed 2026-10-16 on 2.1.292, one
+  macOS host: spawned in `/tmp/x` (an alias of `/private/tmp/x`), a fresh run wrote under
+  `-private-tmp-x` and recorded `/private/tmp/x` as its cwd. A resumed run is found by its id and
+  hides this. Anything keyed on a cwd must go through `physicalCwd()`.
 - `claude` exits 1 on auth failure. Anything this project builds must propagate that; a wrapper
   that returns 0 when the run failed is worse than no wrapper.
 
