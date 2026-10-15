@@ -57,6 +57,22 @@ export const permissionMode = type(
 /** A permission mode both the flag and the settings file accept. */
 export type PermissionMode = typeof permissionMode.infer;
 
+/** Who supplies the child's credential; see `AuthMode` in the main module. */
+export const authMode = type("'fallback' | 'caller'");
+
+/**
+ * A session to continue: in memory, or from a journal file. The two shapes
+ * share no key but `sessionId`, and each rejects the other's, so a seed that
+ * names both `value` and `sourcePath` is an error rather than a guess.
+ */
+const sessionSeed = type({ '+': 'reject', sessionId: 'string', value: 'string' })
+  .or({
+    '+': 'reject',
+    sessionId: 'string',
+    sourcePath: 'string',
+    'sourceSha256?': '/^[a-f0-9]{64}$/',
+  });
+
 /** Mirrors the `PreloadEntry` tagged union from `./preload.ts`. */
 const preloadEntry = type({ '+': 'reject', type: "'file'", path: 'string' })
   .or({ '+': 'reject', type: "'glob'", pattern: 'string' })
@@ -103,8 +119,9 @@ const preset = type({
   // Where it runs.
   'cwd?': 'string | null',
   'ephemeralClaudeHomePath?': 'string | null',
-  'customSessionData?': type({ '+': 'reject', sessionId: 'string', value: 'string' }).or('null'),
+  'customSessionData?': sessionSeed.or('null'),
   'addDirs?': 'string[]',
+  'auth?': authMode,
   'linkAuth?': 'boolean',
   'tokenFile?': 'string | null',
   'noProcessEnv?': 'boolean',
@@ -161,6 +178,10 @@ type _PresetHasEverySchemaField = AssertNoDrift<
   Exclude<keyof typeof preset.infer, keyof DynamicPreset>
 >;
 
+type _SchemaAcceptsEveryAuthMode = AssertNoDrift<
+  Exclude<NonNullable<DynamicPreset['auth']>, typeof authMode.infer>
+>;
+
 /**
  * A parsed and validated `bare-claude.yaml`.
  */
@@ -206,6 +227,60 @@ export async function locateConfig(cwd: string = process.cwd()): Promise<string 
     return null;
   }
   return path.join(stdout.trim(), configFileName);
+}
+
+/**
+ * Which configuration a run reads.
+ *
+ * - `located`: `bare-claude.yaml` at the root of the Git working copy, see
+ *   {@link locateConfig}. Optional: a missing file is the empty configuration.
+ * - `file`: the file at `path`, which must exist. No Git working copy is
+ *   needed.
+ * - `none`: no file at all, so nothing but the caller's own options and the
+ *   library defaults applies — in particular nothing from a repository's
+ *   example configuration.
+ */
+export type ConfigSource =
+  | { kind: 'located' }
+  | { kind: 'file', path: string }
+  | { kind: 'none' };
+
+/**
+ * Reads the configuration a {@link ConfigSource} selects.
+ * @param source - Which configuration to read
+ * @param cwd - Directory a `located` configuration is resolved from
+ * @returns The validated configuration
+ * @throws When a `located` configuration is asked for outside a Git working
+ *   copy, a named file does not exist, or the file is invalid
+ */
+export async function loadConfig(source: ConfigSource, cwd: string = process.cwd()): Promise<Config> {
+  switch (source.kind) {
+    case 'none':
+      return emptyConfig();
+
+    case 'file': {
+      const file = Bun.file(source.path);
+      if (!await file.exists()) {
+        throw new Error(`configuration file ${source.path} does not exist`);
+      }
+      return parseConfig(await file.text(), source.path);
+    }
+
+    case 'located': {
+      const configPath = await locateConfig(cwd);
+      if (configPath === null) {
+        throw new Error(
+          `${cwd} is not inside a Git working copy, which is where ${configFileName} is looked up; `
+          + 'name a file with --config, or read none with --no-config'
+        );
+      }
+      const file = Bun.file(configPath);
+      if (!await file.exists()) {
+        return emptyConfig();
+      }
+      return parseConfig(await file.text(), configPath);
+    }
+  }
 }
 
 /** A YAML mapping, the only shape a configuration file may have at its root. */

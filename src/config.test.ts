@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { emptyConfig, locateConfig, parseConfig } from './config.ts';
+import { emptyConfig, loadConfig, locateConfig, parseConfig } from './config.ts';
 
 const repositoryConfig = path.join(import.meta.dir, '..', 'bare-claude.yaml');
 
@@ -147,6 +147,35 @@ describe('parseConfig', () => {
     expect(parseConfig('maxBudgetUsd: 0.5\nmaxTokens: 2048\n').configPreset.maxTokens).toBe(2048);
   });
 
+  test('accepts either session seed, and a file seed with or without a digest', () => {
+    const digest = 'a'.repeat(64);
+    expect(parseConfig('customSessionData:\n  sessionId: s\n  value: "{}"\n').configPreset.customSessionData)
+      .toEqual({ sessionId: 's', value: '{}' });
+    expect(parseConfig('customSessionData:\n  sessionId: s\n  sourcePath: /p.jsonl\n').configPreset.customSessionData)
+      .toEqual({ sessionId: 's', sourcePath: '/p.jsonl' });
+    expect(parseConfig(`customSessionData:\n  sessionId: s\n  sourcePath: /p.jsonl\n  sourceSha256: ${digest}\n`)
+      .configPreset.customSessionData).toEqual({ sessionId: 's', sourcePath: '/p.jsonl', sourceSha256: digest });
+  });
+
+  test('rejects a session seed that is both, neither, or carries a malformed digest', () => {
+    expect(() => parseConfig('customSessionData:\n  sessionId: s\n  value: "{}"\n  sourcePath: /p.jsonl\n'))
+      .toThrow('customSessionData');
+    expect(() => parseConfig('customSessionData:\n  sessionId: s\n')).toThrow('customSessionData');
+    expect(() => parseConfig(`customSessionData:\n  sessionId: s\n  sourcePath: /p\n  sourceSha256: ${'A'.repeat(64)}\n`))
+      .toThrow('customSessionData');
+    expect(() => parseConfig('customSessionData:\n  sessionId: s\n  sourcePath: /p\n  sourceSha256: abc\n'))
+      .toThrow('customSessionData');
+    expect(() => parseConfig('customSessionData:\n  sessionId: s\n  sourcePath: /p\n  sha256: abc\n'))
+      .toThrow('customSessionData');
+  });
+
+  test('accepts the two auth modes and nothing else', () => {
+    expect(parseConfig('auth: caller').configPreset.auth).toBe('caller');
+    expect(parseConfig('auth: fallback').configPreset.auth).toBe('fallback');
+    expect(() => parseConfig('auth: none')).toThrow('auth must be');
+    expect(() => parseConfig('auth: false')).toThrow('auth must be');
+  });
+
   test('rejects a root that is not a mapping', () => {
     expect(() => parseConfig('- one\n- two\n')).toThrow('must be a mapping of preset fields');
     expect(() => parseConfig('just a string')).toThrow('got a string');
@@ -155,6 +184,37 @@ describe('parseConfig', () => {
   test('reports a YAML syntax error against the file, not as a crash', () => {
     expect(() => parseConfig('presets: [1, 2', 'broken.yaml'))
       .toThrow('broken.yaml is not valid YAML');
+  });
+});
+
+describe('loadConfig', () => {
+  test('none reads nothing, even beside an invalid located file', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'bare-claude-config-test-'));
+    try {
+      const init = Bun.spawn({ cmd: [ 'git', 'init', '-q' ], cwd: root, stdout: 'ignore', stderr: 'ignore' });
+      await init.exited;
+      await Bun.file(path.join(root, 'bare-claude.yaml')).write('quite: true\n');
+
+      expect(await loadConfig({ kind: 'none' }, root)).toEqual(emptyConfig());
+      await expect(loadConfig({ kind: 'located' }, root)).rejects.toThrow('quite must be removed');
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('a named file is read without a Git working copy, and must exist', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bare-claude-config-test-'));
+    try {
+      const file = path.join(dir, 'invocation.yaml');
+      await Bun.file(file).write('model: from-file\n');
+
+      expect((await loadConfig({ kind: 'file', path: file }, dir)).configPreset).toEqual({ model: 'from-file' });
+      await expect(loadConfig({ kind: 'file', path: path.join(dir, 'absent.yaml') }, dir))
+        .rejects.toThrow('does not exist');
+      await expect(loadConfig({ kind: 'located' }, dir)).rejects.toThrow('not inside a Git working copy');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

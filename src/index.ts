@@ -4,6 +4,9 @@ import path from 'node:path';
 
 import { deepmerge } from 'deepmerge-ts';
 
+// Relative, not by package name: the module is not in package.json `exports`,
+// and a self-reference by name resolves through `exports` once installed.
+import { cloneSessionSeed } from './session-seed.ts';
 import {
   hasCredential, readTokenFile, resolveTokenFile, tokenVariable
 } from '@agladysh/bare-claude/token';
@@ -142,25 +145,81 @@ export type Launcher = keyof Launchers;
  */
 type SystemPromptOp = 'appendString' | 'setString' | 'appendFile' | 'setFile';
 
+/**
+ * Who supplies the child's credential.
+ *
+ * - `'fallback'`: the caller's environment first; when it carries no
+ *   credential, Bare Claude falls back to its own sources — the token file
+ *   (see {@link LaunchOptions.tokenFile}) and, where `linkAuth` is on, the
+ *   credential file it links into the ephemeral home.
+ * - `'caller'`: the caller owns authentication. Bare Claude reads no token
+ *   file and links no credential file; the child authenticates with whatever
+ *   the environment the caller built carries, or however the executable
+ *   named by `claudePath` authenticates itself. A managed launcher that
+ *   brings its own credential needs this: under `'fallback'` a token file
+ *   would be put beside it whenever the environment lacks a credential.
+ */
+export type AuthMode = 'fallback' | 'caller';
+
+/**
+ * A prior session continued from memory. `value` is written whole as the new
+ * run's journal: the caller has already allocated those bytes, and this route
+ * spends them once more on disk.
+ */
+export interface InMemorySessionSeed {
+  /** Session id the run resumes (`--resume`). */
+  sessionId: string,
+
+  /** The journal, in Claude Code's JSONL format. */
+  value: string,
+}
+
+/**
+ * A prior session continued from a journal file the caller keeps. The new
+ * run's journal is a copy-on-write clone of it on the same filesystem; the
+ * source is never written, and there is no byte-copy fallback. See
+ * `src/session-seed.ts` for every refusal.
+ */
+export interface FileSessionSeed {
+  /** Session id the run resumes (`--resume`). */
+  sessionId: string,
+
+  /** The prior journal: a regular, single-link file, not a symbolic link. */
+  sourcePath: string,
+
+  /** Lowercase SHA-256 hex digest the source must still have, when recorded. */
+  sourceSha256?: string,
+}
+
+/** A prior session to continue: from memory, or from a journal file. */
+export type SessionSeed = InMemorySessionSeed | FileSessionSeed;
+
 // TODO: Support worktrees.
 /**
  * Options for launching a Claude subprocess.
  */
 export interface LaunchOptions {
   /**
-   * Working directory for the Claude process. Defaults to process.cwd().
+   * Working directory for the Claude process, resolved to an absolute path.
+   * Defaults to process.cwd().
    */
   cwd?: string | null,
 
   /**
-   * Path to ephemeral Claude home directory. If not provided, a temporary directory will be created.
+   * Claude home directory (`CLAUDE_CONFIG_DIR`) for the run, owned by the
+   * caller: resolved to an absolute path, created when missing, and never
+   * removed by this library, whether the run succeeds, fails or is
+   * interrupted. Its `settings.json` is rewritten on every spawn. If not
+   * provided, a temporary directory is created, and `dispose()` removes it.
    */
   ephemeralClaudeHomePath?: string | null,
 
   /**
-   * Custom session data to use for resuming a session.
+   * A prior session to continue under its own session id. Either route
+   * refuses to replace a journal already at the destination, which can only
+   * happen in a caller-supplied home.
    */
-  customSessionData?: null | { sessionId: string, value: string },
+  customSessionData?: null | SessionSeed,
 
   /**
    * Launcher to use for spawning Claude. Defaults to 'claude'.
@@ -268,19 +327,37 @@ export interface LaunchOptions {
   noMothership?: boolean,
 
   /**
-   * Whether to disable process environment inheritance. Defaults to false.
+   * Whether to drop the inherited process environment. Defaults to false.
+   * When false, everything is inherited except the parent-session markers,
+   * credentials included. When true, nothing is, credentials included:
+   * only `spawnOptions.env` and `extraEnv` reach the child. Neither setting
+   * governs the token file — under `auth: 'fallback'` it is still read when
+   * the resulting environment has no credential, from the default location
+   * under `os.homedir()` if `HOME` is absent. `auth: 'caller'` is what turns
+   * that off.
    */
   noProcessEnv?: boolean,
+
+  /**
+   * Who supplies the child's credential; see {@link AuthMode}. Defaults to
+   * `'fallback'`. `'caller'` cannot be combined with `linkAuth: true` or a
+   * `tokenFile`: each would name a credential source the caller just
+   * declared it owns.
+   */
+  auth?: AuthMode,
 
   /**
    * Whether to symlink the credential file from the real Claude config dir into
    * the ephemeral home, so a bare run keeps the subscription session. Only the
    * credential file is linked, never `.claude.json`, so the child cannot
    * clobber the real config, and a token refresh writes back through the link.
+   * The real config dir is this process's `CLAUDE_CONFIG_DIR`, else
+   * `~/.claude`.
    *
    * Platform note: this only helps where Claude Code keeps credentials in a
    * file. On macOS they live in the login keychain and there is nothing to
-   * link — use `CLAUDE_CODE_OAUTH_TOKEN` there. Defaults to true.
+   * link — use `CLAUDE_CODE_OAUTH_TOKEN` there. Defaults to true under
+   * `auth: 'fallback'` and false under `auth: 'caller'`.
    */
   linkAuth?: boolean,
 
@@ -289,10 +366,12 @@ export interface LaunchOptions {
    * child's `CLAUDE_CODE_OAUTH_TOKEN` at spawn time when the child's
    * environment carries neither that variable nor an alternate credential
    * (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`), and only for the `claude`
-   * launcher. Defaults to `BARE_CLAUDE_TOKEN_FILE` from the child's
-   * environment, then `$XDG_CONFIG_HOME/bare-claude/oauth`, then
-   * `~/.config/bare-claude/oauth`. A missing file is fine; an empty or
-   * unreadable one is an error. The value is never surfaced anywhere.
+   * launcher under `auth: 'fallback'`. Null (the default) resolves it:
+   * `BARE_CLAUDE_TOKEN_FILE` from the child's environment, then
+   * `$XDG_CONFIG_HOME/bare-claude/oauth`, then `~/.config/bare-claude/oauth`.
+   * Null does not disable the lookup; `auth: 'caller'` does. A missing file is
+   * fine; an empty or unreadable one is an error. The value is never surfaced
+   * anywhere.
    */
   tokenFile?: string | null,
 
@@ -374,8 +453,20 @@ export type LaunchConfig = Required<LaunchOptions>;
  * Converts LaunchOptions to a fully resolved LaunchConfig by applying defaults.
  * @param o - The launch options to convert
  * @returns A LaunchConfig with all fields resolved to non-optional values
+ * @throws When `auth: 'caller'` is combined with a credential source of
+ *   Bare Claude's own, `linkAuth: true` or a `tokenFile`
  */
 export function LaunchConfig(o: LaunchOptions): LaunchConfig {
+  const auth = o.auth ?? 'fallback';
+  if (auth === 'caller') {
+    if (o.linkAuth === true) {
+      throw new Error('auth "caller" leaves authentication to the caller, so it cannot also take linkAuth');
+    }
+    if (o.tokenFile !== undefined && o.tokenFile !== null && o.tokenFile !== '') {
+      throw new Error('auth "caller" leaves authentication to the caller, so it cannot also take a tokenFile');
+    }
+  }
+
   return {
     cwd: o.cwd ?? null,
     ephemeralClaudeHomePath: o.ephemeralClaudeHomePath ?? null,
@@ -402,7 +493,8 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
     // `launcher` means `claude`, and must behave like passing it.
     noMothership: o.noMothership ?? ((o.launcher ?? 'claude') !== 'claude'),
     noProcessEnv: o.noProcessEnv ?? false,
-    linkAuth: o.linkAuth ?? true,
+    auth,
+    linkAuth: o.linkAuth ?? auth === 'fallback',
     tokenFile: o.tokenFile ?? null,
     tools: o.tools ?? null,
     disallowedTools: o.disallowedTools ?? null,
@@ -747,7 +839,7 @@ interface ClaudeSubprocess<
 > {
   /** The spawned Bun subprocess */
   subprocess: Bun.Subprocess<In, Out, Err>,
-  /** Path to the ephemeral Claude home directory */
+  /** Absolute path to the Claude home directory, the caller's or a temporary one */
   ephemeralClaudeHomePath: string,
   /** Unique identifier for the Claude session */
   sessionId: string,
@@ -775,9 +867,16 @@ interface ClaudeSubprocess<
  * `spawnOptions` is forwarded to `Bun.spawn` except for two fields this
  * function resolves rather than passes through:
  *
- * - `cwd` — `launchOptions.cwd ?? spawnOptions.cwd ?? process.cwd()`. The
- *   winner is also what the ephemeral project directory is keyed on, so the
- *   spawn cwd and the session transcript path can never disagree.
+ * - `cwd` — `launchOptions.cwd ?? spawnOptions.cwd ?? process.cwd()`, made
+ *   absolute. The winner is also what the ephemeral project directory is
+ *   keyed on, so the spawn cwd and the session transcript path can never
+ *   disagree.
+ *
+ * Whatever fails before the child is spawned — a token file, a session seed,
+ * the spawn itself — rejects, and removes the home only when this function
+ * created it. Once spawned, the returned process's exit is the native
+ * process's exit and nothing more: it does not say whether the task was done,
+ * nor that anyone has read the result.
  * - `env` — layered, later wins: the inherited process environment (unless
  *   `noProcessEnv`, and always minus the parent-session markers), then
  *   `spawnOptions.env`, then `launchOptions.extraEnv`, then
@@ -802,7 +901,9 @@ export async function spawnClaude<
 
   assertSafeCallToAction(c.callToAction); // Before any filesystem work, so a refusal leaves nothing behind.
 
-  const cwd = c.cwd ?? spawnOptions.cwd ?? process.cwd();
+  // Absolute, because the winner keys the project directory and a relative
+  // path would key it differently from what the child sees as its cwd.
+  const cwd = path.resolve(c.cwd ?? spawnOptions.cwd ?? process.cwd());
   const sessionId = c.customSessionData?.sessionId ?? Bun.randomUUIDv7();
 
   // Built before the filesystem work below for the same reason
@@ -811,76 +912,116 @@ export async function spawnClaude<
   const cmd = buildArgv(c, sessionId);
   const settings = buildSettings(c);
 
-  // Assumes directory to be created if path is supplied.
-  const ownsClaudeHome = c.ephemeralClaudeHomePath === null;
-  const ephemeralClaudeHomePath = c.ephemeralClaudeHomePath ?? await fs.mkdtemp(
-    path.join(os.tmpdir(), 'bare-claude-home-')
-  );
-
-  // The ephemeral CLAUDE_CONFIG_DIR below leaves the child logged out. Symlink
-  // — not copy — the credential file from the real config dir so no secret is
-  // duplicated on disk and a refresh writes straight back through the link.
-  // Only the credential file, never .claude.json.
-  if (c.linkAuth && c.launcher === 'claude') {
-    const realConfigDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
-    for (const name of [ '.credentials.json', 'auth.json', 'credentials.json' ]) {
-      const source = path.join(realConfigDir, name);
-      if (await Bun.file(source).exists()) {
-        try {
-          await fs.symlink(source, path.join(ephemeralClaudeHomePath, name));
-        } catch { /* Already linked, or something is there; either way, leave it. */ }
-      }
-    }
+  // An empty path would resolve to the working directory and turn it into a
+  // Claude home.
+  if (c.ephemeralClaudeHomePath === '') {
+    throw new Error('ephemeralClaudeHomePath is empty; give a directory, or null for a temporary one');
   }
+
+  // A caller's home is resolved here because the child resolves a relative
+  // CLAUDE_CONFIG_DIR against its own cwd, not against ours.
+  const ownsClaudeHome = c.ephemeralClaudeHomePath === null;
+  const ephemeralClaudeHomePath = c.ephemeralClaudeHomePath === null
+    ? await fs.mkdtemp(path.join(os.tmpdir(), 'bare-claude-home-'))
+    : path.resolve(c.ephemeralClaudeHomePath);
 
   const projectHomePath = path.join(ephemeralClaudeHomePath, 'projects', pathToFilename(cwd));
   const sessionJsonlPath = path.join(projectHomePath, `${sessionId}.jsonl`)
 
-  const env = buildEnv(c, { ephemeralClaudeHomePath, spawnEnv: spawnOptions.env });
+  let subprocess: Bun.Subprocess<In, Out, Err>;
+  try {
+    // Creating unconditionally to simplify watch() logic. Must complete before
+    // the credential link and the session file below, and before the child
+    // is spawned.
+    await fs.mkdir(projectHomePath, { recursive: true, mode: 0o700 });
 
-  // The token file is the last resort and the last step: after buildEnv has
-  // had its say, so an explicit token in any layer wins, and only here, so
-  // the value exists in this process for exactly as long as the spawn takes
-  // and never reaches a preset, a --debug dump or a log. Not for the ollama
-  // launcher, and not beside an alternate credential: both mean the run is
-  // about to talk to something other than Anthropic.
-  if (c.launcher === 'claude' && !hasCredential(env)) {
-    const token = await readTokenFile(resolveTokenFile(c.tokenFile, env));
-    if (token !== null) {
-      env[tokenVariable] = token;
+    // The ephemeral CLAUDE_CONFIG_DIR below leaves the child logged out. Symlink
+    // — not copy — the credential file from the real config dir so no secret is
+    // duplicated on disk and a refresh writes straight back through the link.
+    // Only the credential file, never .claude.json.
+    if (c.linkAuth && c.launcher === 'claude') {
+      const realConfigDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
+      for (const name of [ '.credentials.json', 'auth.json', 'credentials.json' ]) {
+        const source = path.join(realConfigDir, name);
+        if (await Bun.file(source).exists()) {
+          try {
+            await fs.symlink(source, path.join(ephemeralClaudeHomePath, name));
+          } catch { /* Already linked, or something is there; either way, leave it. */ }
+        }
+      }
     }
+
+    const env = buildEnv(c, { ephemeralClaudeHomePath, spawnEnv: spawnOptions.env });
+
+    // The token file is the last resort and the last step: after buildEnv has
+    // had its say, so an explicit token in any layer wins, and only here, so
+    // the value exists in this process for exactly as long as the spawn takes
+    // and never reaches a preset, a --debug dump or a log. Not for the ollama
+    // launcher, and not beside an alternate credential: both mean the run is
+    // about to talk to something other than Anthropic. Not under auth
+    // 'caller' either: the caller has said where the credential comes from.
+    if (c.auth === 'fallback' && c.launcher === 'claude' && !hasCredential(env)) {
+      const token = await readTokenFile(resolveTokenFile(c.tokenFile, env));
+      if (token !== null) {
+        env[tokenVariable] = token;
+      }
+    }
+
+    const seed = c.customSessionData;
+    if (seed !== null) {
+      if ('sourcePath' in seed) {
+        // The types forbid both; a deep merge of two presets can produce it.
+        if ('value' in seed) {
+          throw new Error('customSessionData names both a value and a sourcePath; give one');
+        }
+        cloneSessionSeed(seed.sourcePath, sessionJsonlPath, seed.sourceSha256);
+      } else {
+        try {
+          await fs.writeFile(sessionJsonlPath, seed.value, { flag: 'wx', mode: 0o600 });
+        } catch (error) {
+          if (error instanceof Error && 'code' in error && error.code === 'EEXIST') {
+            throw new Error(`session journal ${sessionJsonlPath} already exists; a seed never overwrites one`);
+          }
+          throw error;
+        }
+      }
+
+      // After the journal, so a refused seed leaves no history behind, and
+      // appended, not written: a caller's home may already hold history
+      // Claude Code wrote for earlier sessions.
+      await fs.appendFile(path.join(ephemeralClaudeHomePath, 'history.jsonl'), `${JSON.stringify({
+        display: 'bare-claude',
+        pastedContents: {},
+        timestamp: Date.now(),
+        project: cwd,
+        sessionId: seed.sessionId,
+      })}\n`);
+    }
+
+    await Bun.file(path.join(ephemeralClaudeHomePath, 'settings.json'))
+      .write(`${JSON.stringify(settings, null, 2)}\n`);
+
+    const o: Bun.Spawn.SpawnOptions<In, Out, Err> & { cmd: string[] } = {
+      ...spawnOptions,
+      cwd,
+      cmd,
+      env,
+    };
+    subprocess = Bun.spawn(o);
+  } catch (error) {
+    // Nothing was spawned, so nothing can need the home we made. A caller's
+    // home is theirs, whatever state this left it in.
+    if (ownsClaudeHome) {
+      await fs.rm(ephemeralClaudeHomePath, { recursive: true, force: true });
+    }
+    throw error;
   }
-
-  const o: Bun.Spawn.SpawnOptions<In, Out, Err> & { cmd: string[] } = {
-    ...spawnOptions,
-    cwd,
-    cmd,
-    env,
-  };
-
-  // Creating unconditionally to simplify watch() logic. Must complete before
-  // the session file below is written and before the child is spawned.
-  await fs.mkdir(projectHomePath, { recursive: true });
-
-  if (c.customSessionData) {
-    await Bun.file(path.join(ephemeralClaudeHomePath, 'history.jsonl')).write(`${JSON.stringify({
-      display: 'bare-claude',
-      pastedContents: {},
-      timestamp: Date.now(),
-      project: path.resolve(cwd),
-      sessionId: c.customSessionData.sessionId,
-    })}\n`);
-    await Bun.file(sessionJsonlPath).write(c.customSessionData.value);
-  }
-
-  await Bun.file(path.join(ephemeralClaudeHomePath, 'settings.json'))
-    .write(`${JSON.stringify(settings, null, 2)}\n`);
 
   let disposed = false;
 
   return {
-    subprocess: Bun.spawn(o),
-    ephemeralClaudeHomePath: ephemeralClaudeHomePath,
+    subprocess,
+    ephemeralClaudeHomePath,
     sessionId,
     projectHomePath,
     sessionJsonlPath,

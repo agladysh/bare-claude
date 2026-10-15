@@ -57,6 +57,24 @@ await spawnClaude({
 Alternate providers authenticate through their own variables (`ANTHROPIC_AUTH_TOKEN` plus
 `ANTHROPIC_BASE_URL`, see the LM Studio example below) and are unaffected.
 
+### Caller-managed authentication
+
+Everything above is the default, `auth: fallback`: the run uses the credential its environment
+carries, and when there is none Bare Claude falls back to sources of its own — the token file, and
+the credential file `linkAuth` links. That fallback triggers on an *absence*, so it also fires
+where the absence is deliberate: a launcher named by `--claude-path` that brings its own
+credential, or an environment scrubbed with `noProcessEnv`, where the default token file is still
+found under `os.homedir()`.
+
+`--auth caller` (the `auth: 'caller'` launch option, `auth: caller` in a preset) hands
+authentication to the caller. No token file is read or even inspected, and no credential file is
+linked; the child gets exactly the environment the layers below produce, and the executable
+authenticates however it does. Combining it with `--token-file` or `linkAuth: true` is an error,
+not a precedence question. Nothing about the environment is inferred or stripped either way:
+whatever credential variables the caller passes reach the child as given, and a preset's
+`extraEnv` is one of the layers that can pass them — see `--no-config` below for keeping a
+repository's preset out of it.
+
 ## Disclaimer
 
 This open-source software uses officially documented features
@@ -115,10 +133,14 @@ bare-claude --use claude -- 'Explain this project'
 Options:
 
 - `-u, --use [presetId]`: use configuration preset `presetId`
+- `--config [file]`: read this configuration file instead of `bare-claude.yaml` at the Git root
+  (see [Choosing the configuration](#choosing-the-configuration))
+- `--no-config`: read no configuration file
 - `-l, --launcher [value]`: `claude` for native Anthropic modes (default), `ollama` for `ollama launch`
 - `-m, --model [model]`: model to be used
 - `--verbose`: print more events in transcript
-- `--debug`: print the resolved configuration, and render only events/blocks no rule recognizes
+- `--debug`: print the resolved configuration, credential values redacted, and render only
+  events/blocks no rule recognizes
 - `-q, --quiet`: do not print transcript at all
 - `-p, --print`: print Claude Code console output (what `claude --print` prints),
   use with `--quiet` when you need the last assistant message only
@@ -140,13 +162,18 @@ Options:
 - `--token-file [path]`: file holding the OAuth token, read when the environment has none
   (default: `$BARE_CLAUDE_TOKEN_FILE`, then `~/.config/bare-claude/oauth`; see
   [Authentication](#authentication))
+- `--auth [mode]`: `fallback` (default) or `caller` (see
+  [Caller-managed authentication](#caller-managed-authentication))
+- `--claude-home [dir]`: Claude home for the run, created if missing and kept whatever the outcome
+  (see [Keeping and continuing a run](#keeping-and-continuing-a-run))
 - `--claude-arg [arg]`: forward a flag to `claude` verbatim, may be included several times
 - `-v, --version`: print the version and exit
 - `-h, --help`: print this help and exit
 
 `--verbose` and `--debug` each also print the session transcript path to stdout and keep the
 ephemeral Claude home directory afterward instead of removing it, so a run worth inspecting isn't
-deleted out from under you.
+deleted out from under you. That home is still a temporary directory nobody owns; to keep a run's
+home where you decide, name it with `--claude-home`.
 
 The call to action is read from stdin when no positional one is given, so `bare-claude` composes
 in a pipeline.
@@ -158,6 +185,12 @@ command. When the run fails, whatever the subprocess wrote to stdout is echoed t
 where Claude Code reports conditions such as `Not logged in`. Not with `--print`, though: that flag
 inherits the child's stdout directly, so there is nothing left to capture, and the failure is
 already on your terminal.
+
+The exit code reports how the process ended, and nothing more. Exit 0 does not mean the task was
+done, and neither the exit code nor a kept session journal means anyone has read the result.
+
+A refusal made before `claude` is spawned — an invalid configuration, a contradictory option, a
+session seed that cannot be published — exits 1 with a one-line `bare-claude:` message on stderr.
 
 ### Configuration
 
@@ -173,6 +206,45 @@ Elaborate example: see [`bare-claude.yaml`](./bare-claude.yaml) in this reposito
 
 A configuration file data is a Preset (see below) with an optional extra `presets` field,
 containing record of named presets.
+
+#### Choosing the configuration
+
+By default the file is `bare-claude.yaml` at the root of the Git working copy the command runs in,
+so a run picks up whatever that repository's file says — this repository's own example, for one,
+points every run from its checkout at an LM Studio endpoint and credential. A caller that drives
+`bare-claude` from someone else's working copy, or from none, chooses instead:
+
+- `--config FILE` reads that file, which must exist, and no other. No Git working copy is needed.
+  Its named presets serve `--use`. This is how one invocation is declared whole: working
+  directory, Claude home, tools and read scope, auth mode and session seed in one validated file,
+  with nothing copied from a launcher script.
+- `--no-config` reads none: only the command line and the library defaults apply.
+
+The file is validated the same way whichever route selected it, before anything is spawned. The
+command line still wins over it, as below. Relative paths in it resolve against the directory
+`bare-claude` runs in — except `read` and `preload`, which resolve against the run's `cwd` — so
+a generated per-invocation file is clearest with absolute ones.
+
+```yaml
+# invocation.yaml, written for one run
+cwd: /work/checkout
+ephemeralClaudeHomePath: /work/runs/0042/claude-home
+auth: caller
+claudePath: /opt/launchers/claude
+tools: [Read, Grep, Glob]
+addDirs: [/work/reference]
+customSessionData:
+  sessionId: 0199e7a0-5b1c-7c2e-9d4f-3a6b8c0d1e2f
+  sourcePath: /work/runs/0041/claude-home/projects/-work-checkout/0199e7a0-5b1c-7c2e-9d4f-3a6b8c0d1e2f.jsonl
+  # sourceSha256: the 64 lowercase hex digits recorded when run 0041 ended
+```
+
+```bash
+env -i PATH="$PATH" HOME="$HOME" bare-claude --config invocation.yaml --quiet --print -- 'Continue'
+```
+
+`env -i` is the command line's way to scrub the environment the run inherits; `noProcessEnv`
+with `spawnOptions.env` is the library's.
 
 #### Preset
 
@@ -297,6 +369,38 @@ callToAction: Explain this project to me
 
 Note command-line `--use` overrode `use` field from the configuration file root Preset.
 
+## Keeping and continuing a run
+
+`--claude-home DIR` (`ephemeralClaudeHomePath`) gives a run a Claude home that belongs to the
+caller. It is created when missing and never removed by Bare Claude — not after success, not after
+failure, not when the run is interrupted. When the command ends it reports, on stderr:
+
+```
+Claude home kept at /work/runs/0042/claude-home
+Claude session journal at /work/runs/0042/claude-home/projects/-work-checkout/0199….jsonl
+```
+
+The second line appears only if the child wrote a journal. What the home holds is Claude Code's own
+record of the session; what the task produced, and whether anyone has received it, are not in it.
+
+To continue that session in a new run, seed the new run from the journal by path
+(`customSessionData` with `sessionId` and `sourcePath`, optionally `sourceSha256`) and give the new
+run a home of its own. The new journal is a copy-on-write clone of the old one, on the same
+filesystem, so a continuation costs no disk until it appends; the source is never written, and
+each side appends independently afterwards. It is refused, before `claude` is spawned and with
+nothing published, when:
+
+- the filesystem cannot clone, or the source and the new home are on different filesystems — there
+  is no byte-copy fallback;
+- the source is a symbolic link, or has a second hard link;
+- `sourceSha256` is given and the source no longer has that digest, or the source changes while it
+  is being read or cloned;
+- a journal for that session already exists in the new home;
+- `--read` or `preload` would have to extend it, which needs its bytes in memory.
+
+The in-memory route, `customSessionData` with `value`, remains for callers who mean to hold the
+journal as a string, and is what `--read` uses. It, too, refuses to replace an existing journal.
+
 ## Preloading Context
 
 `--read` preloads files. A preset can preload more than files, via typed descriptors that land as
@@ -392,9 +496,11 @@ its version. `git` is what locates the preset file and resolves `--read`. `auth`
 (`--token-file` applies) — by path, with a warning when its mode lets anyone but its owner read
 it and a failure when it is empty; failing both, what to do. It is a warning rather than a
 failure when `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` stands in. Never a value, from either
-source. `install` is whether `bare-claude` is on
+source. Under `--auth caller` it inspects nothing and is a warning saying so: the caller's route
+is not this program's to check. `install` is whether `bare-claude` is on
 `PATH`, and whether it is this checkout's symlink. `preset` is the `bare-claude.yaml` a run from
-the current directory would load, validated.
+the current directory would load, validated — or the file `--config` names, which must exist;
+under `--no-config` there is nothing to load and it is `ok`.
 
 Exits 1 when any item is `fail`. Nothing is repaired, and no model is spawned: the only
 subprocesses are `--version` probes and `git rev-parse`.
@@ -487,12 +593,21 @@ Optional:
   also written to `permissions.defaultMode`, and the two accept different sets. `'manual'` is valid
   for the flag only, and `'default'` and `'delegate'` for the setting only — using one of those
   would make Claude Code reject the whole settings file, silently, in `--print` mode.
-- `cwd`: Working directory for the Claude process. Defaults to `process.cwd()`.
-- `ephemeralClaudeHomePath`: Path to existing ephemeral Claude Code home directory.
-  If not provided, a temporary directory will be created.
-- `customSessionData`: Data to resume a previous session, optional.
-  Contains `{ sessionId: string, value: string }`.
-  The `value` is to be in Claude JSONL format.
+- `cwd`: Working directory for the Claude process, made absolute. Defaults to `process.cwd()`.
+- `ephemeralClaudeHomePath`: Claude home directory (`CLAUDE_CONFIG_DIR`) owned by the caller: made
+  absolute, created when missing, never removed by this library whatever the outcome. Its
+  `settings.json` is rewritten on every spawn. If not provided, a temporary directory is created,
+  and `dispose()` removes it. See [Keeping and continuing a run](#keeping-and-continuing-a-run).
+- `customSessionData`: A prior session to resume, optional. A `SessionSeed`, one of:
+  - `{ sessionId, value }` (`InMemorySessionSeed`): `value`, in Claude JSONL format, is written
+    whole as the new journal.
+  - `{ sessionId, sourcePath, sourceSha256? }` (`FileSessionSeed`): the new journal is a
+    copy-on-write clone of the file at `sourcePath`, which is never written. No byte-copy
+    fallback; see [Keeping and continuing a run](#keeping-and-continuing-a-run) for every
+    refusal.
+
+  Either way an existing journal for that session in the home is never replaced: the spawn
+  rejects instead.
 - `changeSystemPrompt`: Configuration for modifying the system prompt.
   Contains `{ type: 'appendString' | 'setString' | 'appendFile' | 'setFile', value: string }`.
 - `noInstructionFiles`: Whether to disable instruction files. Defaults to `true`.
@@ -521,18 +636,28 @@ Optional:
     cohorts). `extraSettings.env.CLAUDE_CODE_BASH_EDIT_DIFF` is merged last and wins either way.
 - `noMothership`: Whether to disable calling the mothership.
   Defaults to `false` if `launcher` is `claude` (including when it is left unset), and `true` otherwise.
-- `noProcessEnv`: Whether to disable process environment inheritance. Defaults to `false`.
-  The session markers Claude Code injects into its children (`CLAUDECODE`, `CLAUDE_CODE_*`,
-  `CLAUDE_PID`, `CLAUDE_EFFORT`) are always stripped, so a nested run does not adopt its parent's
-  session. Authentication variables are never stripped.
-- `linkAuth`: Whether to symlink the credential file from the real Claude config directory into the
-  ephemeral one. Only helps where Claude Code keeps credentials in a file — on macOS they live in
-  the login keychain, so use `CLAUDE_CODE_OAUTH_TOKEN` there. Defaults to `true`.
+- `noProcessEnv`: Whether to drop the inherited process environment. Defaults to `false`.
+  When `false`, everything is inherited except the session markers Claude Code injects into its
+  children (`CLAUDECODE`, `CLAUDE_CODE_*`, `CLAUDE_PID`, `CLAUDE_EFFORT`), which are always
+  stripped so a nested run does not adopt its parent's session; credential variables are
+  inherited like everything else. When `true`, nothing is inherited, credentials included: only
+  `spawnOptions.env` and `extraEnv` reach the child. Neither value turns off the token file — only
+  `auth: 'caller'` does.
+- `auth`: Who supplies the child's credential, an `AuthMode`: `'fallback'` or `'caller'`. Defaults to
+  `'fallback'`: the environment's credential, else the token file and `linkAuth`. `'caller'`
+  reads no token file and links nothing; it cannot be combined with `linkAuth: true` or a
+  `tokenFile`. See [Caller-managed authentication](#caller-managed-authentication).
+- `linkAuth`: Whether to symlink the credential file from the real Claude config directory (this
+  process's `CLAUDE_CONFIG_DIR`, else `~/.claude`) into the ephemeral one. Only helps where Claude
+  Code keeps credentials in a file — on macOS they live in the login keychain, so use
+  `CLAUDE_CODE_OAUTH_TOKEN` there. Defaults to `true` under `auth: 'fallback'`, `false` under
+  `auth: 'caller'`.
 - `tokenFile`: File holding the subscription token, read into the child's `CLAUDE_CODE_OAUTH_TOKEN`
   at spawn time when the child's environment carries neither that variable nor an alternate
-  credential, for the `claude` launcher only. Defaults to `BARE_CLAUDE_TOKEN_FILE` from the
-  child's environment, then `$XDG_CONFIG_HOME/bare-claude/oauth`, then
-  `~/.config/bare-claude/oauth`. See [Authentication](#authentication). Defaults to `null`.
+  credential, for the `claude` launcher under `auth: 'fallback'` only. `null`, the default, means
+  "resolve it", not "none": `BARE_CLAUDE_TOKEN_FILE` from the child's environment, then
+  `$XDG_CONFIG_HOME/bare-claude/oauth`, then `~/.config/bare-claude/oauth`. See
+  [Authentication](#authentication).
 - `tools`: Tools the run may use (`--tools`). `[]` allows none. Note `--allowedTools ''` does *not*
   achieve this: it fails open. Defaults to `null`.
 - `disallowedTools`: Tools the run may not use (`--disallowed-tools`). `['*']` denies all.
@@ -562,6 +687,11 @@ A promise that resolves to a `ClaudeSubprocess` object containing:
 - `dispose()`: Removes the ephemeral Claude home directory, but only when `spawnClaude` created it.
   Idempotent. Call it in a `finally`; without it every spawn leaks a temporary directory.
 
+`spawnClaude` rejects when anything fails before the child is spawned — a token file, a session
+seed, the spawn itself — and then removes the home only if it created it. Once spawned,
+`subprocess.exited` is the native process's exit code, nothing more: it does not say whether the
+task was done, nor that anyone has read the result.
+
 ```typescript
 const claude = await spawnClaude({ callToAction: 'Explain this project to me' });
 try {
@@ -585,8 +715,8 @@ All three are pure — no filesystem, no clock, no subprocess.
 
 #### Precedence
 
-`cwd` is `launchOptions.cwd ?? spawnOptions.cwd ?? process.cwd()`, and the winner also determines
-the session transcript path, so the two can never disagree.
+`cwd` is `launchOptions.cwd ?? spawnOptions.cwd ?? process.cwd()`, made absolute, and the winner
+also determines the session transcript path, so the two can never disagree.
 
 Environment, later wins: inherited process environment (unless `noProcessEnv`, and always minus
 the parent session markers) → `spawnOptions.env` → `extraEnv` → `CLAUDE_CONFIG_DIR`. The last is
@@ -633,6 +763,12 @@ exported too. See [Configuration](#configuration).
 the enclosing Git working copy, whether or not the file exists — or `null` outside one;
 `configFileName` is the name it appends. The CLI and `--doctor` both resolve through it.
 
+`loadConfig(source, cwd?)` reads the configuration a `ConfigSource` selects —
+`{ kind: 'located' }`, `{ kind: 'file', path }` or `{ kind: 'none' }`, the library side of the
+default, `--config` and `--no-config` — and validates it; see
+[Choosing the configuration](#choosing-the-configuration). `authMode` is the schema for the
+`auth` field, as `effortLevel` is for its own.
+
 `@agladysh/bare-claude/preset` exports `resolvePreset(preset, presets)`, which folds a
 `DynamicPreset`'s `use` chain and applies the CLI display defaults to produce a runnable `Preset`
 — the function behind the [preset resolution order](#preset-resolution-order) above.
@@ -653,9 +789,9 @@ file, throwing on an empty or unreadable one.
 From `@agladysh/bare-claude/doctor`. `runDoctor` returns a `DoctorReport`: `items`, each
 `{ name, status: 'ok' | 'warn' | 'fail', detail, hint }` in print order, and `ok`, false when any
 item failed. Every input is an option — `claudePath`, `env`, `cwd`, `binDir` — so it can be run
-against a machine assembled in a test, plus `tokenFile`. `formatDoctorReport` renders what
-`--doctor` prints. See
-[Doctor](#doctor).
+against a machine assembled in a test, plus `tokenFile`, `auth` and `config` (a `ConfigSource`),
+which `--doctor` takes from `--token-file`, `--auth` and `--config`/`--no-config`.
+`formatDoctorReport` renders what `--doctor` prints. See [Doctor](#doctor).
 
 ### install(binDir, options?), status(binDir), uninstall(binDir)
 
@@ -675,7 +811,8 @@ The current version of the Bare Claude makes the following assumptions:
 
 - Claude Code executable, `claude`, is installed and available in `PATH` (or pointed to via
   `claudePath`/`--claude-path`)
-- `bare-claude` is run inside a Git working copy
+- `bare-claude` is run inside a Git working copy, unless `--config` or `--no-config` says which
+  configuration to read and nothing is preloaded
 - `git` is installed and available in `PATH`
 
 `bare-claude --doctor` checks each of these.
