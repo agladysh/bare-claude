@@ -13,12 +13,11 @@
  */
 import { afterEach, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { constants, copyFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { cliPath, fakeClaudeDir, makeTempRepo, runCli } from './helpers.ts';
+import { cloneBranch, makeTempRepo, runCli } from './helpers.ts';
 
 const dirs: string[] = [];
 
@@ -81,21 +80,6 @@ async function argvProbe(): Promise<{ file: string, read: () => Promise<string[]
 /** The values following each occurrence of `flag` in `argv`. */
 function flagValues(argv: string[], flag: string): string[] {
   return argv.flatMap((arg, i) => arg === flag ? [ argv[i + 1] ?? '' ] : []);
-}
-
-/** Whether `dir`'s filesystem accepts a forced copy-on-write clone. */
-async function canClone(dir: string): Promise<boolean> {
-  if (process.platform !== 'darwin' && process.platform !== 'linux') return false;
-  const probe = await fs.mkdtemp(path.join(dir, 'probe-'));
-  try {
-    await fs.writeFile(path.join(probe, 'a'), 'probe');
-    copyFileSync(path.join(probe, 'a'), path.join(probe, 'b'), constants.COPYFILE_FICLONE_FORCE);
-    return true;
-  } catch {
-    return false;
-  } finally {
-    await fs.rm(probe, { recursive: true, force: true });
-  }
 }
 
 /** The `Claude session journal at` path the CLI reported, or null. */
@@ -293,55 +277,27 @@ describe('--claude-home', () => {
     }
   });
 
-  test('outlives an interrupted run', async () => {
+  test('is reported as soon as the child exists, before the run ends', async () => {
+    // A runner that has to kill the CLI outright has only what was printed
+    // before that: the journal path and the process group to end.
     const cwd = await repo();
     const home = path.join(await tempDir('home'), 'claude');
-    const cli = Bun.spawn({
-      cmd: [ 'bun', cliPath, '--no-config', '--claude-home', home, '--quiet', 'hello' ],
-      cwd,
-      env: {
-        ...process.env,
-        BARE_CLAUDE_TOKEN_FILE: path.join(cwd, 'no-token-file'),
-        FAKE_CLAUDE_SLEEP_MS: '1500',
-        PATH: `${fakeClaudeDir}:${process.env.PATH ?? ''}`,
-      },
-      stdin: 'ignore',
-      stdout: 'ignore',
-      stderr: 'ignore',
-    });
+    const result = await runCli([ '--no-config', '--claude-home', home, '--quiet', 'hello' ], { cwd });
 
-    // The run is under way once the child has written its transcript.
-    const projects = path.join(home, 'projects');
-    const journal = async (): Promise<string | null> => {
-      for (const project of await fs.readdir(projects).catch(() => [])) {
-        for (const name of await fs.readdir(path.join(projects, project))) {
-          if (name.endsWith('.jsonl')) {
-            return path.join(projects, project, name);
-          }
-        }
-      }
-      return null;
-    };
-    const deadline = Date.now() + 10_000;
-    while (await journal() === null && Date.now() < deadline) {
-      await Bun.sleep(25);
-    }
-    expect(await journal()).not.toBeNull();
-
-    cli.kill('SIGTERM');
-    await cli.exited;
-
-    expect(cli.exitCode === 0).toBe(false);
-    const kept = await journal();
-    expect(kept).not.toBeNull();
-    expect(await fs.readFile(kept ?? '', 'utf8')).toContain('"hello"');
-    // Let the orphaned fake finish its sleep before the directory goes.
-    await Bun.sleep(1600);
-  }, 20_000);
+    const lines = result.stderr.split('\n');
+    const journalLine = lines.findIndex(line => line.startsWith('Claude session journal at '));
+    const groupLine = lines.findIndex(line => /^Claude process (group )?\d+$/.test(line));
+    const endLine = lines.findIndex(line => line === 'Claude process ended: exit code 0');
+    const homeLine = lines.findIndex(line => line === `Claude home kept at ${home}`);
+    expect(journalLine).toBeGreaterThanOrEqual(0);
+    expect(groupLine).toBeGreaterThan(journalLine);
+    expect(endLine).toBeGreaterThan(groupLine);
+    expect(homeLine).toBeGreaterThan(endLine);
+  });
 });
 
 describe('a session continued from a journal file', () => {
-  test('resumes from an exact clone and never writes the source, or refuses outright', async () => {
+  test(`resumes from an exact clone and never writes the source, or refuses outright [${cloneBranch} branch]`, async () => {
     const cwd = await repo();
     const root = await tempDir('seed');
     const sessionId = '01900000-0000-7000-8000-00000000000a';
@@ -366,7 +322,7 @@ describe('a session continued from a journal file', () => {
 
     expect((await fs.readFile(source)).equals(prior)).toBe(true);
 
-    if (!await canClone(root)) {
+    if (cloneBranch === 'refusal') {
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toContain('no byte copy is made');
       expect(await argv.read()).toBeNull();
@@ -468,6 +424,21 @@ describe('--auth caller', () => {
     expect(result.stdout).not.toContain('sk-ant-oat01-from-config');
     expect(result.stdout).not.toContain('sk-ant-api-from-config');
     expect(result.stderr).not.toContain('sk-ant-');
+  });
+
+  test('--debug prints an in-memory session journal\'s size, not its content', async () => {
+    const cwd = await repo();
+    const value = `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'private words' } })}\n`;
+    const config = await configFile(
+      `customSessionData:\n  sessionId: s\n  value: ${JSON.stringify(value)}\n`
+    );
+    const home = path.join(await tempDir('home'), 'claude');
+
+    const result = await runCli([ '--config', config, '--claude-home', home, '--debug', 'hello' ], { cwd });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain(`"value": "<${value.length} characters, not printed>"`);
+    expect(result.stdout).not.toContain('private words');
   });
 
   test('is refused beside --token-file', async () => {

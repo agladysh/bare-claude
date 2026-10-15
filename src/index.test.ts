@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
 
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+import { cloneBranch } from '../test/helpers.ts';
 import {
   assertSafeCallToAction,
   buildArgv,
@@ -121,6 +122,25 @@ describe('LaunchConfig', () => {
     // Unset, in each of the ways the token file resolution treats as unset.
     expect(cfg({ auth: 'caller', tokenFile: null }).tokenFile).toBeNull();
     expect(cfg({ auth: 'caller', tokenFile: '' }).auth).toBe('caller');
+  });
+
+  test('refuses an auth mode that is neither, as a JavaScript caller could pass', () => {
+    // An unknown mode used to switch every fallback off without a word.
+    for (const auth of [ 'none', 'Fallback', '', 0, null ]) {
+      const options: LaunchOptions = { callToAction: '# do it' };
+      Object.assign(options, { auth });
+      expect(() => LaunchConfig(options)).toThrow('auth must be "fallback" or "caller"');
+    }
+  });
+
+  test('refuses a session id that cannot name a journal file, and takes one that can', () => {
+    for (const sessionId of [ '../escape', 'a/b', 'a\\b', '', '.', '..', '.hidden', '-flag', 'x'.repeat(129) ]) {
+      expect(() => cfg({ customSessionData: { sessionId, value: '' } })).toThrow('cannot name a journal file');
+      expect(() => cfg({ customSessionData: { sessionId, sourcePath: '/p' } })).toThrow('cannot name a journal file');
+    }
+    for (const sessionId of [ '01900000-0000-7000-8000-000000000001', 'seed_1.v2', 'x'.repeat(128) ]) {
+      expect(cfg({ customSessionData: { sessionId, value: '' } }).customSessionData?.sessionId).toBe(sessionId);
+    }
   });
 
   test('keeps falsy values a caller passed explicitly', () => {
@@ -770,12 +790,22 @@ describe('spawnClaude and the token file', () => {
     }
   });
 
-  async function probeScript(): Promise<string> {
-    const script = path.join(await tempDir('probe'), 'claude');
-    await fs.writeFile(script, '#!/bin/sh\nprintf \'%s\' "${CLAUDE_CODE_OAUTH_TOKEN-<unset>}"\n', { mode: 0o755 });
-    await fs.chmod(script, 0o755);
-    return script;
-  }
+  // One script for every run here, not one per run: in the 2026-10-15 suite
+  // each run of a freshly written script took 0.1-1.4 s, against 20-50 ms for
+  // the checked-in fake below, enough to time out a test making three runs.
+  let probeDir = '';
+  let probe = '';
+
+  beforeAll(async () => {
+    probeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bare-claude-spawn-token-probe-'));
+    probe = path.join(probeDir, 'claude');
+    await fs.writeFile(probe, '#!/bin/sh\nprintf \'%s\' "${CLAUDE_CODE_OAUTH_TOKEN-<unset>}"\n', { mode: 0o755 });
+    await fs.chmod(probe, 0o755);
+  });
+
+  afterAll(async () => {
+    await fs.rm(probeDir, { recursive: true, force: true });
+  });
 
   /** A HOME whose default token file holds `content`, or none when null. */
   async function homeWith(content: string | null): Promise<string> {
@@ -791,7 +821,7 @@ describe('spawnClaude and the token file', () => {
   async function tokenSeenBy(options: Partial<LaunchOptions>): Promise<string> {
     const claude = await spawnClaude({
       callToAction: '# probe',
-      claudePath: await probeScript(),
+      claudePath: probe,
       noProcessEnv: true,
       linkAuth: false,
       ...options,
@@ -925,20 +955,6 @@ describe('spawnClaude and a caller\'s Claude home', () => {
     return { claude, exitCode };
   }
 
-  /** Whether `dir`'s filesystem accepts a forced copy-on-write clone. */
-  async function canClone(dir: string): Promise<boolean> {
-    const probe = await fs.mkdtemp(path.join(dir, 'probe-'));
-    try {
-      await fs.writeFile(path.join(probe, 'a'), 'probe');
-      await fs.copyFile(path.join(probe, 'a'), path.join(probe, 'b'), fs.constants.COPYFILE_FICLONE_FORCE);
-      return true;
-    } catch {
-      return false;
-    } finally {
-      await fs.rm(probe, { recursive: true, force: true });
-    }
-  }
-
   test('a missing home is created, and dispose() leaves it, after success and failure alike', async () => {
     const root = await tempDir('root');
     for (const exitCode of [ '0', '3' ]) {
@@ -998,7 +1014,76 @@ describe('spawnClaude and a caller\'s Claude home', () => {
     expect(leaked).toEqual([]);
   });
 
-  test('a file seed resumes from an exact clone, and the source outlives the new appends', async () => {
+  test('a spawn that fails after publishing takes back its journal and history line, so a retry works', async () => {
+    // The counterexample: a claudePath that does not exist. The seed and the
+    // history line are published before Bun.spawn throws; left in place, the
+    // same invocation would be refused as "already exists" from then on.
+    const root = await tempDir('root');
+    const home = path.join(root, 'home');
+    await fs.mkdir(home);
+    const history = path.join(home, 'history.jsonl');
+    await fs.writeFile(history, '{"earlier":true}\n');
+    const seed = { sessionId: '01900000-0000-7000-8000-000000000004', value: '{"type":"user"}\n' };
+
+    await expect(run({
+      cwd: root, ephemeralClaudeHomePath: home, customSessionData: seed, claudePath: path.join(root, 'no-such-claude'),
+    })).rejects.toThrow();
+
+    expect(await fs.readFile(history, 'utf8')).toBe('{"earlier":true}\n');
+    const projects = path.join(home, 'projects');
+    for (const project of await fs.readdir(projects)) {
+      expect(await fs.readdir(path.join(projects, project))).toEqual([]);
+    }
+
+    const retried = await run({ cwd: root, ephemeralClaudeHomePath: home, customSessionData: seed });
+    expect(retried.exitCode).toBe(0);
+    expect((await fs.readFile(retried.claude.sessionJsonlPath, 'utf8')).startsWith(seed.value)).toBe(true);
+    expect((await fs.readFile(history, 'utf8')).trimEnd().split('\n')).toHaveLength(2);
+  });
+
+  test('settings.json is replaced whole, mode 0600, leaving no temporary file beside it', async () => {
+    // It can carry a caller's extraSettings.env, and a run still reading the
+    // home must never see half of it.
+    const root = await tempDir('root');
+    const home = path.join(root, 'home');
+    for (const value of [ 'first', 'second' ]) {
+      const result = await run({ cwd: root, ephemeralClaudeHomePath: home, extraSettings: { env: { MARK: value } } });
+      expect(result.exitCode).toBe(0);
+    }
+    const settings = path.join(home, 'settings.json');
+    expect((await fs.stat(settings)).mode & 0o777).toBe(0o600);
+    expect(await Bun.file(settings).text()).toContain('"MARK": "second"');
+    expect((await fs.readdir(home)).filter(name => name.startsWith('.settings.json.'))).toEqual([]);
+  });
+
+  test('a session id that cannot name a journal file is refused before anything is created', async () => {
+    const root = await tempDir('root');
+    const home = path.join(root, 'home');
+    for (const sessionId of [ '../escape', 'a/b', '', '.hidden', 'x'.repeat(129) ]) {
+      await expect(run({ cwd: root, ephemeralClaudeHomePath: home, customSessionData: { sessionId, value: '' } }))
+        .rejects.toThrow('cannot name a journal file');
+    }
+    expect(await fs.readdir(root)).toEqual([]);
+  });
+
+  test('processGroup is the spawned PID only when spawned detached', async () => {
+    const root = await tempDir('root');
+    const plain = await spawnClaude({
+      callToAction: '# probe', claudePath: fakeClaude, noProcessEnv: true, auth: 'caller', cwd: root,
+    }, { env: { PATH: path.dirname(process.execPath) }, stdout: 'ignore', stderr: 'ignore' });
+    await plain.subprocess.exited;
+    await plain.dispose();
+    expect(plain.processGroup).toBeNull();
+
+    const detached = await spawnClaude({
+      callToAction: '# probe', claudePath: fakeClaude, noProcessEnv: true, auth: 'caller', cwd: root,
+    }, { env: { PATH: path.dirname(process.execPath) }, stdout: 'ignore', stderr: 'ignore', detached: true });
+    await detached.subprocess.exited;
+    await detached.dispose();
+    expect(detached.processGroup).toBe(process.platform === 'win32' ? null : detached.subprocess.pid);
+  });
+
+  test(`a file seed resumes from an exact clone, and the source outlives the new appends [${cloneBranch} branch]`, async () => {
     const root = await tempDir('root');
     const sessionId = '01900000-0000-7000-8000-000000000003';
     const source = path.join(root, 'prior', `${sessionId}.jsonl`);
@@ -1011,7 +1096,7 @@ describe('spawnClaude and a caller\'s Claude home', () => {
       cwd: root, ephemeralClaudeHomePath: home, customSessionData: { sessionId, sourcePath: source, sourceSha256 },
     };
 
-    if (!await canClone(root)) {
+    if (cloneBranch === 'refusal') {
       await expect(run(options)).rejects.toThrow('no byte copy is made');
       expect((await fs.readFile(source)).equals(prior)).toBe(true);
       const projects = path.join(home, 'projects');

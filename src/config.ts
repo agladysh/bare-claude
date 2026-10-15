@@ -61,14 +61,21 @@ export type PermissionMode = typeof permissionMode.infer;
 export const authMode = type("'fallback' | 'caller'");
 
 /**
+ * A session id that can name a journal file. The same expression as
+ * `sessionIdPattern` in the main module, which `LaunchConfig` enforces; a
+ * test holds the two together.
+ */
+export const sessionIdSchema = type('/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/');
+
+/**
  * A session to continue: in memory, or from a journal file. The two shapes
  * share no key but `sessionId`, and each rejects the other's, so a seed that
  * names both `value` and `sourcePath` is an error rather than a guess.
  */
-const sessionSeed = type({ '+': 'reject', sessionId: 'string', value: 'string' })
+const sessionSeed = type({ '+': 'reject', sessionId: sessionIdSchema, value: 'string' })
   .or({
     '+': 'reject',
-    sessionId: 'string',
+    sessionId: sessionIdSchema,
     sourcePath: 'string',
     'sourceSha256?': '/^[a-f0-9]{64}$/',
   });
@@ -97,6 +104,7 @@ const preset = type({
   'print?': 'boolean',
   'verbose?': 'boolean',
   'debug?': 'boolean',
+  'stopGraceMs?': 'number.integer >= 0',
 
   // Preloaded context. `read` is preload's file/glob case, kept separate
   // because it is also a flag.

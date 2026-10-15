@@ -44,6 +44,14 @@
  *   FAKE_CLAUDE_SLEEP_MS       - milliseconds to wait after writing the
  *                                session file and before exiting, so a test
  *                                can interrupt a run that is still going.
+ *   FAKE_CLAUDE_APPEND_EVERY_MS - while sleeping, append one record to the
+ *                                session file this often, so a journal that
+ *                                stops growing shows its writer has stopped.
+ *   FAKE_CLAUDE_PID_FILE       - path this process writes its PID to, once
+ *                                its signal handling is in place.
+ *   FAKE_CLAUDE_IGNORE_SIGTERM - `'1'` ignores SIGTERM, as a process that
+ *                                will not shut down when asked; only SIGKILL
+ *                                then ends it.
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -62,6 +70,15 @@ if (argvFile !== undefined) {
   await fs.writeFile(argvFile, JSON.stringify(argv));
 }
 
+if (process.env.FAKE_CLAUDE_IGNORE_SIGTERM === '1') {
+  process.on('SIGTERM', () => {});
+}
+
+const pidFile = process.env.FAKE_CLAUDE_PID_FILE;
+if (pidFile !== undefined) {
+  await fs.writeFile(pidFile, String(process.pid));
+}
+
 function flagValue(name: string): string | undefined {
   const i = argv.indexOf(name);
   return i === -1 ? undefined : argv[i + 1];
@@ -76,6 +93,8 @@ if (configDir === undefined) {
   process.exit(1);
 }
 
+let sessionPath: string | null = null;
+
 if (process.env.FAKE_CLAUDE_WRITE_SESSION !== '0') {
   const projectsDir = path.join(configDir, 'projects');
   const projectDirs = await fs.readdir(projectsDir);
@@ -86,7 +105,7 @@ if (process.env.FAKE_CLAUDE_WRITE_SESSION !== '0') {
     process.exit(1);
   }
 
-  const sessionPath = path.join(projectsDir, projectDirs[0] ?? '', `${sessionId}.jsonl`);
+  sessionPath = path.join(projectsDir, projectDirs[0] ?? '', `${sessionId}.jsonl`);
 
   // A small, plausible transcript: the prompt echoed back, then a reply.
   // Real enough for TranscriptRenderer to recognize both records.
@@ -107,8 +126,13 @@ if (process.env.FAKE_CLAUDE_WRITE_SESSION !== '0') {
 }
 
 const sleepMs = Number(process.env.FAKE_CLAUDE_SLEEP_MS ?? '0');
-if (sleepMs > 0) {
-  await Bun.sleep(sleepMs);
+const appendEveryMs = Number(process.env.FAKE_CLAUDE_APPEND_EVERY_MS ?? '0');
+const sleepUntil = Date.now() + sleepMs;
+while (Date.now() < sleepUntil) {
+  await Bun.sleep(appendEveryMs > 0 ? Math.min(appendEveryMs, sleepUntil - Date.now()) : sleepUntil - Date.now());
+  if (appendEveryMs > 0 && sessionPath !== null) {
+    await fs.appendFile(sessionPath, `${JSON.stringify({ type: 'progress', at: Date.now() })}\n`);
+  }
 }
 
 const echo = process.env.FAKE_CLAUDE_ECHO_ENV;

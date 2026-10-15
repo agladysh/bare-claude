@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+import type { ConfigSource } from './config.ts';
 import { formatDoctorReport, runDoctor, type DoctorItem, type DoctorReport } from './doctor.ts';
 import { commandName, commandSource, install } from './install.ts';
 
@@ -254,6 +255,96 @@ describe('runDoctor', () => {
         expect(auth.detail).toBe('caller-managed: bare-claude supplies no credential, and this does not check the caller\'s');
         expect(report.ok).toBe(true);
       }
+    });
+  });
+
+  describe('the invocation a run would make', () => {
+    /**
+     * Each case was a disagreement: the doctor read the shell and the flags,
+     * a run read the configuration too. A run's child that drops the
+     * inherited environment would fall back to the account's real home for
+     * the default token file, so every such case names its own HOME and a
+     * token file that does not exist.
+     */
+    async function invocation(yaml: string): Promise<ConfigSource> {
+      const file = path.join(await tempDir('invocation'), 'invocation.yaml');
+      await Bun.file(file).write(yaml);
+      return { kind: 'file', path: file };
+    }
+
+    test('auth: caller in the configuration is what the auth item reports', async () => {
+      const { env, cwd } = await healthy();
+      const { CLAUDE_CODE_OAUTH_TOKEN: _dropped, ...withoutToken } = env;
+      const report = await runDoctor({ env: withoutToken, cwd, config: await invocation('auth: caller\n') });
+
+      expect(item(report, 'auth').status).toBe('warn');
+      expect(item(report, 'auth').detail).toStartWith('caller-managed:');
+      expect(report.ok).toBe(true);
+    });
+
+    test('noProcessEnv hides the shell\'s token from the run, so from the doctor too', async () => {
+      const { env, cwd, home } = await healthy();
+      const config = await invocation([
+        'noProcessEnv: true',
+        'extraEnv:',
+        `  HOME: ${home}`,
+        `  PATH: ${env.PATH}`,
+        `  BARE_CLAUDE_TOKEN_FILE: ${path.join(home, 'no-token-file')}`,
+        '',
+      ].join('\n'));
+      const report = await runDoctor({ env, cwd, config });
+
+      expect(item(report, 'auth').status).toBe('fail');
+      expect(item(report, 'auth').detail).toStartWith('CLAUDE_CODE_OAUTH_TOKEN absent');
+    });
+
+    test('a token the configuration passes in extraEnv counts, and is not printed', async () => {
+      const { env, cwd } = await healthy();
+      const { CLAUDE_CODE_OAUTH_TOKEN: _dropped, ...withoutToken } = env;
+      const config = await invocation('extraEnv:\n  CLAUDE_CODE_OAUTH_TOKEN: sk-ant-oat01-from-config\n');
+      const report = await runDoctor({ env: withoutToken, cwd, config });
+
+      expect(item(report, 'auth').detail).toBe('CLAUDE_CODE_OAUTH_TOKEN present');
+      expect(formatDoctorReport(report)).not.toContain('sk-ant-oat01-from-config');
+    });
+
+    test('the configuration\'s claudePath is the executable checked', async () => {
+      const { env, cwd } = await healthy();
+      const report = await runDoctor({ env, cwd, config: await invocation('claudePath: /nonexistent/claude\n') });
+
+      expect(item(report, 'claude').status).toBe('fail');
+      expect(item(report, 'claude').detail).toBe('/nonexistent/claude not found on PATH');
+    });
+
+    test('--use selects the preset whose fields are checked', async () => {
+      const { env, cwd } = await healthy();
+      const { CLAUDE_CODE_OAUTH_TOKEN: _dropped, ...withoutToken } = env;
+      const config = await invocation('presets:\n  managed:\n    auth: caller\n');
+
+      expect(item(await runDoctor({ env: withoutToken, cwd, config }), 'auth').status).toBe('fail');
+      expect(item(await runDoctor({ env: withoutToken, cwd, config, use: 'managed' }), 'auth').status).toBe('warn');
+    });
+
+    test('command-line overrides win over the configuration, as in a run', async () => {
+      const { env, cwd } = await healthy();
+      const { CLAUDE_CODE_OAUTH_TOKEN: _dropped, ...withoutToken } = env;
+      const report = await runDoctor({
+        env: withoutToken, cwd, config: await invocation('auth: fallback\n'), overrides: { auth: 'caller' },
+      });
+
+      expect(item(report, 'auth').status).toBe('warn');
+    });
+
+    test('an invocation a run would refuse fails the preset item, with the refusal as the hint', async () => {
+      const { env, cwd } = await healthy();
+      const config = await invocation('auth: caller\ntokenFile: /some/oauth\n');
+      const report = await runDoctor({ env, cwd, config });
+
+      const preset = item(report, 'preset');
+      expect(preset.status).toBe('fail');
+      expect(preset.detail).toBe('the invocation does not resolve; a run with these options would be refused');
+      expect(preset.hint.join('\n')).toContain('cannot also take a tokenFile');
+      expect(report.ok).toBe(false);
     });
   });
 

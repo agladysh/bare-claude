@@ -2,8 +2,11 @@
 #
 # Validated on load against the schema in src/config.ts: an unknown key or an
 # out-of-range value is an error naming the path, not a silently ignored typo.
-
-use: default
+#
+# There is deliberately no root `use`: this file is read by every run from a
+# checkout of this repository, and a root preset that carries a provider
+# endpoint and credential would apply them to all of those runs. Name one with
+# `--use`, e.g. `--use lmstudio`.
 
 presets:
   lmstudio:

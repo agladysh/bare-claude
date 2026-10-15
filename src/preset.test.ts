@@ -88,6 +88,45 @@ describe('resolvePreset', () => {
     expect(presets.base).toEqual({ read: 'a.ts' });
   });
 
+  test('deep-merges nested records without changing the presets merged', () => {
+    const presets: Record<string, DynamicPreset> = {
+      first: { extraEnv: { A: '1' }, extraArgs: [ '--a' ] },
+      second: { extraEnv: { B: '2' }, extraArgs: [ '--b' ] },
+      third: { extraEnv: { A: '3' } },
+    };
+    const result = resolvePreset({ ...cta, use: [ 'first', 'second', 'third' ] }, presets);
+    expect(result.extraEnv).toEqual({ A: '3', B: '2' });
+    expect(result.extraArgs).toEqual([ '--a', '--b' ]);
+    expect(presets).toEqual({
+      first: { extraEnv: { A: '1' }, extraArgs: [ '--a' ] },
+      second: { extraEnv: { B: '2' }, extraArgs: [ '--b' ] },
+      third: { extraEnv: { A: '3' } },
+    });
+  });
+
+  test('passes a value JSON cannot hold through by reference, as deepmerge does', () => {
+    // A JavaScript caller is not held to the JsonObject type of extraSettings.
+    class Marker {}
+    const marker = new Marker();
+    const hook = () => 'hook';
+    const nested = { kept: true };
+    Object.assign(nested, { marker, hook });
+    const presets: Record<string, DynamicPreset> = { base: { extraSettings: { nested: { inherited: true } } } };
+
+    const result = resolvePreset({ ...cta, use: 'base', extraSettings: { nested } }, presets);
+
+    const merged: unknown = result.extraSettings?.nested;
+    if (typeof merged !== 'object' || merged === null || !('marker' in merged) || !('hook' in merged)) {
+      throw new Error('extraSettings.nested lost a value the caller passed');
+    }
+    expect(merged.marker).toBe(marker);
+    expect(merged.hook).toBe(hook);
+    expect(merged).toMatchObject({ inherited: true, kept: true });
+    expect(merged).not.toBe(nested);
+    expect(Object.keys(nested)).toEqual([ 'kept', 'marker', 'hook' ]);
+    expect(presets).toEqual({ base: { extraSettings: { nested: { inherited: true } } } });
+  });
+
   test('concatenates read arrays across the inheritance chain', () => {
     const presets: Record<string, DynamicPreset> = {
       withCode: { read: ['*.ts'] },

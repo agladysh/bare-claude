@@ -139,8 +139,12 @@ Options:
 - `-l, --launcher [value]`: `claude` for native Anthropic modes (default), `ollama` for `ollama launch`
 - `-m, --model [model]`: model to be used
 - `--verbose`: print more events in transcript
-- `--debug`: print the resolved configuration, credential values redacted, and render only
-  events/blocks no rule recognizes
+- `--debug`: print the resolved configuration, and render only events/blocks no rule recognizes.
+  In the configuration, the values of `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and
+  `ANTHROPIC_AUTH_TOKEN` are replaced by `<redacted>` wherever they appear, and an in-memory
+  session journal (`customSessionData.value`) by its length. Nothing else is: a secret under any
+  other name, `extraArgs`, `extraSettings` and the prompt are printed as given. `--debug` is for
+  someone allowed to see the invocation; it is not a sanitizer
 - `-q, --quiet`: do not print transcript at all
 - `-p, --print`: print Claude Code console output (what `claude --print` prints),
   use with `--quiet` when you need the last assistant message only
@@ -166,6 +170,9 @@ Options:
   [Caller-managed authentication](#caller-managed-authentication))
 - `--claude-home [dir]`: Claude home for the run, created if missing and kept whatever the outcome
   (see [Keeping and continuing a run](#keeping-and-continuing-a-run))
+- `--stop-grace-ms [n]`: after `bare-claude` receives SIGTERM, SIGINT or SIGHUP, how long the run
+  gets before its process group is sent SIGKILL; default 10000 (see
+  [Stopping a run](#stopping-a-run))
 - `--claude-arg [arg]`: forward a flag to `claude` verbatim, may be included several times
 - `-v, --version`: print the version and exit
 - `-h, --help`: print this help and exit
@@ -189,8 +196,56 @@ already on your terminal.
 The exit code reports how the process ended, and nothing more. Exit 0 does not mean the task was
 done, and neither the exit code nor a kept session journal means anyone has read the result.
 
+A run stopped by SIGTERM, SIGINT or SIGHUP to `bare-claude` exits with 128 plus that signal's
+number — 143, 130, 129 — whatever `claude` itself exited with, so a stopped run is never read as
+a completed one. See [Stopping a run](#stopping-a-run).
+
 A refusal made before `claude` is spawned — an invalid configuration, a contradictory option, a
 session seed that cannot be published — exits 1 with a one-line `bare-claude:` message on stderr.
+
+### Stopping a run
+
+`bare-claude` spawns `claude` (or what `--claude-path` names) in a process group of its own, on
+macOS and Linux: Bun calls `setsid()` in the child. Whatever that process starts — the native
+Claude Code process under a managed launcher, the shells Claude Code runs — is in the group too,
+unless it starts a session of its own.
+
+On the first SIGTERM, SIGINT or SIGHUP, `bare-claude`:
+
+1. sends that signal to the spawned process alone, so a launcher that supervises the native
+   process can shut it down in its own order, and says so on stderr;
+2. once that process has exited, sends the same signal once to anything left in its group;
+3. when `--stop-grace-ms` (10000 by default, chosen rather than measured) has passed with
+   anything still running, sends SIGKILL to the whole group. A second signal sends it at once.
+
+It then reports and exits as usual, with the 128+n status above:
+
+```
+bare-claude: received SIGTERM; sent it to claude (pid 41321), SIGKILL to process group 41321 after 10000 ms
+Claude process ended: exit code 143
+Claude stop: SIGTERM; process group 41321 empty
+Claude home kept at /work/runs/0042/claude-home
+```
+
+`Claude stop:` says whether SIGKILL was needed and what was left in the group: `empty`,
+`still occupied after SIGKILL`, or `holds processes this user may not signal; left alone`. A run
+that ends without being asked is not signalled; if its group still has processes then, that is
+reported and left alone.
+
+What a stop cannot do:
+
+- **SIGKILL to `bare-claude` itself** cannot be caught, so nothing is forwarded or reported, and
+  the run carries on. A runner that may have to do that must record the process group from the
+  `Claude process group` line printed at spawn (see
+  [Keeping and continuing a run](#keeping-and-continuing-a-run)) and signal the group itself. Until
+  it reads the kept home back, the outcome of such a run is unknown, not failed and not done.
+- **A descendant that started a session of its own** is outside the group and is not reached.
+- **Work already done stays done**: edits in the working directory, records in the session
+  journal, requests already sent to a model provider, and anything another service was asked to
+  do. The stop ends processes; it does not roll anything back.
+
+On Windows there is no process group: the spawned process alone is signalled, and the stop line
+says so.
 
 ### Configuration
 
@@ -210,9 +265,10 @@ containing record of named presets.
 #### Choosing the configuration
 
 By default the file is `bare-claude.yaml` at the root of the Git working copy the command runs in,
-so a run picks up whatever that repository's file says — this repository's own example, for one,
-points every run from its checkout at an LM Studio endpoint and credential. A caller that drives
-`bare-claude` from someone else's working copy, or from none, chooses instead:
+so a run picks up whatever that repository's file says — its root preset's endpoint and
+credentials included. (This repository's own file has no root preset for that reason; its
+`lmstudio` preset applies only when named with `--use`.) A caller that drives `bare-claude` from
+someone else's working copy, or from none, chooses instead:
 
 - `--config FILE` reads that file, which must exist, and no other. No Git working copy is needed.
   Its named presets serve `--use`. This is how one invocation is declared whole: working
@@ -240,11 +296,20 @@ customSessionData:
 ```
 
 ```bash
-env -i PATH="$PATH" HOME="$HOME" bare-claude --config invocation.yaml --quiet --print -- 'Continue'
+env -i PATH="$PATH" HOME="$HOME" USER="$USER" TMPDIR="${TMPDIR:-/tmp}" \
+  bare-claude --config invocation.yaml --quiet --print -- 'Continue'
 ```
 
 `env -i` is the command line's way to scrub the environment the run inherits; `noProcessEnv`
-with `spawnOptions.env` is the library's.
+with `spawnOptions.env` is the library's. Which variables to pass back is the caller's to know,
+not this example's: `PATH` finds `bun` and the executable, `HOME` is where Claude Code and the
+default token file are looked for, and `USER` and `TMPDIR` are among what programs commonly
+expect of a login environment. A launcher's own requirements, documented by whoever maintains it,
+come first; a list copied from here is not a substitute for them.
+
+The doctor reads the same configuration the same way: `bare-claude --doctor --config
+invocation.yaml`, with the same `--use` and flags, checks the executable, working directory,
+auth mode and child environment that run would have.
 
 #### Preset
 
@@ -373,24 +438,58 @@ Note command-line `--use` overrode `use` field from the configuration file root 
 
 `--claude-home DIR` (`ephemeralClaudeHomePath`) gives a run a Claude home that belongs to the
 caller. It is created when missing and never removed by Bare Claude — not after success, not after
-failure, not when the run is interrupted. When the command ends it reports, on stderr:
+failure, not after a stop. As soon as the child is spawned, and before it has done anything, the
+command reports on stderr where its journal will be and which process group it runs in; when it
+ends, how the process ended and where the home is:
 
 ```
-Claude home kept at /work/runs/0042/claude-home
 Claude session journal at /work/runs/0042/claude-home/projects/-work-checkout/0199….jsonl
+Claude process group 41321
+…
+Claude process ended: exit code 0
+Claude home kept at /work/runs/0042/claude-home
 ```
 
-The second line appears only if the child wrote a journal. What the home holds is Claude Code's own
-record of the session; what the task produced, and whether anyone has received it, are not in it.
+The journal line names a path, not a file: the child creates the file, and one that failed early
+may never have. The first two lines are all a runner has if it has to kill `bare-claude` outright
+(see [Stopping a run](#stopping-a-run)).
+
+What a kept home holds is whatever Claude Code and Bare Claude wrote there, which this project does
+not inventory: the session journal, which records the conversation and what tools read, so it can
+hold anything the prompt or a file contained; `settings.json`, mode 0600, which carries any
+`extraSettings.env` given; under `auth: fallback`, a symlink to the real credential file where
+`linkAuth` found one; and Claude Code's own state. Keeping it is keeping all of that. What the task
+produced, and whether anyone has received it, are not in it.
+
+One live run per home. Nothing in Bare Claude stops two runs, or a run and a leftover process
+from a stopped one, from sharing a home: they would append to each other's history, and each
+spawn replaces `settings.json` under the other. `settings.json` is replaced atomically, so a
+reader never sees half of one, but which one it sees is not decided. Giving each run its own home,
+and starting the next only once the last has been seen to end, is the runner's.
 
 To continue that session in a new run, seed the new run from the journal by path
 (`customSessionData` with `sessionId` and `sourcePath`, optionally `sourceSha256`) and give the new
 run a home of its own. The new journal is a copy-on-write clone of the old one, on the same
-filesystem, so the continuation initially shares its existing file data; the source is never written, and
-each side appends independently afterwards. It is refused, before `claude` is spawned and with
-nothing published, when:
+filesystem, so the continuation initially shares its existing file data; the source is never
+written, and each side appends independently afterwards. Nothing locks the source: seeding one
+journal into several homes makes several independent continuations under the same session id,
+each its own fork from then on — a session is a home and an id together, not an id. Record the
+digest only once the run that wrote the journal has been seen to end: `sourceSha256` catches a
+change made after it was taken, not one made before.
 
-- the platform is neither macOS nor Linux, where the forced-clone implementation was checked;
+The session id names the journal file, so it must be a letter or digit followed by letters,
+digits, `.`, `_` or `-`, 128 characters at most; anything else, a path separator included, is
+refused. Claude Code's own ids are UUIDs.
+
+The seed is refused before `claude` is spawned, with no journal and no history line published,
+when any of the following holds. What `spawnClaude` did before reaching the seed stays done in a
+caller's home: the home and its project directory created, the credential file linked under
+`linkAuth`. A temporary home is removed whole.
+
+- the platform is neither macOS nor Linux: a forced clone was source-read in Bun 1.3.13's
+  `copyFileSync` for those two (`clonefile()`, `ioctl_ficlone`, neither with a byte-copy
+  fallback), while its Windows branch copies bytes whatever the flag says. `engines` allows any
+  Bun from 1.3; later versions have not been read;
 - the filesystem cannot clone, or the source and the new home are on different filesystems — there
   is no byte-copy fallback;
 - the source is a symbolic link, or has a second hard link;
@@ -401,6 +500,12 @@ nothing published, when:
 
 The in-memory route, `customSessionData` with `value`, remains for callers who mean to hold the
 journal as a string, and is what `--read` uses. It, too, refuses to replace an existing journal.
+
+If anything fails after the journal is published but before `claude` is spawned — a
+`--claude-path` that does not exist, say — the journal and the `history.jsonl` line that run added
+are taken back, so the same invocation can simply be retried. Each is taken back only while it is
+provably still what this run wrote: the journal while the path names the same file, the history
+line while nothing has been appended after it. Anything else is left, and the error says so.
 
 ## Preloading Context
 
@@ -490,21 +595,29 @@ ok   install: /Users/you/.local/bin/bare-claude -> /Users/you/projects/bare-clau
 ok   preset: /Users/you/projects/bare-claude/bare-claude.yaml (presets: default, changelog)
 ```
 
-One line per item, a hint beneath any that needs fixing. `bun` is the running runtime, checked
-against `engines.bun`. `claude` is the executable a run would spawn — `--claude-path` applies — and
-its version. `git` is what locates the preset file and resolves `--read`. `auth` says whether
-`CLAUDE_CODE_OAUTH_TOKEN` is present in the environment; failing that, whether the token file is
-(`--token-file` applies) — by path, with a warning when its mode lets anyone but its owner read
-it and a failure when it is empty; failing both, what to do. It is a warning rather than a
-failure when `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` stands in. Never a value, from either
-source. Under `--auth caller` it inspects nothing and is a warning saying so: the caller's route
-is not this program's to check. `install` is whether `bare-claude` is on
-`PATH`, and whether it is this checkout's symlink. `preset` is the `bare-claude.yaml` a run from
-the current directory would load, validated — or the file `--config` names, which must exist;
-under `--no-config` there is nothing to load and it is `ok`.
+One line per item, a hint beneath any that needs fixing. The doctor takes the same options a run
+does — `--config`/`--no-config`, `--use` and every other flag — and resolves them the same way, so
+it checks the invocation that run would make rather than the shell around it.
+
+`bun` is the running runtime, checked against `engines.bun`. `claude` is the executable that
+invocation would spawn — its `claudePath`, searched for on the `PATH` of the environment its child
+would get, from its `cwd` — and its version. `git` is what locates the preset file and resolves
+`--read`. `auth` looks at the environment that child would get — this one unless `noProcessEnv`
+drops it, plus `extraEnv` — and says whether `CLAUDE_CODE_OAUTH_TOKEN` is present there; failing
+that, whether the token file is (`tokenFile`/`--token-file` applies) — by path, with a warning
+when its mode lets anyone but its owner read it and a failure when it is empty; failing both, what
+to do. It is a warning rather than a failure when `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`
+stands in. Never a value, from either source. Under `auth: caller` it inspects nothing and is a
+warning saying so: the caller's route is not this program's to check. `install` is whether
+`bare-claude` is on `PATH`, and whether it is this checkout's symlink. `preset` is the
+`bare-claude.yaml` a run from the current directory would load, validated — or the file `--config`
+names, which must exist; under `--no-config` there is nothing to load and it is `ok`. When the
+invocation would be refused — an unknown `--use`, `auth: caller` beside a `tokenFile`, a session
+id that cannot name a file — `preset` fails with the refusal as its hint.
 
 Exits 1 when any item is `fail`. Nothing is repaired, and no model is spawned: the only
-subprocesses are `--version` probes and `git rev-parse`.
+subprocesses are `--version` probes and `git rev-parse`. The `--version` probe does run the
+executable the invocation names, a managed launcher included.
 
 Available programmatically as `runDoctor()` and `formatDoctorReport()` from
 `@agladysh/bare-claude/doctor`.
@@ -597,9 +710,11 @@ Optional:
 - `cwd`: Working directory for the Claude process, made absolute. Defaults to `process.cwd()`.
 - `ephemeralClaudeHomePath`: Claude home directory (`CLAUDE_CONFIG_DIR`) owned by the caller: made
   absolute, created when missing, never removed by this library whatever the outcome. Its
-  `settings.json` is rewritten on every spawn. If not provided, a temporary directory is created,
-  and `dispose()` removes it. See [Keeping and continuing a run](#keeping-and-continuing-a-run).
-- `customSessionData`: A prior session to resume, optional. A `SessionSeed`, one of:
+  `settings.json` is replaced atomically on every spawn; one live run per home is the caller's to
+  keep. If not provided, a temporary directory is created, and `dispose()` removes it. See
+  [Keeping and continuing a run](#keeping-and-continuing-a-run).
+- `customSessionData`: A prior session to resume, optional. Its `sessionId` must match
+  `sessionIdPattern` (exported): it names the journal file. A `SessionSeed`, one of:
   - `{ sessionId, value }` (`InMemorySessionSeed`): `value`, in Claude JSONL format, is written
     whole as the new journal.
   - `{ sessionId, sourcePath, sourceSha256? }` (`FileSessionSeed`): the new journal is a
@@ -644,7 +759,8 @@ Optional:
   inherited like everything else. When `true`, nothing is inherited, credentials included: only
   `spawnOptions.env` and `extraEnv` reach the child. Neither value turns off the token file — only
   `auth: 'caller'` does.
-- `auth`: Who supplies the child's credential, an `AuthMode`: `'fallback'` or `'caller'`. Defaults to
+- `auth`: Who supplies the child's credential, an `AuthMode`: `'fallback'` or `'caller'`; any
+  other value, from an untyped caller, is refused. Defaults to
   `'fallback'`: the environment's credential, else the token file and `linkAuth`. `'caller'`
   reads no token file and links nothing; it cannot be combined with `linkAuth: true` or a
   `tokenFile`. See [Caller-managed authentication](#caller-managed-authentication).
@@ -685,22 +801,54 @@ A promise that resolves to a `ClaudeSubprocess` object containing:
 - `sessionId`: The session ID
 - `projectHomePath`: Path to the project directory in Claude home
 - `sessionJsonlPath`: Path to the session JSONL file
+- `processGroup`: The process group the spawned process leads — its PID — when spawned with
+  `spawnOptions.detached: true` on macOS or Linux; `null` otherwise
 - `dispose()`: Removes the ephemeral Claude home directory, but only when `spawnClaude` created it.
   Idempotent. Call it in a `finally`; without it every spawn leaks a temporary directory.
 
 `spawnClaude` rejects when anything fails before the child is spawned — a token file, a session
-seed, the spawn itself — and then removes the home only if it created it. Once spawned,
-`subprocess.exited` is the native process's exit code, nothing more: it does not say whether the
+seed, `settings.json`, the spawn itself — and takes back what it published: the journal while the
+path still names the file it wrote, the `history.jsonl` line while nothing was appended after it,
+and the whole home if it created it. Whatever had to be left is named in the error. Once spawned,
+`subprocess.exited` is the spawned process's exit code, nothing more: it does not say whether the
 task was done, nor that anyone has read the result.
 
+`spawnClaude` does not supervise what it spawned. The CLI forwards signals and ends the process
+group (see [Stopping a run](#stopping-a-run)); a library caller that wants the same spawns
+detached and calls `stopClaude` on its own signals and deadlines:
+
 ```typescript
-const claude = await spawnClaude({ callToAction: 'Explain this project to me' });
+import { spawnClaude } from '@agladysh/bare-claude';
+import { stopClaude } from '@agladysh/bare-claude/lifecycle';
+
+const claude = await spawnClaude({ callToAction: 'Explain this project to me' }, { detached: true });
+const onSignal = () => void stopClaude(claude, { signal: 'SIGTERM', graceMs: 10_000 });
+process.once('SIGTERM', onSignal);
 try {
   const exitCode = await claude.subprocess.exited;
 } finally {
+  process.off('SIGTERM', onSignal);
   await claude.dispose();
 }
 ```
+
+Without `detached`, the child shares the caller's process group: a terminal's Ctrl-C reaches it
+directly, and nothing but the caller can end what it started once the caller is gone.
+
+### stopClaude(run, options)
+
+From `@agladysh/bare-claude/lifecycle`. Ends a run in three bounded steps: `options.signal` to
+the spawned process alone; once it has exited, the same signal once to what it left in its process
+group; SIGKILL to the whole group when `options.graceMs` runs out or `options.escalate` (an
+`AbortSignal`) is aborted. Without a process group, the spawned process alone is signalled at
+each step. Resolves with a `StopReport`: `signal`, `escalated`, the spawned process's `exitCode`
+and `signalCode`, `processGroup`, and `groupState` — `empty`, `occupied` (something outlived
+SIGKILL within two seconds), `not-permitted`, or `null` without a group.
+
+It signals only the process Bun spawned, through Bun's handle, and only a group whose id is that
+process's PID; any other `processGroup` is refused, as are ids 0 and 1 and the caller's own PID.
+`processGroupState(pgid)` probes a group with signal 0. A stop ends processes; it does not undo what
+they wrote or sent.
 
 ### Pure launch configuration
 
@@ -773,6 +921,11 @@ default, `--config` and `--no-config` — and validates it; see
 `@agladysh/bare-claude/preset` exports `resolvePreset(preset, presets)`, which folds a
 `DynamicPreset`'s `use` chain and applies the CLI display defaults to produce a runnable `Preset`
 — the function behind the [preset resolution order](#preset-resolution-order) above.
+`mergeInvocation(config, overrides, use?)` merges a whole invocation the way the CLI does — the
+configuration's root preset, the command line's fields over it, `--use` replacing the root's
+`use` — into a `MergedPreset` that need not be runnable; `resolveInvocation` does the same and
+then requires a `callToAction`. The CLI runs through the second and `--doctor` through the first,
+so both read an invocation identically. A `Preset` also carries the CLI-only `stopGraceMs`.
 
 ### Token file
 
@@ -789,10 +942,12 @@ file, throwing on an empty or unreadable one.
 
 From `@agladysh/bare-claude/doctor`. `runDoctor` returns a `DoctorReport`: `items`, each
 `{ name, status: 'ok' | 'warn' | 'fail', detail, hint }` in print order, and `ok`, false when any
-item failed. Every input is an option — `claudePath`, `env`, `cwd`, `binDir` — so it can be run
-against a machine assembled in a test, plus `tokenFile`, `auth` and `config` (a `ConfigSource`),
-which `--doctor` takes from `--token-file`, `--auth` and `--config`/`--no-config`.
-`formatDoctorReport` renders what `--doctor` prints. See [Doctor](#doctor).
+item failed. Every input is an option — `env`, `cwd`, `binDir` — so it can be run against a
+machine assembled in a test. The invocation to check is `config` (a `ConfigSource`), `use` and
+`overrides` (a `DynamicPreset`), merged by `mergeInvocation` exactly as a run merges them;
+`claudePath`, `tokenFile` and `auth` are shorthands that win over both. `--doctor` passes its
+`--config`/`--no-config`, `--use` and every other flag through these. `formatDoctorReport`
+renders what `--doctor` prints. See [Doctor](#doctor).
 
 ### install(binDir, options?), status(binDir), uninstall(binDir)
 

@@ -2,11 +2,40 @@
 
 ## [Unreleased]
 
-### Fixed
-
-- File-based session continuation refuses unsupported platforms before filesystem effects; a forced-copy flag alone does not guarantee cloning on Windows.
-
 ### Changed
+
+- **The CLI spawns `claude` in a process group of its own** (`detached`, so `setsid()`, on macOS
+  and Linux) and forwards SIGTERM, SIGINT and SIGHUP: to the spawned process first, then once to
+  what it left in the group, then SIGKILL to the group after `--stop-grace-ms` (10000 by default)
+  or at a second signal. It then reports, keeps the home as for a failed run, and exits with
+  128 plus the signal's number. Before, a signal killed the CLI alone: `claude`, and whatever a
+  launcher had started under it, went on running, spending and writing the kept journal, and
+  nothing was reported. A run that ends on its own is not signalled; group members it leaves are
+  reported, not killed.
+- **This repository's `bare-claude.yaml` has no root `use` any more.** Every run from a checkout
+  read it, and its `default` preset pointed all of them at an LM Studio endpoint with its
+  credential. The presets are unchanged; `--use default` restores the old behaviour.
+- **`--doctor` checks the invocation a run would make.** It reads the configuration a run would
+  read, merges `--use` and the flags the same way, and checks that invocation's `claudePath`,
+  `cwd`, `auth` and `tokenFile`, and the environment its child would get (`noProcessEnv`,
+  `extraEnv`). An invocation a run would refuse fails the `preset` item. Before, it looked only
+  at the shell and three flags, so `auth: caller` in a configuration failed the doctor while the
+  run proceeded, and a token in `extraEnv` went unseen.
+- **`LaunchConfig` refuses an `auth` other than `'fallback'` or `'caller'`**, which an untyped
+  caller could pass and which turned every fallback off without a word, and **a session id that
+  cannot name a journal file** — empty, with a path separator, leading with `.` or `-`, or over
+  128 characters. The configuration schema refuses the same ids.
+- **`settings.json` is replaced atomically, mode 0600**: written to a private file in the home and
+  renamed over the old one. It was rewritten in place at the default mode, so a run still using
+  the home could read half a file — which Claude Code drops whole and silently — and any
+  `extraSettings.env` was readable beyond its owner.
+- **A spawn that fails after publishing a session seed takes it back**: the journal while the path
+  still names the file it wrote, the `history.jsonl` line while nothing was appended after it.
+  Before, a `claudePath` that did not exist left both in a caller's home, and the same invocation
+  was refused as "already exists" from then on. The history line is now appended last before the
+  spawn.
+- `--debug` prints an in-memory session journal (`customSessionData.value`) as its length.
+- New `noBashEditDiff` launch option, default `true`, sets `CLAUDE_CODE_BASH_EDIT_DIFF=0` in the
 
 - New `noBashEditDiff` launch option, default `true`, sets `CLAUDE_CODE_BASH_EDIT_DIFF=0` in the
   settings `env`. Since 2.1.269, Claude Code in `auto`/`bypassPermissions` mode (for enabled
@@ -16,7 +45,6 @@
   Claude's sweep of stores older than min(`cleanupPeriodDays`, 2) days. Headless runs on one
   large repository accumulated tens of gigabytes. `noBashEditDiff: false` omits the variable; see the
   README for how that composes with a caller's `bashEditDiffEnabled`.
-
 - **`ephemeralClaudeHomePath` and `cwd` are made absolute**, and a caller's home is created when
   missing. A relative home reached the child as a relative `CLAUDE_CONFIG_DIR`, which it
   resolves against its own cwd, not the parent's; a relative `cwd` keyed the project directory
@@ -29,7 +57,8 @@
   removes the temporary home it created instead of leaking it.
 - `--debug` prints the resolved configuration with the values of `CLAUDE_CODE_OAUTH_TOKEN`,
   `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` replaced by `<redacted>`, wherever in it they
-  appear. A configuration passing a credential through `extraEnv` had it printed.
+  appear. A configuration passing a credential through `extraEnv` had it printed. Redaction is
+  by those names only; everything else is printed.
 - The CLI's `--read` and `preload` resolve against the run's `cwd`, as the child does, rather
   than against the directory `bare-claude` was started in.
 - Documentation: `noProcessEnv` was described as never stripping authentication variables. With
@@ -52,12 +81,23 @@
   journal is an exclusive copy-on-write clone of a retained prior journal on the same filesystem,
   with exact source checks and no byte-copy fallback. The source is never written; each side
   appends independently. The in-memory `{ sessionId, value }` route is unchanged. `--read` and
-  `preload` refuse to extend a file seed.
+  `preload` refuse to extend a file seed. Supported on macOS and Linux only, refused elsewhere
+  before anything is created: Bun 1.3.13's Windows `copyFileSync` copies bytes whatever the
+  forced-clone flag says.
 - `--claude-home DIR`, the CLI side of `ephemeralClaudeHomePath`: a caller's Claude home, kept
-  whatever the outcome. The CLI reports `Claude home kept at` and, when the child wrote one,
-  `Claude session journal at` on stderr for every kept home.
-- `SessionSeed`, `InMemorySessionSeed`, `FileSessionSeed` and `AuthMode` types; `authMode`
-  schema from `@agladysh/bare-claude/config`.
+  whatever the outcome. For every home declared kept (`--claude-home`, `--verbose`, `--debug`),
+  the CLI reports `Claude session journal at` and `Claude process group` on stderr as soon as the
+  child is spawned, and `Claude process ended` and `Claude home kept at` when it ends.
+- `stopClaude()` and `processGroupState()` from `@agladysh/bare-claude/lifecycle`, the stop the
+  CLI performs, for library callers: the spawned process, then its process group, then SIGKILL,
+  each bounded, signalling nothing but that process and a group whose id is its PID. `processGroup`
+  on the value `spawnClaude` returns, set when spawned with `detached: true`.
+- `--stop-grace-ms`, and the CLI-only preset field `stopGraceMs`.
+- `mergeInvocation()` and `resolveInvocation()` from `@agladysh/bare-claude/preset`: one merge of
+  configuration, command line and `--use`, shared by a run and `--doctor`. `runDoctor()` takes
+  `use` and `overrides`.
+- `SessionSeed`, `InMemorySessionSeed`, `FileSessionSeed` and `AuthMode` types; `sessionIdPattern`;
+  `authMode` and `sessionIdSchema` schemas from `@agladysh/bare-claude/config`.
 - The subscription token can live in a file: `~/.config/bare-claude/oauth` (under
   `XDG_CONFIG_HOME` when set), or the file named by `--token-file`, the `tokenFile` launch option
   or `BARE_CLAUDE_TOKEN_FILE`. `spawnClaude()` reads it, trimmed, into the child's
