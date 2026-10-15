@@ -426,6 +426,34 @@ describe('--auth caller', () => {
     expect(result.stderr).not.toContain('sk-ant-');
   });
 
+  test('--debug withholds every environment value, whatever its name, and keeps the names', async () => {
+    // A credential is not always called what the redaction list expects: a
+    // provider key, a basic-auth URL, a launcher's own variable.
+    const cwd = await repo();
+    const config = await configFile([
+      'auth: caller',
+      'extraEnv:',
+      '  PROVIDER_KEY: secret-in-extra-env',
+      '  ANTHROPIC_BASE_URL: https://user:secret-in-url@proxy.example',
+      'extraSettings:',
+      '  env:',
+      '    LAUNCHER_LEASE: secret-in-settings-env',
+      '  model: printed-as-given',
+      '',
+    ].join('\n'));
+    const home = path.join(await tempDir('home'), 'claude');
+
+    const result = await runCli([ '--config', config, '--claude-home', home, '--debug', 'hello' ], { cwd });
+
+    expect(result.exitCode).toBe(0);
+    for (const secret of [ 'secret-in-extra-env', 'secret-in-url', 'secret-in-settings-env' ]) {
+      expect(result.stdout).not.toContain(secret);
+    }
+    expect(result.stdout).toContain(`"PROVIDER_KEY": "<${'secret-in-extra-env'.length} characters, not printed>"`);
+    expect(result.stdout).toContain('"LAUNCHER_LEASE": "<');
+    expect(result.stdout).toContain('"model": "printed-as-given"');
+  });
+
   test('--debug prints an in-memory session journal\'s size, not its content', async () => {
     const cwd = await repo();
     const value = `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'private words' } })}\n`;

@@ -34,9 +34,21 @@
   Before, a `claudePath` that did not exist left both in a caller's home, and the same invocation
   was refused as "already exists" from then on. The history line is now appended last before the
   spawn.
-- `--debug` prints an in-memory session journal (`customSessionData.value`) as its length.
-- New `noBashEditDiff` launch option, default `true`, sets `CLAUDE_CODE_BASH_EDIT_DIFF=0` in the
-
+- **A supervisor that kills `bare-claude`'s process group no longer reaches `claude`.** Since the
+  CLI spawns `claude` into a group of its own, a kill aimed at the CLI's group — `timeout -k`'s
+  final SIGKILL, a job-control kill of the shell's job — ends the CLI alone, and the run goes on.
+  Every run now reports `Claude process group N` on stderr as soon as it is spawned, whatever
+  its home; a supervisor must either signal `bare-claude` itself and allow it at least
+  `--stop-grace-ms` plus 5 seconds before any kill of its own, or signal that group directly.
+- `--debug` withholds every value of `extraEnv` and `extraSettings.env`, printing its length in
+  place of it and keeping its name, and prints an in-memory session journal
+  (`customSessionData.value`) as its length. Everything else in the configuration is printed as
+  given.
+- `--doctor` no longer inspects the token file when the invocation does not resolve (an unknown
+  `--use`, a contradictory option, an unreadable named configuration): the `auth` item says it was
+  not checked, since the configuration that failed may be the one that declares `auth: caller`.
+  Outside a Git working copy, with no configuration to read, the command line is still checked as
+  before.
 - New `noBashEditDiff` launch option, default `true`, sets `CLAUDE_CODE_BASH_EDIT_DIFF=0` in the
   settings `env`. Since 2.1.269, Claude Code in `auto`/`bypassPermissions` mode (for enabled
   cohorts) keeps one private Git store per process and repository under
@@ -57,8 +69,8 @@
   removes the temporary home it created instead of leaking it.
 - `--debug` prints the resolved configuration with the values of `CLAUDE_CODE_OAUTH_TOKEN`,
   `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` replaced by `<redacted>`, wherever in it they
-  appear. A configuration passing a credential through `extraEnv` had it printed. Redaction is
-  by those names only; everything else is printed.
+  appear. A configuration passing a credential through `extraEnv` had it printed. Outside the
+  environment blocks (above), redaction is by those three names only.
 - The CLI's `--read` and `preload` resolve against the run's `cwd`, as the child does, rather
   than against the directory `bare-claude` was started in.
 - Documentation: `noProcessEnv` was described as never stripping authentication variables. With
@@ -86,12 +98,18 @@
   forced-clone flag says.
 - `--claude-home DIR`, the CLI side of `ephemeralClaudeHomePath`: a caller's Claude home, kept
   whatever the outcome. For every home declared kept (`--claude-home`, `--verbose`, `--debug`),
-  the CLI reports `Claude session journal at` and `Claude process group` on stderr as soon as the
-  child is spawned, and `Claude process ended` and `Claude home kept at` when it ends.
-- `stopClaude()` and `processGroupState()` from `@agladysh/bare-claude/lifecycle`, the stop the
-  CLI performs, for library callers: the spawned process, then its process group, then SIGKILL,
-  each bounded, signalling nothing but that process and a group whose id is its PID. `processGroup`
-  on the value `spawnClaude` returns, set when spawned with `detached: true`.
+  the CLI reports `Claude session journal at` on stderr as soon as the child is spawned, and
+  `Claude process ended` and `Claude home kept at` when it ends.
+- `@agladysh/bare-claude/lifecycle`, the supervision the CLI itself runs on, for library callers:
+  - `superviseSignals()`: installed before the spawn, it turns SIGTERM, SIGINT and SIGHUP into an
+    orderly stop of the attached run, holds a signal that arrives before there is a run,
+    escalates to SIGKILL on a further one, and through `finish()` stops a run still going and
+    waits for the stop before the caller cleans up; `stoppedBy` and `signalExitStatus()` give the
+    128+n status.
+  - `stopClaude()` and `processGroupState()`: the stop itself — the spawned process, then its
+    process group, then SIGKILL, each bounded, signalling nothing but that process and a group
+    whose id is its PID.
+  - `processGroup` on the value `spawnClaude` returns, set when spawned with `detached: true`.
 - `--stop-grace-ms`, and the CLI-only preset field `stopGraceMs`.
 - `mergeInvocation()` and `resolveInvocation()` from `@agladysh/bare-claude/preset`: one merge of
   configuration, command line and `--use`, shared by a run and `--doctor`. `runDoctor()` takes

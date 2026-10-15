@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import { buildEnv, LaunchConfig, type AuthMode } from '@agladysh/bare-claude';
 import {
-  configFileName, loadConfig, locateConfig, parseConfig, type ConfigSource
+  configFileName, loadConfig, locateConfig, parseConfig, type Config, type ConfigSource
 } from '@agladysh/bare-claude/config';
 import { commandName, commandSource, defaultBinDir, status } from '@agladysh/bare-claude/install';
 import { mergeInvocation, type DynamicPreset } from '@agladysh/bare-claude/preset';
@@ -432,14 +432,26 @@ async function checkPreset(cwd: string, source: ConfigSource): Promise<DoctorIte
   }
 }
 
-/** An invocation resolved as a run would resolve it, or why it cannot be. */
-type ResolvedRun = { launch: LaunchConfig } | { launch: LaunchConfig, error: string };
+/**
+ * An invocation resolved as a run would resolve it, or why it cannot be.
+ *
+ * - `resolved`: what a run would do.
+ * - `command-line`: there is no configuration to read (outside a Git working
+ *   copy, with the located one asked for), so `launch` is the command line
+ *   alone. Checked as such, as the doctor always has.
+ * - `refused`: a run would be refused. `launch` is the command line alone,
+ *   good enough to look for an executable but not to judge a credential: the
+ *   configuration it misses may declare `auth: caller`, under which no token
+ *   file may be read.
+ */
+type ResolvedRun =
+  | { kind: 'resolved', launch: LaunchConfig }
+  | { kind: 'command-line', launch: LaunchConfig, error: string }
+  | { kind: 'refused', launch: LaunchConfig, error: string };
 
 /**
  * Resolves the invocation: configuration, overrides, `use`, then
- * `LaunchConfig`, the same steps and refusals as a run. When that fails, the
- * other checks still run against the overrides alone, so one bad key does not
- * hide a missing `claude`.
+ * `LaunchConfig`, the same steps and refusals as a run.
  */
 async function resolveRun(
   source: ConfigSource,
@@ -447,19 +459,33 @@ async function resolveRun(
   overrides: DynamicPreset,
   use: string | undefined
 ): Promise<ResolvedRun> {
-  try {
-    const merged = mergeInvocation(await loadConfig(source, cwd), overrides, use);
-    return { launch: LaunchConfig({ ...merged, callToAction: '' }) };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    let launch: LaunchConfig;
+  const commandLine = (): LaunchConfig => {
     try {
       const { use: _ignored, read: _read, ...fields } = overrides;
-      launch = LaunchConfig({ ...fields, callToAction: '' });
+      return LaunchConfig({ ...fields, callToAction: '' });
     } catch {
-      launch = LaunchConfig({ callToAction: '' });
+      return LaunchConfig({ callToAction: '' });
     }
-    return { launch, error: message };
+  };
+  const message = (error: unknown) => error instanceof Error ? error.message : String(error);
+
+  let config: Config;
+  try {
+    config = await loadConfig(source, cwd);
+  } catch (error) {
+    // Outside a Git working copy there is no configuration to read at all, so
+    // the command line is the whole of what is known — as before there was a
+    // configuration to resolve. Any other failure means a configuration that
+    // could not be read, which may say anything, `auth: caller` included.
+    const noConfiguration = source.kind === 'located' && await locateConfig(cwd) === null;
+    return { kind: noConfiguration ? 'command-line' : 'refused', launch: commandLine(), error: message(error) };
+  }
+
+  try {
+    const merged = mergeInvocation(config, overrides, use);
+    return { kind: 'resolved', launch: LaunchConfig({ ...merged, callToAction: '' }) };
+  } catch (error) {
+    return { kind: 'refused', launch: commandLine(), error: message(error) };
   }
 }
 
@@ -503,10 +529,12 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
   if (runEnv.PATH === undefined) {
     claude.detail += ' (the run\'s environment sets no PATH; resolved with the doctor\'s)';
   }
+  if (run.kind === 'refused') {
+    claude.detail += ' (from the command line alone: the invocation does not resolve)';
+  }
 
   let preset = await checkPreset(cwd, source);
-  const outsideWorkingCopy = source.kind === 'located' && preset.status === 'warn';
-  if ('error' in run && preset.status !== 'fail' && !outsideWorkingCopy) {
+  if (run.kind === 'refused' && preset.status !== 'fail') {
     preset = {
       name: 'preset',
       status: 'fail',
@@ -515,11 +543,22 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
     };
   }
 
+  // A refused invocation's auth mode is unknown, so no token file is opened:
+  // the configuration that failed may be the one that says not to.
+  const auth: DoctorItem = run.kind === 'refused'
+    ? {
+      name: 'auth',
+      status: 'warn',
+      detail: 'not checked: the invocation does not resolve (see preset), so which credential it would use is unknown',
+      hint: [],
+    }
+    : await checkAuth(runEnv, launch.tokenFile ?? undefined, launch.auth);
+
   const items: DoctorItem[] = [
     checkBun(),
     claude,
     await checkGit(env, cwd),
-    await checkAuth(runEnv, launch.tokenFile ?? undefined, launch.auth),
+    auth,
     await checkInstall(env, options.binDir),
     preset,
   ];

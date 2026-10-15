@@ -891,8 +891,9 @@ interface ClaudeSubprocess<
   /**
    * The process group the spawned process leads — its own PID — when it was
    * spawned with `spawnOptions.detached: true` on macOS or Linux; null
-   * otherwise. Pass the whole value to `stopClaude` from
-   * `@agladysh/bare-claude/lifecycle` to end the run and its descendants.
+   * otherwise. Attach the whole value to a supervisor from `superviseSignals`
+   * in `@agladysh/bare-claude/lifecycle`, or pass it to `stopClaude` there,
+   * to end the run and its descendants.
    */
   processGroup: number | null,
   /**
@@ -1065,8 +1066,9 @@ function appendHistoryLine(filePath: string, line: string): HistoryLine {
  *
  * The spawned process is not supervised. Ending it, and anything it started,
  * is the caller's: pass `detached: true` in `spawnOptions` to give it a
- * process group of its own, and `stopClaude` from
- * `@agladysh/bare-claude/lifecycle` to end that group. Its exit code is the
+ * process group of its own, and supervise it with `superviseSignals` from
+ * `@agladysh/bare-claude/lifecycle`, installed before this call, as the CLI
+ * does. Its exit code is the
  * spawned process's own and nothing more: it does not say whether the task
  * was done, nor that anyone has read the result.
  * @template In - The type of writable stdin stream

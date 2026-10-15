@@ -20,6 +20,11 @@
  * anything the run asked another service to do, and requests already sent to
  * a model provider. A stop also cannot undo what the run already wrote, in
  * its working directory or its session journal.
+ *
+ * {@link superviseSignals} is the policy around a stop — which signals start
+ * one, holding one that arrives before there is a run, escalating on a second,
+ * and waiting for the stop before anything is cleaned up. The CLI uses it as
+ * is; a library caller should too, rather than rebuilding it.
  */
 
 /** Whether a process group still has members this process may signal. */
@@ -257,5 +262,217 @@ export async function stopClaude(run: StoppableRun, options: StopOptions): Promi
     signalCode: subprocess.signalCode,
     processGroup,
     groupState: processGroup === null ? null : processGroupState(processGroup),
+  };
+}
+
+/** POSIX numbers of the signals a supervisor stops a run on; the same on macOS and Linux. */
+export const stopSignalNumbers = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 } as const;
+
+/** A signal {@link superviseSignals} turns into a stop. */
+export type StopSignal = keyof typeof stopSignalNumbers;
+
+/** Every {@link StopSignal}, the default set a supervisor listens for. */
+export const stopSignals: readonly StopSignal[] = [ 'SIGHUP', 'SIGINT', 'SIGTERM' ];
+
+/**
+ * The shell's exit status for a command ended by `signal`: 128 plus its
+ * number, so 129, 130 and 143. A runner reading it cannot mistake a stopped
+ * run for a completed one.
+ */
+export function signalExitStatus(signal: StopSignal): number {
+  return 128 + stopSignalNumbers[signal];
+}
+
+/**
+ * Where a supervisor's signals come from. The default is this process's own
+ * signal handlers; anything else with the same two methods can deliver them,
+ * which is how the tests deliver signals without sending any to themselves.
+ */
+export interface SignalSource {
+  on(signal: StopSignal, listener: () => void): void,
+  off(signal: StopSignal, listener: () => void): void,
+}
+
+const processSignals: SignalSource = {
+  on: (signal, listener) => {
+    process.on(signal, listener);
+  },
+  off: (signal, listener) => {
+    process.off(signal, listener);
+  },
+};
+
+/** Something a supervisor did, for its caller to report. */
+export type SupervisorEvent =
+  /** A signal arrived before {@link Supervisor.attach}; the run is stopped once attached. */
+  | { kind: 'held', signal: StopSignal }
+  /**
+   * A stop began: `cause` is the signal that started it, or `'finish'` when
+   * {@link Supervisor.finish} found the run still going and sent `SIGTERM`.
+   */
+  | { kind: 'stopping', cause: StopSignal | 'finish', pid: number, processGroup: number | null, graceMs: number }
+  /** A further signal during a stop: `SIGKILL` goes out now. */
+  | { kind: 'escalating', signal: StopSignal }
+  /** A signal arrived after the run had ended on its own; nothing was stopped. */
+  | { kind: 'after-exit', signal: StopSignal };
+
+/** How {@link superviseSignals} supervises. */
+export interface SupervisorOptions {
+  /** Passed to {@link stopClaude}: how long a stopped run gets before `SIGKILL`. */
+  graceMs: number,
+
+  /** Which signals start a stop. Defaults to {@link stopSignals}, all three. */
+  signals?: readonly StopSignal[],
+
+  /** Told of every {@link SupervisorEvent}, synchronously, as it happens. */
+  onEvent?: (event: SupervisorEvent) => void,
+
+  /** Where signals come from. Defaults to this process. */
+  source?: SignalSource,
+}
+
+/** One run's supervision, from before it is spawned until it is cleaned up. */
+export interface Supervisor {
+  /**
+   * Hands over the run `spawnClaude` returned. A signal held since
+   * {@link superviseSignals} was called starts its stop now.
+   * @throws When a run was already attached, or supervision has ended
+   */
+  attach(run: StoppableRun): void,
+
+  /** The signal that started a stop of a running run; null when none did. */
+  readonly stoppedBy: StopSignal | null,
+
+  /**
+   * Ends supervision. If the attached run is still going and nothing stopped
+   * it, stops it with `SIGTERM`; waits for any stop, with the handlers still
+   * in place so a further signal still escalates; then removes them. Resolves
+   * with the stop's report, or null when there was no stop. Idempotent. Call
+   * it before removing the run's home.
+   */
+  finish(): Promise<StopReport | null>,
+
+  /**
+   * Removes the handlers without stopping anything. For when the spawn
+   * failed and there is no run to attach; otherwise use {@link finish}.
+   */
+  release(): void,
+}
+
+/**
+ * Starts supervising one run, before it is spawned: from this call on, the
+ * signals in `options.signals` no longer end this process, they stop the run.
+ *
+ * - The first signal stops the attached run with {@link stopClaude}: that
+ *   signal to the spawned process, then once to its process group, then
+ *   `SIGKILL` to the group once `options.graceMs` has passed.
+ * - A signal before {@link Supervisor.attach} is held and acted on at attach.
+ * - Any further signal during a stop sends `SIGKILL` at once.
+ * - A signal after the run has ended on its own stops nothing and is not
+ *   recorded as {@link Supervisor.stoppedBy}.
+ *
+ * Call {@link Supervisor.finish} once the run has ended, or to end it, and
+ * only then dispose of its home. Until `finish` or `release`, this process
+ * cannot be ended by those signals; it must end itself.
+ * @param options - See {@link SupervisorOptions}
+ * @returns The supervision of the run about to be spawned
+ */
+export function superviseSignals(options: SupervisorOptions): Supervisor {
+  const source = options.source ?? processSignals;
+  const escalate = new AbortController();
+  const emit = (event: SupervisorEvent) => options.onEvent?.(event);
+
+  let run: StoppableRun | null = null;
+  let requested: StopSignal | null = null;
+  let stoppedBy: StopSignal | null = null;
+  let report: Promise<StopReport> | null = null;
+  let finishing: Promise<StopReport | null> | null = null;
+  let released = false;
+
+  const startStop = (attached: StoppableRun, cause: StopSignal | 'finish') => {
+    emit({
+      kind: 'stopping',
+      cause,
+      pid: attached.subprocess.pid,
+      processGroup: attached.processGroup,
+      graceMs: options.graceMs,
+    });
+    report = stopClaude(attached, {
+      signal: cause === 'finish' ? 'SIGTERM' : cause,
+      graceMs: options.graceMs,
+      escalate: escalate.signal,
+    });
+    if (cause !== 'finish') {
+      stoppedBy = cause;
+    }
+  };
+
+  const onSignal = (signal: StopSignal) => {
+    if (requested !== null) {
+      if (!escalate.signal.aborted) {
+        emit({ kind: 'escalating', signal });
+        escalate.abort();
+      }
+      return;
+    }
+    if (run !== null && !isRunning(run.subprocess)) {
+      emit({ kind: 'after-exit', signal });
+      return;
+    }
+    requested = signal;
+    if (run === null) {
+      emit({ kind: 'held', signal });
+    } else {
+      startStop(run, signal);
+    }
+  };
+
+  const listeners = new Map<StopSignal, () => void>();
+  for (const signal of options.signals ?? stopSignals) {
+    const listener = () => onSignal(signal);
+    listeners.set(signal, listener);
+    source.on(signal, listener);
+  }
+
+  const release = () => {
+    if (released) {
+      return;
+    }
+    released = true;
+    for (const [ signal, listener ] of listeners) {
+      source.off(signal, listener);
+    }
+  };
+
+  return {
+    attach: (attached) => {
+      if (run !== null) {
+        throw new Error('a supervisor supervises one run, and one is already attached');
+      }
+      if (released) {
+        throw new Error('this supervision has ended; start a new one for a new run');
+      }
+      run = attached;
+      if (requested !== null) {
+        startStop(attached, requested);
+      }
+    },
+    get stoppedBy() {
+      return stoppedBy;
+    },
+    finish: () => {
+      finishing ??= (async () => {
+        if (run !== null && report === null && isRunning(run.subprocess)) {
+          startStop(run, 'finish');
+        }
+        try {
+          return report === null ? null : await report;
+        } finally {
+          release();
+        }
+      })();
+      return finishing;
+    },
+    release,
   };
 }

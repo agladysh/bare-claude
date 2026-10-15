@@ -251,6 +251,30 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('stop
     expect(run.stderr()).toContain('bare-claude: received SIGINT again; sending SIGKILL now\n');
   }, 30_000);
 
+  test('SIGHUP stops a run with a temporary home too: its group is reported at spawn, exit 129', async () => {
+    // A runner cannot reach this child through the CLI's own process group,
+    // so the group line must be there whether or not the home is kept.
+    const { cwd, claudePid } = await setUp();
+    const run = startCli([ '--no-config', '--quiet', 'hello' ], cwd, { ...writing, FAKE_CLAUDE_PID_FILE: claudePid });
+    const claude = await pidFrom(claudePid);
+    expect(await eventually(() => run.stderr().includes(`Claude process group ${claude}\n`), 10_000)).toBe(true);
+    expect(run.stderr()).not.toContain('Claude session journal at');
+
+    run.cli.kill('SIGHUP');
+    expect(await run.cli.exited).toBe(129);
+
+    expect(await eventually(() => processGone(claude), 5_000)).toBe(true);
+    expect(await eventually(() => run.stderr().includes('Claude home kept at '), 2_000)).toBe(true);
+    const home = run.stderr().match(/^Claude home kept at (.+)$/m)?.[1] ?? '';
+    expect(path.isAbsolute(home) && path.basename(home).startsWith('bare-claude-home-')).toBe(true);
+    dirs.push(home);
+    const journal = run.stderr().match(/^Claude session journal at (.+)$/m)?.[1] ?? '';
+    expect(journal.startsWith(path.join(home, 'projects'))).toBe(true);
+    const [ before, after ] = await sizesApart(journal, 300);
+    expect(after).toBe(before);
+    expect(run.stderr()).toContain(`bare-claude: received SIGHUP; sent it to claude (pid ${claude})`);
+  }, 30_000);
+
   test('a run that ends on its own is not signalled, and its exit stands', async () => {
     const { cwd, home, claudePid } = await setUp();
     const run = startCli([ '--no-config', '--claude-home', home, '--quiet', 'hello' ], cwd, {
