@@ -7,7 +7,7 @@ import path from 'node:path';
 import { eventually, processGone } from '../test/helpers.ts';
 import {
   processGroupState, signalExitStatus, stopClaude, superviseSignals,
-  type SignalSource, type StopSignal, type SupervisorEvent,
+  type SignalSource, type StopOptions, type StopSignal, type SupervisorEvent,
 } from './lifecycle.ts';
 
 /**
@@ -207,6 +207,86 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('supe
     expect(events.map(event => event.kind === 'stopping' ? event.cause : event.kind)).toEqual([ 'finish' ]);
     expect(await supervisor.finish()).toBe(report);
     expect(processGone(run.subprocess.pid)).toBe(true);
+  }, 20_000);
+
+  test('a signal during a finish() stop hurries that stop: one stop, SIGKILL at once, no stoppedBy', async () => {
+    const signals = new TestSignals();
+    const events: SupervisorEvent[] = [];
+    const supervisor = superviseSignals({ graceMs: 60_000, source: signals, onEvent: event => events.push(event) });
+    const dir = await tempDir();
+    const readyFile = path.join(dir, 'ready');
+    const childFile = path.join(dir, 'child.pid');
+    // Neither the launcher nor its child will go on SIGTERM; only SIGKILL
+    // ends them inside the 60-second grace.
+    const run = detachedRun(`trap '' TERM; sleep 30 & echo $! > '${childFile}'; echo ready > '${readyFile}'; wait`);
+    expect(await eventually(() => Bun.file(readyFile).exists(), 10_000)).toBe(true);
+    const child = await pidIn(childFile);
+    supervisor.attach(run);
+
+    const startedAt = Date.now();
+    const finishing = supervisor.finish();
+    signals.send('SIGINT');
+    const report = await finishing;
+
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
+    expect(events.map(event => event.kind)).toEqual([ 'stopping', 'escalating' ]);
+    expect(events[0]).toMatchObject({ kind: 'stopping', cause: 'finish' });
+    expect(report?.signal).toBe('SIGTERM');
+    expect(report?.escalated).toBe(true);
+    expect(report?.groupState).toBe('empty');
+    expect(supervisor.stoppedBy).toBeNull();
+    expect(await eventually(() => processGone(run.subprocess.pid) && processGone(child), 5_000)).toBe(true);
+    expect(signals.listening).toBe(0);
+  }, 20_000);
+
+  test('a grace that cannot bound a stop is refused, and no handler is left installed', async () => {
+    const signals = new TestSignals();
+    for (const graceMs of [ Number.NaN, Number.POSITIVE_INFINITY, -1, undefined, '10' ]) {
+      const options = { graceMs: 0, source: signals };
+      Object.assign(options, { graceMs });
+      expect(() => superviseSignals(options)).toThrow('graceMs must be a finite number');
+    }
+    expect(signals.listening).toBe(0);
+
+    // stopClaude refuses it before signalling anything: the process lives on.
+    const run = detachedRun('sleep 30');
+    const options: StopOptions = { signal: 'SIGTERM', graceMs: 0 };
+    Object.assign(options, { graceMs: undefined });
+    await expect(stopClaude(run, options)).rejects.toThrow('graceMs must be a finite number');
+    expect(processGone(run.subprocess.pid)).toBe(false);
+  });
+
+  test('signal names that cannot stop a run are refused before any handler is installed', () => {
+    const signals = new TestSignals();
+    for (const requested of [ [ 'SIGTERM', 'SIGKILL' ], [ 'SIGUSR1' ], [ 'SIGINT', 15 ], 'SIGTERM' ]) {
+      const options = { graceMs: 1_000, source: signals };
+      Object.assign(options, { signals: requested });
+      expect(() => superviseSignals(options)).toThrow();
+      expect(signals.listening).toBe(0);
+    }
+  });
+
+  test('a signal named twice is listened for once, so release removes every handler', () => {
+    const signals = new TestSignals();
+    const supervisor = superviseSignals({ graceMs: 1_000, source: signals, signals: [ 'SIGTERM', 'SIGTERM', 'SIGINT' ] });
+    expect(signals.listening).toBe(2);
+    supervisor.release();
+    expect(signals.listening).toBe(0);
+  });
+
+  test('release() is refused once a run is attached, and the handlers stay until finish()', async () => {
+    const signals = new TestSignals();
+    const supervisor = superviseSignals({ graceMs: 5_000, source: signals });
+    const run = detachedRun('sleep 30');
+    supervisor.attach(run);
+
+    expect(() => supervisor.release()).toThrow('a run is attached');
+    expect(signals.listening).toBe(3);
+
+    await supervisor.finish();
+    expect(signals.listening).toBe(0);
+    expect(processGone(run.subprocess.pid)).toBe(true);
+    expect(() => supervisor.release()).not.toThrow();
   }, 20_000);
 
   test('listens for the signals asked for, until released, and supervises one run', async () => {

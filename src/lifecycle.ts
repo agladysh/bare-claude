@@ -146,6 +146,17 @@ function signalGroup(pgid: number, signal: NodeJS.Signals): void {
   }
 }
 
+/**
+ * Refuses a grace that would not bound a stop. Checked at run time because a
+ * JavaScript caller is not held to the type: an absent one made the deadline
+ * NaN, which never passes, so SIGKILL was never sent.
+ */
+function assertGrace(graceMs: unknown): void {
+  if (typeof graceMs !== 'number' || !Number.isFinite(graceMs) || graceMs < 0) {
+    throw new Error(`graceMs must be a finite number of milliseconds, 0 or more, got ${String(graceMs)}`);
+  }
+}
+
 function isRunning(subprocess: StoppableRun['subprocess']): boolean {
   return subprocess.exitCode === null && subprocess.signalCode === null;
 }
@@ -201,9 +212,12 @@ async function settle(waitFor: Promise<number> | null, ms: number, abort: AbortS
  * changed before it stopped, are not things a stop can tell.
  * @param run - The value `spawnClaude` returned, or anything shaped like it
  * @param options - See {@link StopOptions}
- * @throws When `run.processGroup` is not the spawned process's own PID
+ * @throws When `run.processGroup` is not the spawned process's own PID, or
+ *   `options.graceMs` is not a finite number of milliseconds from 0 up;
+ *   either before anything is signalled
  */
 export async function stopClaude(run: StoppableRun, options: StopOptions): Promise<StopReport> {
+  assertGrace(options.graceMs);
   const { subprocess, processGroup } = run;
   if (processGroup !== null) {
     assertOwnGroup(processGroup);
@@ -283,6 +297,35 @@ export function signalExitStatus(signal: StopSignal): number {
   return 128 + stopSignalNumbers[signal];
 }
 
+/** Narrows a value from untyped code to a {@link StopSignal}. */
+function isStopSignal(value: unknown): value is StopSignal {
+  return stopSignals.some(signal => signal === value);
+}
+
+/**
+ * The signals a supervisor will listen for, each once, or a refusal. All of
+ * this happens before a single handler is installed, so a refusal leaves
+ * none behind; and each signal is listened for once, so release removes
+ * every handler it installed.
+ */
+function signalsToSupervise(requested: unknown): StopSignal[] {
+  if (requested === undefined) {
+    return [ ...stopSignals ];
+  }
+  if (!Array.isArray(requested)) {
+    throw new Error('signals must be an array of signal names');
+  }
+  const names: readonly unknown[] = requested;
+  const unique = new Set<StopSignal>();
+  for (const signal of names) {
+    if (!isStopSignal(signal)) {
+      throw new Error(`cannot supervise ${String(signal)}: only ${stopSignals.join(', ')} stop a run`);
+    }
+    unique.add(signal);
+  }
+  return [ ...unique ];
+}
+
 /**
  * Where a supervisor's signals come from. The default is this process's own
  * signal handlers; anything else with the same two methods can deliver them,
@@ -353,8 +396,13 @@ export interface Supervisor {
   finish(): Promise<StopReport | null>,
 
   /**
-   * Removes the handlers without stopping anything. For when the spawn
-   * failed and there is no run to attach; otherwise use {@link finish}.
+   * Removes the handlers without stopping anything, for when the spawn
+   * failed and there is no run to attach. Once a run is attached it is
+   * refused: removing the handlers then would let the next signal end this
+   * process and orphan the detached run, or cut a stop short. Use
+   * {@link finish}, which stops what is still running first. A no-op after
+   * `finish` or an earlier `release`.
+   * @throws When a run is attached and supervision has not finished
    */
   release(): void,
 }
@@ -367,17 +415,27 @@ export interface Supervisor {
  *   signal to the spawned process, then once to its process group, then
  *   `SIGKILL` to the group once `options.graceMs` has passed.
  * - A signal before {@link Supervisor.attach} is held and acted on at attach.
- * - Any further signal during a stop sends `SIGKILL` at once.
+ * - Any further signal during a stop — one a signal started, or one
+ *   {@link Supervisor.finish} started — sends `SIGKILL` at once, to that same
+ *   stop. It never starts a second stop, and a signal that only hurried a
+ *   `finish` stop is not recorded as {@link Supervisor.stoppedBy}.
  * - A signal after the run has ended on its own stops nothing and is not
  *   recorded as {@link Supervisor.stoppedBy}.
  *
- * Call {@link Supervisor.finish} once the run has ended, or to end it, and
- * only then dispose of its home. Until `finish` or `release`, this process
- * cannot be ended by those signals; it must end itself.
+ * Call {@link Supervisor.attach} as soon as the spawn returns, before
+ * anything else that could throw, and {@link Supervisor.finish} once the run
+ * has ended, or to end it, and only then dispose of its home. Until `finish`
+ * or `release`, this process cannot be ended by those signals; it must end
+ * itself.
  * @param options - See {@link SupervisorOptions}
  * @returns The supervision of the run about to be spawned
+ * @throws When `options.graceMs` is not a finite number from 0 up, or
+ *   `options.signals` names anything but SIGHUP, SIGINT and SIGTERM; before
+ *   any handler is installed
  */
 export function superviseSignals(options: SupervisorOptions): Supervisor {
+  assertGrace(options.graceMs);
+  const supervised = signalsToSupervise(options.signals);
   const source = options.source ?? processSignals;
   const escalate = new AbortController();
   const emit = (event: SupervisorEvent) => options.onEvent?.(event);
@@ -408,7 +466,8 @@ export function superviseSignals(options: SupervisorOptions): Supervisor {
   };
 
   const onSignal = (signal: StopSignal) => {
-    if (requested !== null) {
+    // A stop under way, whoever started it, is hurried, never doubled.
+    if (requested !== null || report !== null) {
       if (!escalate.signal.aborted) {
         emit({ kind: 'escalating', signal });
         escalate.abort();
@@ -428,13 +487,13 @@ export function superviseSignals(options: SupervisorOptions): Supervisor {
   };
 
   const listeners = new Map<StopSignal, () => void>();
-  for (const signal of options.signals ?? stopSignals) {
+  for (const signal of supervised) {
     const listener = () => onSignal(signal);
     listeners.set(signal, listener);
     source.on(signal, listener);
   }
 
-  const release = () => {
+  const removeHandlers = () => {
     if (released) {
       return;
     }
@@ -442,6 +501,16 @@ export function superviseSignals(options: SupervisorOptions): Supervisor {
     for (const [ signal, listener ] of listeners) {
       source.off(signal, listener);
     }
+  };
+
+  const release = () => {
+    if (released) {
+      return;
+    }
+    if (run !== null) {
+      throw new Error('a run is attached; finish() stops it if need be and then releases the handlers');
+    }
+    removeHandlers();
   };
 
   return {
@@ -468,7 +537,7 @@ export function superviseSignals(options: SupervisorOptions): Supervisor {
         try {
           return report === null ? null : await report;
         } finally {
-          release();
+          removeHandlers();
         }
       })();
       return finishing;

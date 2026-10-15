@@ -248,8 +248,18 @@ job — ends `bare-claude` alone, and the run goes on unreported. A supervisor m
 
 `Claude stop:` says whether SIGKILL was needed and what was left in the group: `empty`,
 `still occupied after SIGKILL`, or `holds processes this user may not signal; left alone`. A run
-that ends without being asked is not signalled; if its group still has processes then, that is
-reported and left alone.
+that ends without being asked is not signalled. If its group still has processes then, they are
+left alone — they may be work the run meant to leave running — and reported as such, the home is
+kept rather than removed under them, and `bare-claude` stops reading the child's stdout and exits
+with `claude`'s own code even if one of them still holds that pipe open:
+
+```
+Claude process ended: exit code 0
+bare-claude: claude exited, but process group 41321 still has processes; they were not signalled and may still be running
+Claude home kept at /var/folders/…/bare-claude-home-…
+```
+
+That exit code says how the spawned process ended, not that everything the run started has.
 
 What a stop cannot do:
 
@@ -851,6 +861,8 @@ const claude = await spawnClaude({ callToAction: 'Explain this project to me' },
     supervisor.release();
     throw error;
   });
+// Attached at once, before anything else that could throw, and everything after it inside the
+// try whose finally finishes supervision: a detached run is never left with nobody to stop it.
 supervisor.attach(claude);
 try {
   const exitCode = await claude.subprocess.exited;
@@ -867,15 +879,22 @@ try {
 `superviseSignals(options)` takes `graceMs`, and optionally `signals` (default all three),
 `onEvent` — told of each `SupervisorEvent`: `held`, `stopping` (with its `cause`, a signal or
 `'finish'`), `escalating`, `after-exit` — and `source`, where signals come from (default this
-process). The `Supervisor` it returns has:
+process). It throws, before installing any handler, when `graceMs` is not a finite number from 0
+up or `signals` is not a list of SIGHUP, SIGINT and SIGTERM; a signal named twice is listened for
+once. `stopClaude` refuses such a `graceMs` too, before signalling anything. The `Supervisor` it
+returns has:
 
 - `attach(run)`: hands over the run; a held signal starts its stop now. One run per supervisor.
 - `finish()`: if the run is still going and nothing stopped it, stops it with SIGTERM; waits for
   any stop; then removes the handlers. Resolves with the `StopReport`, or `null` when there was no
-  stop. Idempotent. Call it before `dispose()`.
-- `release()`: removes the handlers without stopping anything, for a spawn that failed.
-- `stoppedBy`: the signal that stopped a running run, or `null`. A signal after the run had
-  already ended on its own is not one. `signalExitStatus(signal)` is the matching 128+n.
+  stop. Idempotent. Call it before `dispose()`. A signal during any stop, this one included,
+  sends SIGKILL to that same stop at once; it never starts a second one.
+- `release()`: removes the handlers without stopping anything, for a spawn that failed. Refused
+  once a run is attached: the next signal would then end the caller and orphan the detached run,
+  or cut its stop short. `finish()` is the way out from there.
+- `stoppedBy`: the signal that started the stop of a running run, or `null`. A signal after the
+  run had already ended on its own is not one, and neither is one that only hurried a stop
+  `finish()` started. `signalExitStatus(signal)` is the matching 128+n.
 
 Until `finish()` or `release()`, those signals do not end the calling process; it must end
 itself. Without `detached`, the child shares the caller's process group: a terminal's Ctrl-C

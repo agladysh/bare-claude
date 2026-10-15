@@ -275,6 +275,47 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('stop
     expect(run.stderr()).toContain(`bare-claude: received SIGHUP; sent it to claude (pid ${claude})`);
   }, 30_000);
 
+  test('a leftover holding the child\'s stdout does not hold the CLI: it exits, says what is left, keeps the home', async () => {
+    // A launcher that exits 0 at once and leaves a process behind in its
+    // group, with its stdout — the pipe the CLI drains — still open. Nobody
+    // asked for a stop, so it is not signalled; the CLI must still exit well
+    // before that process ends, and must not report the run as wholly over.
+    const { cwd, claudePid } = await setUp();
+    const launcher = path.join(await tempDir('launcher'), 'launcher');
+    await fs.writeFile(launcher, [
+      '#!/bin/sh',
+      'sleep 30 &',
+      'echo $! > "$FAKE_CLAUDE_PID_FILE"',
+      'exit 0',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    await fs.chmod(launcher, 0o755);
+
+    const startedAt = Date.now();
+    const run = startCli([ '--no-config', '--claude-path', launcher, '--quiet', 'hello' ], cwd, {
+      FAKE_CLAUDE_PID_FILE: claudePid,
+    });
+    expect(await run.cli.exited).toBe(0);
+    expect(Date.now() - startedAt).toBeLessThan(15_000);
+
+    const leftover = await pidFrom(claudePid);
+    expect(processGone(leftover)).toBe(false);
+    expect(await eventually(() => run.stderr().includes('Claude home kept at '), 2_000)).toBe(true);
+    const stderr = run.stderr();
+    const group = stderr.match(/^Claude process group (\d+)$/m)?.[1];
+    expect(group).toBeDefined();
+    expect(stderr).toContain(
+      `bare-claude: claude exited, but process group ${group} still has processes; `
+      + 'they were not signalled and may still be running\n'
+    );
+    expect(stderr).toContain('Claude process ended: exit code 0\n');
+    expect(stderr).not.toContain('Claude stop:');
+    const home = stderr.match(/^Claude home kept at (.+)$/m)?.[1] ?? '';
+    expect(path.isAbsolute(home) && path.basename(home).startsWith('bare-claude-home-')).toBe(true);
+    dirs.push(home);
+    expect(await fs.stat(home).then(stats => stats.isDirectory())).toBe(true);
+  }, 30_000);
+
   test('a run that ends on its own is not signalled, and its exit stands', async () => {
     const { cwd, home, claudePid } = await setUp();
     const run = startCli([ '--no-config', '--claude-home', home, '--quiet', 'hello' ], cwd, {

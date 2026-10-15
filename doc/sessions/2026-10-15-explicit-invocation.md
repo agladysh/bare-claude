@@ -1,7 +1,7 @@
 # 2026-10-15 — explicit invocation, caller-managed auth, file session seed, stopping a run
 
 Started at public `main` 90a7ff6 (0.9.0, `[Unreleased]` carrying the token file and
-`noBashEditDiff`). Written over three rounds by Opus 5.5 with file tools only: the author ran no
+`noBashEditDiff`). Written over four rounds by Opus 5.5 with file tools only: the author ran no
 shell, no typecheck, no tests, no `claude`, in any round. Between rounds, independent source
 reviews were made and the operating session ran the checks recorded under "What was run". One
 change in the candidate is the operating session's, not the author's: `src/preset.ts`'s merge was
@@ -36,7 +36,10 @@ test`:
   pass, 1 skip, 0 fail, 1192 `expect()` calls. The skip is the test that runs only under
   `BARE_CLAUDE_REQUIRE_CLONE=1`. Every seed test took the `[clone branch]`, so on that host the
   forced clone ran and the published journals were clones. All five termination tests passed.
-- **Round three:** nothing. Its new and changed tests are unrun as written.
+- **326fa42 (round three):** typecheck clean; 399 pass, 1 skip (the same conditional test), 0
+  fail. The seed tests again took the clone branch, and SIGHUP on a run with a temporary home
+  exited 129.
+- **Round four:** unrun at authoring. The operating session runs it and records the result here.
 
 What those passes establish is their scope: one macOS host, one Bun version, fakes for `claude`
 and for a launcher. In particular they show, on that host, that `process.kill` with a negative PID
@@ -129,6 +132,29 @@ of it; `engines` admits any Bun from 1.3, and later versions have not been read.
   no longer reaches it. Round two reported the group only for kept homes. Now every run does; the
   README and CHANGELOG state the contract: signal `bare-claude` itself and allow it
   `--stop-grace-ms` plus 5 seconds before a kill of one's own, or signal the reported group.
+- **One stop at a time, bounded by construction (round four).** A review of 326fa42 found that a
+  signal during a stop `finish()` had started began a second stop, with a fresh grace, where the
+  documentation promised SIGKILL at once; that a list naming a signal twice installed a handler
+  `release()` could not remove, so the process stopped exiting on that signal for good; and that
+  an absent `graceMs` from an untyped caller made the deadline NaN, so SIGKILL never came. Any
+  signal during any stop now escalates that stop; inputs are validated before the first handler
+  is installed or the first signal sent; signals are deduplicated.
+- **`release()` is refused once a run is attached (round four).** It used to remove the handlers
+  mid-run or mid-stop, after which the next signal ended the caller and orphaned the detached
+  run. Documenting that as the caller's responsibility would leave a public function whose only
+  use after `attach` is a mistake; `finish()` already covers every legitimate case, stopping what
+  is still running before it lets go.
+- **Attach before anything fallible (round four).** The CLI wrote its stdout and stderr lines
+  between the spawn and `attach`; a write to a closed pipe there would have left the detached
+  child unattached and running. It now attaches as soon as the spawn returns, and everything
+  after is inside the `try` whose `finally` finishes supervision.
+- **Leftovers after a natural exit (round four).** Something the run left in its group may hold
+  the child's stdout pipe, which the CLI drains; a read pending on it could keep the CLI alive
+  until that process ended. Once supervision has finished, the CLI cancels its own reader — the
+  pipe is one it created for this run, nobody else's — and the leftovers are reported as not
+  signalled and possibly still running, and the home is kept rather than removed under them. The
+  exit code stays the spawned process's own: it never says that everything the run started has
+  ended.
 - **A signal after the run ended on its own is not its outcome (round three).** Round two turned
   any first signal into 128+n, even one that arrived after `claude` had exited with its own code.
 - **A failed spawn takes back what it published.** The journal is removed only while the path
@@ -175,6 +201,9 @@ is a clone. The platform does not decide it — macOS does not imply APFS. Test 
   unnecessary. The latest review confirms it never requested a lock.
 - **Round two's report** also listed as unestablished three Bun behaviours that the 9742078 run
   then exercised, and said every test was unrun after that run existed.
+- **Round three's supervisor** broke its own documented promise when a signal arrived during a
+  `finish()` stop, and accepted inputs that made it leak a handler or never escalate (above).
+- **Round three's report** said its tests were unrun after root had run them on 326fa42.
 - **Round two's README library example** was unsafe (above); **its CHANGELOG** carried a truncated
   duplicate of the `noBashEditDiff` entry, now removed.
 - **Review finding, rebutted in part:** "on macOS the clone tests must require the clone branch".
@@ -190,10 +219,11 @@ is a clone. The platform does not decide it — macOS does not imply APFS. Test 
   CLI followed by the runner signalling the reported group, each leaving the group empty.
 - **`setsid()` and Claude Code**: a detached child has no controlling terminal. That `claude
   --print` does not need one was not checked.
-- **Round three's tests**, as said above, and in particular: a signal held during a CLI spawn is
-  tested only through the library supervisor, where the test controls the timing.
-- **Leftovers after a natural exit**: reported and left alone. Whether one holding the child's
-  stdout pipe keeps the CLI from exiting was not checked.
+- **Round four's tests**, as said above. A signal held during a CLI spawn is tested only through
+  the library supervisor, where the test controls the timing; a write failing between spawn and
+  attach is not tested at all, only removed as a possibility by the order of the code.
+- **A leftover holding the CLI's own stdout or stderr**, under `--print` or otherwise: the CLI
+  does not read those, so they cannot hold it, but they keep a pipeline downstream of it open.
 - **A narrow window remains** where `claude` has exited but Bun has not yet observed it: a signal
   then starts a stop of an exited process and the status is 128+n.
 - **A held signal followed by a failed spawn** exits 1 with the failure's message: there was
@@ -205,3 +235,7 @@ is a clone. The platform does not decide it — macOS does not imply APFS. Test 
   paths in `src/token.ts`, `src/install.ts`, earlier session reports and
   `session-events-example.txt`. The two `src/` files ship in the package; cleaning them is a
   separate change.
+
+## Root verification of supervisor edge repairs
+
+On 16 October 2026 at 00:51 UTC+03:00, Codex (AI) ran `bun run typecheck` and `bun test` on the preceding source changes. Type checking passed; the suite reported 405 pass, 1 conditional skip and 0 fail across 20 files. These are synthetic process and wrapper checks, not native managed-launcher acceptance. The exact check outputs remain in the receiving maintainer's run custody. The new edge cases ran, including the signal during `finish()`, invalid inputs, duplicate-handler release and the natural-exit leftover holding the child pipe.
