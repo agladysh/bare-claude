@@ -1,5 +1,39 @@
 # Changelog
 
+## [v0.14.0] - 2026-10-16
+
+### Added
+
+- **Custody briefs**: `--brief`, with `--outcome-custody` or `--outcome-batch`, and `briefCustody()`
+  from `@agladysh/bare-claude/custody`. A brief (`custodyBriefVersion` 1) is a compact projection of
+  a `readCustody` reading, made from that reading alone and printed on one line.
+  - **What it keeps.** The state; how custody ended the run; how its session began; the measured
+    figures, each in its own scope (`lastCall`, `contextWindow`, `process`, `session`,
+    `inheritedTotals`, `appended`); and the size and digest of stdout, stderr and the journal.
+  - **What it leaves out.** The call to action; the result's text, error text and API-error text;
+    stderr; `basis` and `problems` text; `extraArgs`; and the environment. Nothing else is left
+    out, so a brief is not redaction: paths, session ids, model names, one-word native codes and
+    the call to action's digest pass as recorded.
+  - **Lineage.** In a batch, or when `predecessors` are given, each run's predecessors are sought
+    among the readings given, link by link, by the digest of the bytes the run seeded and nothing
+    else. Each link says what was inherited through it. A shared session id is a hint
+    (`sameSession`), never a link. A run with no readable start is linked to nothing, whatever
+    digest its invocation required.
+  - **Batch.** Each directory is read once, at its physical path. `result` and `journal` lines are
+    per-line errors, and the exit status is 0 unless the requests cannot be read.
+  - **No silent `--brief`.** Without `--outcome-custody` or `--outcome-batch`, `--brief` is
+    refused rather than ignored. `--help` still prints the help.
+  - **Limits.**
+    - `contextWindow` is `null` whenever the result's models report different windows, as
+      observed of results naming an Opus and a Haiku model. Nothing compares a prompt with a
+      window.
+    - Costs are Claude Code's own reported dollar figures: not a bill, and not subscription usage.
+    - A brief is not reception of the run's return. The return is read from the stdout file the
+      brief names and checked against the digest the brief gives. A brief says nothing of whether
+      the task was done, delivered, received or accepted.
+
+  Without `--brief`, readings are printed as before.
+
 ## [v0.13.0] - 2026-10-16
 
 ### Added

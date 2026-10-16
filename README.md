@@ -88,10 +88,10 @@ The Anthropic API key use and alternate model provider use should be okay.
 
 ## Installation
 
-Releases are cut as Git tags. To install this release, 0.13.0, from its tag:
+Releases are cut as Git tags. To install this release, 0.14.0, from its tag:
 
 ```bash
-bun add github:agladysh/bare-claude#v0.13.0
+bun add github:agladysh/bare-claude#v0.14.0
 ```
 
 A tag is a name. A consumer that depends on what it installed should record the commit that name
@@ -174,6 +174,9 @@ Options:
   [Reading a custody directory](#reading-a-custody-directory))
 - `--outcome-batch [file|-]`: read many result/journal or custody requests in one process, one JSON
   line each
+- `--brief`: with `--outcome-custody` or `--outcome-batch`, print a compact brief of each custody
+  directory instead of its reading; refused with any other mode (see
+  [Briefing a custody directory](#briefing-a-custody-directory))
 - `--doctor`: report what a run needs and exit 1 when something required is missing
   (see [Doctor](#doctor))
 - `--effort [level]`: `low`, `medium`, `high` (default), `xhigh` or `max`
@@ -1012,6 +1015,236 @@ throws, resolving with a `CustodyReading`: `CustodyState`, `CustodyRecordReading
 `CustodyJoin` and `RecordedDigest`, with the constants `custodyReadingVersion`, `custodyReadingScope` and
 `stdoutProvenance`.
 
+### Briefing a custody directory
+
+```bash
+bare-claude --outcome-custody /work/runs/0042 --brief
+```
+
+`--brief` prints a brief on one line in place of the reading
+(`format: "bare-claude/custody-brief"`, `version` 1). A brief is a projection of the reading
+[`--outcome-custody`](#reading-a-custody-directory) makes, and of nothing else. The directory is
+read exactly as it is without `--brief`, and nothing is spawned, signalled or written. The brief
+keeps what a supervisor or a log needs to say what became of a run: its state, how custody ended
+it, how its session began, its measured figures each in its own scope, and the size and digest of
+its stdout, stderr and journal. It leaves out the call to action; the result's text, error text
+and API-error text; stderr; the reading's `basis` and `problems` text (`problems` becomes a count);
+`extraArgs`; and anything from the environment. Every field is copied by name, so nothing else
+attached to a reading passes through. The exit status is the same as for `--outcome-custody`: 1
+only when the directory cannot be listed, and even then a brief with `state: "unreadable"` is
+printed.
+
+A continued session is best read as a chain of runs, with the runs in one batch:
+
+```bash
+printf '%s\n' '{"id":"0041","custody":"/work/runs/0041"}' '{"id":"0042","custody":"/work/runs/0042"}' \
+  | bare-claude --outcome-batch - --brief
+```
+
+- **Output.** Each non-empty input line gets one output line, in order:
+  `{"reader", "line", "id", "brief", "error"}`.
+- **Reading.** Every distinct directory is read once, at its physical path. All of them are read
+  before any brief is made, because the batch's own custody lines are where each run's lineage is
+  sought.
+- **Other lines.** A `result` or `journal` line is that line's `error`
+  (`--brief reads custody lines only`), because those readings carry error text that a brief
+  leaves out. A malformed line keeps its own error.
+- **Exit status.** 0, unless the requests themselves cannot be read.
+- **Other modes.** `--brief` without `--outcome-custody` or `--outcome-batch` is refused with
+  exit 1 rather than ignored. That covers `--brief` on its own, beside `--outcome`, `--version`,
+  `--usage` or `--display`, and on a run. Only `--help` takes precedence.
+
+An illustrative example: run 0042 continued the session of run 0041, seeded from 0041's journal by
+path, and 0042's line from that batch carries this `brief`. The paths, ids and figures are
+invented, though consistent with one another. It is pretty-printed here, though the CLI prints it
+on one line. Digests, the session id and the two constant sentences, `scope` and `costBasis`, are
+shortened with `…`.
+
+```json
+{
+  "format": "bare-claude/custody-brief",
+  "version": 1,
+  "scope": "one custody reading without its named payload fields (…); not redaction. …",
+  "reader": { "name": "@agladysh/bare-claude", "version": "0.14.0" },
+  "directory": "/work/runs/0042",
+  "read": "2026-10-16T12:00:00.000Z",
+  "state": "exited",
+  "problems": 0,
+  "inPlace": true,
+  "run": {
+    "packageVersion": "0.14.0", "launcher": "claude", "model": "opus", "effortLevel": "high",
+    "callToAction": { "bytes": 41, "sha256": "9c1e…" }
+  },
+  "end": { "outcome": "exited", "exitCode": 0, "signalCode": null, "stopCause": null, "custodyError": false },
+  "session": {
+    "kind": "file",
+    "sessionId": "0199e7a0-…",
+    "sourcePath": "/work/runs/0041/home/projects/-work-checkout/0199e7a0-….jsonl",
+    "requiredSha256": "b07d…",
+    "seeded": { "bytes": 1843310, "sha256": "b07d…" }
+  },
+  "lineage": {
+    "links": [
+      {
+        "directory": "/work/runs/0041", "matchedBy": [ "completion.journal", "journal as read" ],
+        "state": "exited", "inheritedCall": { "status": "read", "prompt": 212000, "output": 3100 },
+        "contextLimit": false, "compactions": 0
+      }
+    ],
+    "end": { "status": "fresh", "candidates": [], "sameSession": [] }
+  },
+  "result": {
+    "status": "read", "basis": "json-requested", "file": "result", "resultStatus": "no-error",
+    "terminalReason": "completed", "stopReason": "end_turn", "numTurns": 23, "apiErrorStatus": null,
+    "contextLimit": null, "sessionId": "0199e7a0-…"
+  },
+  "join": { "kind": "joined", "over": "appended" },
+  "measured": {
+    "lastCall": { "prompt": 387000, "output": 2400, "from": "result" },
+    "contextWindow": null,
+    "process": { "tokens": { "input": 41, "cacheCreation": 9120, "cacheRead": 3650000, "output": 18300 }, "durationMs": 412000 },
+    "session": { "costUsd": 31.8, "apiDurationMs": 690000, "models": [ "claude-opus-5-5", "claude-haiku-4-5-20251001" ] },
+    "inheritedTotals": { "status": "read", "costUsd": 14.2, "apiDurationMs": 301000 },
+    "costBasis": "Claude Code's own reported dollar figure: …",
+    "appended": {
+      "segments": 1, "openTail": false, "versions": [ "2.1.292" ], "unmeasuredCalls": 0,
+      "apiErrors": 0, "contextLimitErrors": 0, "compactions": 0, "preTokens": []
+    }
+  },
+  "stdout": { "path": "/work/runs/0042/stdout", "bytes": 5210, "sha256": "41aa…", "changedSinceCompletion": false },
+  "stderr": { "path": "/work/runs/0042/stderr", "bytes": 0, "sha256": "e3b0…", "changedSinceCompletion": false },
+  "journal": {
+    "path": "/work/runs/0042/home/projects/-work-checkout/0199e7a0-….jsonl",
+    "sessionId": "0199e7a0-…",
+    "atCompletion": { "exists": true, "bytes": 2390114, "sha256": "77c2…" },
+    "changedSinceCompletion": false,
+    "boundary": "seeded"
+  }
+}
+```
+
+**The figures, each in its own scope:**
+
+- **`measured.lastCall`** is one API call. It is the result's last `usage.iterations` entry
+  (`from: "result"`), or else the last measured call this run appended to its journal
+  (`from: "appended journal"`). Its `prompt` is what that one call sent.
+- **`measured.contextWindow`** is the context window the result reports when every model that
+  reports one reports the same, and `null` when no model reports one or models report different
+  windows. Results have been observed naming an Opus and a Haiku model with different windows, so
+  `null` is the ordinary value for such runs. The brief then relates `lastCall.prompt` to no window. In neither
+  case does it apply a threshold, compute a ratio, or say why a run ended near a limit.
+- **`measured.process`** is the result's sums over this process's calls. It has no prompt: the
+  cache reads above, summed over many calls, are not a context size.
+- **`measured.session`** is cumulative over the whole session, including earlier processes of a
+  resumed session. `models` leaves out any name that is not one word.
+- **`measured.inheritedTotals`** is where the session's totals stood in the seeded bytes, from the
+  last `cost-state` record those bytes hold (`status: "read"`); otherwise `nothing-seeded`,
+  `no-cost-state`, or `unknown` when the journal was not read or its seeded bytes cannot be told
+  apart. The
+  brief does not subtract it from `session`.
+  Whether Claude Code resumes its totals from that record is not established, so the two are
+  figures side by side, not a difference.
+- **Costs.** Every `costUsd` is what `costBasis` says it is: Claude Code's own reported dollar
+  figure. It is not a bill, and it is not subscription usage, which `--usage` reports.
+- **`measured.appended`** counts only what this run appended after its seeded bytes: segments,
+  API errors, context-limit errors, and compactions with their `preTokens`. It never counts an
+  inherited record. It is `null` when this run's records cannot be told from inherited ones, as in
+  a session continued under 0.12.0, or when the journal was not read.
+- **`result` and `join`.** `result` carries classifications and counts only. `join` carries the
+  reading's `kind` and `over`.
+
+**Lineage.** `lineage.links` lists a run's predecessors, nearest first. A predecessor is a run
+whose journal has the digest of the bytes this run seeded, either as its completion recorded it or
+as read (`matchedBy`). Each link is followed the same way. The digest used is `session.seeded`,
+which the spawn measured. For a start written by 0.12.0, which recorded no seed, it is
+`requiredSha256`, the digest without which the spawn refused to seed.
+
+Each link says what the run after it inherited. `inheritedCall` is the predecessor's last measured
+call, whose prompt Claude Code reads back as the context size on resume. It is known
+(`status: "read"`) only while the predecessor's journal, as read, is exactly the seeded bytes;
+otherwise it is `journal-differs`, `journal-not-read` or `no-measured-call`. A link also gives the
+predecessor's `state`, whether it showed a context limit, and how many compactions it appended.
+
+`lineage.end.status` says where the chain stops:
+
+| Status | Meaning |
+| --- | --- |
+| `fresh` | the last run in the chain started a fresh session. The chain is whole |
+| `not-sought` | no predecessors were given to look among. A single `--outcome-custody --brief` of a continued run whose records agree on a digest always reads so |
+| `unknown` | the records do not say what was seeded: there is no readable start, or there is a 0.12.0 start with no readable invocation. A digest the invocation required is not bytes seeded, since a run that never started has one too |
+| `no-digest` | it continued a session, but no record holds a digest of what it seeded: records written by 0.12.0, with a memory seed or a file seed that required no digest. A start written since 0.13.0 records the seeded digest |
+| `conflict` | its records disagree about what was seeded |
+| `ambiguous` | several journals given have the digest, and `candidates` lists them; none is chosen. A directory and its copy do this, for example, and so do identical journals from distinct runs that appended nothing |
+| `source-differs` | no journal given has the digest, and `candidates` are the runs whose recorded journal path is the source the invocation named. Their completion digest differs from the bytes seeded, and so does their digest as read, where the journal was read |
+| `unresolved` | no journal given has the digest. The predecessor may not be among those given. Bytes preloaded into a seed also change the digest |
+| `cycle` | the next predecessor is already in the chain, which runs that appended nothing can cause |
+
+`fresh`, `unknown`, `no-digest` and `conflict` come from the run's own records, so they read the
+same with or without predecessors.
+
+- **A session id never makes a link.** A session can be continued from any of its journals, or from
+  bytes no custody kept. Under `no-digest` and `unresolved`, `sameSession` lists the runs given
+  that share the session id, as a hint only: a run's own successors share it too.
+- **The search covers the readings given and nothing else.** Nothing on disk is searched. A
+  predecessor missing from the batch leaves the chain `unresolved`.
+- **`fresh` describes the invocation.** One that started a fresh session reads `fresh` even with no
+  start record. That is no evidence that anything ran; `state` says whether it did.
+
+**Directory names.**
+
+- **Batch briefs** name each directory by its physical path. A directory named twice, through a
+  symbolic link for example, is one reading.
+- **A copy is another directory.** It reads `inPlace: false`. Its journal path still names the
+  original's journal, so that journal is not read. Given beside its original, the copy makes a
+  successor's lineage `ambiguous`.
+- **A single `--outcome-custody --brief`** names the directory as given, made absolute. The two
+  modes can therefore spell one directory differently.
+- **`briefCustody` called directly** compares directories as strings. A caller should read at
+  physical paths, as the CLI does; otherwise an alias reads as `ambiguous`.
+- **`source-differs`** compares source paths as recorded.
+
+**Continuing from a brief.** `journal.path`, `journal.sessionId` and `journal.atCompletion.sha256`
+describe the journal a continuation would seed from, but only while `journal.changedSinceCompletion`
+is `false`. The brief does not offer a continuation any more than the reading does. Establishing
+that nothing still writes the session is the caller's responsibility.
+
+**Not redaction.** A brief leaves out the named fields above, and nothing more. It carries, as
+recorded:
+
+- absolute paths and directory names, journal paths included, whose project key spells out the
+  run's working directory;
+- session ids, and the model and effort level from the invocation;
+- native one-word values, whatever they say: terminal and stop reasons, versions, model names;
+- the call to action's size and SHA-256, which can confirm a guessed prompt.
+
+A native string is `null`, or left out of a list, in two cases: when it was not recorded, and when
+it is not one word of at most 128 printable characters. A `null` `terminalReason` does not say
+which. That rule keeps native sentences out of a brief. It does not make a brief safe to publish.
+
+**Not reception.** Printing, logging or showing a brief is not reception of the run's return. The
+return is the stdout file the brief names: a receiver reads those bytes from `stdout.path` and
+checks them against `stdout.sha256`. A brief shows what the records say. It does not show whether
+the task was done, delivered, received or accepted.
+
+**Programmatically**, from `@agladysh/bare-claude/custody`, `briefCustody(reading, predecessors?)`
+makes a brief. It is pure, and works over readings `readCustody` made. Without `predecessors`,
+lineage is not sought. With them, `reading` itself is skipped by directory, and a directory given
+twice counts once.
+
+```typescript
+import { briefCustody, readCustody } from '@agladysh/bare-claude/custody';
+
+// Physical paths, as the CLI's batch uses.
+const directories = [ '/work/runs/0041', '/work/runs/0042' ];
+const readings = await Promise.all(directories.map(directory => readCustody(directory)));
+const briefs = readings.map(reading => briefCustody(reading, readings));
+```
+
+The brief is a `CustodyBrief`, made of `BriefRun`, `BriefEnd`, `BriefSession` (with `BriefSeeded`),
+`BriefLineage` (`LineageLink`, `LineageEnd`, `LineageEndStatus`, `LineageMatch`,
+`LineageInheritedCall`), `BriefResult`, `BriefMeasured` (`BriefInheritedTotals`, `BriefAppended`),
+`BriefOutput` and `BriefJournal`. Its constants are `custodyBriefVersion`, `custodyBriefScope`
+and `briefCostBasis`.
 
 ## Doctor
 
