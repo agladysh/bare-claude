@@ -11,13 +11,18 @@
  * stdout. No real `claude`, model, or credential is involved; `runCli` keeps
  * the operator's real token file out of reach.
  */
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import { cloneBranch, makeTempRepo, runCli } from './helpers.ts';
+
+// These tests start real Bun CLI processes. With Bun 1.3.13 on 16 October
+// 2026, unchanged baseline cases exceeded the default five-second budget.
+// Keep a 20-second hang bound; retain explicit latency assertions where tested.
+setDefaultTimeout(20_000);
 
 const dirs: string[] = [];
 

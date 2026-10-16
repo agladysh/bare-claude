@@ -10,12 +10,17 @@
  * unless a test says otherwise, so the operator's real token file is never
  * read here.
  */
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import { makeTempRepo, runCli } from './helpers.ts';
+
+// These tests start real Bun CLI processes. With Bun 1.3.13 on 16 October
+// 2026, unchanged baseline cases exceeded the default five-second budget.
+// Keep a 20-second hang bound; retain explicit latency assertions where tested.
+setDefaultTimeout(20_000);
 
 const echo = { FAKE_CLAUDE_ECHO_ENV: 'CLAUDE_CODE_OAUTH_TOKEN' };
 

@@ -16,10 +16,15 @@
  * never loads this repository's own `bare-claude.yaml`, which points at a
  * real `lmstudio` preset that has nothing to do with these tests.
  */
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import fs from 'node:fs/promises';
 
 import { makeTempRepo, runCli } from './helpers.ts';
+
+// These tests start real Bun CLI processes. With Bun 1.3.13 on 16 October
+// 2026, unchanged baseline cases exceeded the default five-second budget.
+// Keep a 20-second hang bound; retain explicit latency assertions where tested.
+setDefaultTimeout(20_000);
 
 const tempRepos: string[] = [];
 
