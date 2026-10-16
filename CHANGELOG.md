@@ -1,5 +1,36 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Run custody**: `--custody DIR`, `custody:` in a configuration file, and `runInCustody()` from
+  `@agladysh/bare-claude/custody`. One run in a fresh directory, mode 0700, every record created
+  once and never rewritten: its invocation before the spawn; the spawned process's own stdout and
+  stderr, byte for byte, written by it through its own descriptors; a start record after the
+  spawn; and a versioned completion — how the spawned process ended (`exited`, `stopped` or
+  `not-started`), the stop and its cause, its group's `readProcessGroup` reading, and the size and
+  digest of each output and of the journal. Stopped through `superviseSignals`; an `AbortSignal`
+  cancels. Invocation-only and start-only directories are unknown outcomes, and say so. No
+  continuation is offered: an empty group does not show every writer gone, and continuing is the
+  caller's to establish. Events reach the caller's code as they happen — `onEvent`, and under the
+  CLI one JSON line each on stdout, which then carries nothing else — as transport, not receipt; a
+  reader that goes away ends the stream, not the run. An optional `identify(pid)` records the
+  caller's own reading of the process's identity; custody claims nothing from a PID. Custody's
+  records hold no environment value, settings document or token; `extraArgs` are recorded as
+  given, and the directory's `home/` holds what any kept Claude home holds.
+- **`--config` may be given several times**, and `loadConfigFiles()` from
+  `@agladysh/bare-claude/config` with `composeConfigs()` from `@agladysh/bare-claude/preset`
+  compose the files in order: named presets pooled, root presets merged as presets merge. A preset
+  name two files define, a root `use` in two files, and a file named twice are refused. One shared
+  profile and one run's own declaration no longer have to be copied into one file. `--doctor`
+  still checks one named file, and refuses several.
+
+### Changed
+
+- The README's single-file invocation example declares `quiet` and `print` in the file rather than
+  on the command line, as a whole declaration should.
+
 ## [v0.10.0] - 2026-10-16
 
 ### Fixed

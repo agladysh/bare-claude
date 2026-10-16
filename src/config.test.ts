@@ -6,8 +6,9 @@ import path from 'node:path';
 
 import { type } from 'arktype';
 
-import { emptyConfig, loadConfig, locateConfig, parseConfig, sessionIdSchema } from './config.ts';
+import { emptyConfig, loadConfig, loadConfigFiles, locateConfig, parseConfig, sessionIdSchema } from './config.ts';
 import { sessionIdPattern } from './index.ts';
+import { composeConfigs, resolveInvocation } from './preset.ts';
 
 const repositoryConfig = path.join(import.meta.dir, '..', 'bare-claude.yaml');
 
@@ -236,6 +237,91 @@ describe('loadConfig', () => {
       await expect(loadConfig({ kind: 'file', path: path.join(dir, 'absent.yaml') }, dir))
         .rejects.toThrow('does not exist');
       await expect(loadConfig({ kind: 'located' }, dir)).rejects.toThrow('not inside a Git working copy');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('custody in a configuration file', () => {
+  test('is a directory and, optionally, keepCallToAction; nothing else', () => {
+    expect(parseConfig('custody:\n  directory: /runs/1\n  keepCallToAction: true\n').configPreset)
+      .toEqual({ custody: { directory: '/runs/1', keepCallToAction: true } });
+    expect(() => parseConfig('custody:\n  keepCallToAction: true\n')).toThrow('directory');
+    expect(() => parseConfig('custody:\n  directory: /runs/1\n  continuation: true\n')).toThrow('continuation');
+  });
+});
+
+describe('composed configuration files', () => {
+  const profile = [
+    'effortLevel: low',
+    'read: profile.md',
+    'extraArgs: [--from-profile-root]',
+    'presets:',
+    '  worker:',
+    '    model: from-profile',
+    '    tools: [Read]',
+    '    extraArgs: [--from-profile-preset]',
+    '',
+  ].join('\n');
+  const declaration = [
+    'use: worker',
+    'model: from-run',
+    'read: [run.md]',
+    'extraArgs: [--from-run]',
+    'callToAction: "# the run\'s own"',
+    '',
+  ].join('\n');
+
+  test('compose as one file would: later roots win, arrays concatenate, use reaches every file\'s presets', () => {
+    const composed = composeConfigs([
+      { source: 'profile.yaml', config: parseConfig(profile, 'profile.yaml') },
+      { source: 'run.yaml', config: parseConfig(declaration, 'run.yaml') },
+    ]);
+    expect(composed.configPreset).toEqual({
+      effortLevel: 'low',
+      model: 'from-run',
+      read: [ 'profile.md', 'run.md' ],
+      extraArgs: [ '--from-profile-root', '--from-run' ],
+      callToAction: '# the run\'s own',
+      use: 'worker',
+    });
+
+    // The root wins over what it uses, as within one file.
+    const preset = resolveInvocation(composed, {});
+    expect(preset).toMatchObject({
+      model: 'from-run',
+      effortLevel: 'low',
+      tools: [ 'Read' ],
+      extraArgs: [ '--from-profile-preset', '--from-profile-root', '--from-run' ],
+    });
+  });
+
+  test('a preset name in two files, or a root use in two, is refused rather than guessed', () => {
+    const named = (source: string, yaml: string) => ({ source, config: parseConfig(yaml, source) });
+    expect(() => composeConfigs([
+      named('a.yaml', 'presets:\n  worker:\n    model: a\n'),
+      named('b.yaml', 'presets:\n  worker:\n    model: b\n'),
+    ])).toThrow('preset "worker" is defined in both a.yaml and b.yaml');
+    expect(() => composeConfigs([
+      named('a.yaml', 'use: x\npresets:\n  x:\n    model: a\n'),
+      named('b.yaml', 'use: y\npresets:\n  y:\n    model: b\n'),
+    ])).toThrow('both a.yaml and b.yaml name a root use');
+  });
+
+  test('loadConfigFiles reads each file, which must exist, once', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bare-claude-config-test-'));
+    try {
+      const first = path.join(dir, 'profile.yaml');
+      const second = path.join(dir, 'run.yaml');
+      await Bun.file(first).write(profile);
+      await Bun.file(second).write(declaration);
+
+      expect((await loadConfigFiles([ first, second ])).configPreset.model).toBe('from-run');
+      expect(Object.keys((await loadConfigFiles([ first, second ])).presets)).toEqual([ 'worker' ]);
+      await expect(loadConfigFiles([ first, path.join(dir, 'absent.yaml') ])).rejects.toThrow('does not exist');
+      await expect(loadConfigFiles([ first, first ])).rejects.toThrow('is named twice');
+      await expect(loadConfigFiles([])).rejects.toThrow('no configuration file is named');
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }

@@ -1,5 +1,6 @@
 import type { LaunchOptions } from '@agladysh/bare-claude';
 import type { Config } from '@agladysh/bare-claude/config';
+import type { CustodyDeclaration } from '@agladysh/bare-claude/custody';
 import type { PreloadEntry } from '@agladysh/bare-claude/preload';
 import { deepmergeIntoCustom } from 'deepmerge-ts';
 
@@ -32,6 +33,14 @@ export interface Preset extends LaunchOptions {
    * 10000.
    */
   stopGraceMs?: number;
+
+  /**
+   * Keep the run in custody (`@agladysh/bare-claude/custody`): a fresh
+   * directory holding its invocation, raw output, start and completion. The
+   * CLI then renders no transcript, writes one JSON custody event per line to
+   * stdout and nothing else there, and refuses `print`.
+   */
+  custody?: CustodyDeclaration;
 }
 
 /**
@@ -149,6 +158,59 @@ function resolvePresetImpl(
  */
 export function resolvePreset(preset: DynamicPreset, presets: Record<string, DynamicPreset>): Preset {
   return completePreset(resolvePresetImpl(preset, presets, []));
+}
+
+/** One configuration file's contents, and the path to name it by, for {@link composeConfigs}. */
+export interface ConfigLayer {
+  source: string,
+  config: Config,
+}
+
+/**
+ * Composes configurations given in order — a shared profile, say, then one
+ * run's own declaration — into one, as though they were one file:
+ *
+ * - Named presets are pooled. A name two layers define is refused: which one
+ *   a `use` meant would be a guess.
+ * - Root presets merge left to right, as presets merge: a later layer's
+ *   scalars win, records merge key by key, arrays concatenate. `read` is
+ *   made a list first, so a bare string concatenates too.
+ * - At most one layer's root may name a `use`, which is never merged; two
+ *   are refused. `--use` still replaces whichever there is.
+ *
+ * A single layer comes back as it went in, but for `read` being a list.
+ * @param layers - Configurations, least significant first
+ * @returns The composed configuration
+ * @throws When two layers define the same named preset, or two roots name a `use`
+ */
+export function composeConfigs(layers: readonly ConfigLayer[]): Config {
+  const presets: Record<string, DynamicPreset> = {};
+  const definedIn = new Map<string, string>();
+  let root: DynamicPreset = {};
+  let rootUse: { source: string, use: string | string[] } | null = null;
+
+  for (const { source, config } of layers) {
+    for (const [ id, preset ] of Object.entries(config.presets)) {
+      const earlier = definedIn.get(id);
+      if (earlier !== undefined) {
+        throw new Error(`preset "${id}" is defined in both ${earlier} and ${source}; a name must mean one preset`);
+      }
+      definedIn.set(id, source);
+      presets[id] = preset;
+    }
+
+    const { use, read, ...fields } = config.configPreset;
+    if (use !== undefined) {
+      if (rootUse !== null) {
+        throw new Error(`both ${rootUse.source} and ${source} name a root use; name it in one of them, or with --use`);
+      }
+      rootUse = { source, use };
+    }
+    const layer: DynamicPreset = read === undefined ? fields : { ...fields, read: Array.isArray(read) ? read : [ read ] };
+    root = mergePresets(root, layer);
+  }
+
+  return { configPreset: rootUse === null ? root : { ...root, use: rootUse.use }, presets };
 }
 
 /**

@@ -2,7 +2,7 @@ import path from 'node:path';
 
 import { scope, type } from 'arktype';
 
-import type { DynamicPreset } from '@agladysh/bare-claude/preset';
+import { composeConfigs, type ConfigLayer, type DynamicPreset } from '@agladysh/bare-claude/preset';
 
 /**
  * Runtime schema for `bare-claude.yaml`.
@@ -105,6 +105,7 @@ const preset = type({
   'verbose?': 'boolean',
   'debug?': 'boolean',
   'stopGraceMs?': 'number.integer >= 0',
+  'custody?': type({ '+': 'reject', directory: 'string', 'keepCallToAction?': 'boolean' }),
 
   // Preloaded context. `read` is preload's file/glob case, kept separate
   // because it is also a flag.
@@ -243,7 +244,7 @@ export async function locateConfig(cwd: string = process.cwd()): Promise<string 
  * - `located`: `bare-claude.yaml` at the root of the Git working copy, see
  *   {@link locateConfig}. Optional: a missing file is the empty configuration.
  * - `file`: the file at `path`, which must exist. No Git working copy is
- *   needed.
+ *   needed. Several named files are read by {@link loadConfigFiles}.
  * - `none`: no file at all, so nothing but the caller's own options and the
  *   library defaults applies — in particular nothing from a repository's
  *   example configuration.
@@ -266,13 +267,8 @@ export async function loadConfig(source: ConfigSource, cwd: string = process.cwd
     case 'none':
       return emptyConfig();
 
-    case 'file': {
-      const file = Bun.file(source.path);
-      if (!await file.exists()) {
-        throw new Error(`configuration file ${source.path} does not exist`);
-      }
-      return parseConfig(await file.text(), source.path);
-    }
+    case 'file':
+      return readConfigFile(source.path);
 
     case 'located': {
       const configPath = await locateConfig(cwd);
@@ -289,6 +285,43 @@ export async function loadConfig(source: ConfigSource, cwd: string = process.cwd
       return parseConfig(await file.text(), configPath);
     }
   }
+}
+
+/** A named configuration file, which must exist, validated. */
+async function readConfigFile(configPath: string): Promise<Config> {
+  const file = Bun.file(configPath);
+  if (!await file.exists()) {
+    throw new Error(`configuration file ${configPath} does not exist`);
+  }
+  return parseConfig(await file.text(), configPath);
+}
+
+/**
+ * Reads named configuration files, each of which must exist, validates each
+ * on its own, and composes them in order with `composeConfigs` from
+ * `@agladysh/bare-claude/preset`: later files over earlier ones, named
+ * presets pooled. One canonical profile and one run's own declaration, say,
+ * neither copied into the other. No Git working copy is needed.
+ * @param paths - The files, least significant first
+ * @returns The composed configuration
+ * @throws When no file, or one file twice, is named; when a file does not
+ *   exist or is invalid; when the files do not compose
+ */
+export async function loadConfigFiles(paths: readonly string[]): Promise<Config> {
+  if (paths.length === 0) {
+    throw new Error('no configuration file is named');
+  }
+  const named = new Set<string>();
+  const layers: ConfigLayer[] = [];
+  for (const configPath of paths) {
+    const resolved = path.resolve(configPath);
+    if (named.has(resolved)) {
+      throw new Error(`configuration file ${configPath} is named twice`);
+    }
+    named.add(resolved);
+    layers.push({ source: configPath, config: await readConfigFile(configPath) });
+  }
+  return composeConfigs(layers);
 }
 
 /** A YAML mapping, the only shape a configuration file may have at its root. */
