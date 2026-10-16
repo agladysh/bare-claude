@@ -30,8 +30,8 @@ import {
   type ProcessGroupState, type StopReport, type SupervisorEvent
 } from '@agladysh/bare-claude/lifecycle';
 import {
-  custodyFiles, readCustody, runInCustody,
-  type CustodyConfiguration, type CustodyDeclaration, type CustodyEvent, type CustodyReading
+  briefCustody, custodyFiles, readCustody, runInCustody,
+  type CustodyBrief, type CustodyConfiguration, type CustodyDeclaration, type CustodyEvent, type CustodyReading
 } from '@agladysh/bare-claude/custody';
 import { alternateCredentialVariables, tokenVariable } from '@agladysh/bare-claude/token';
 import { readUsage } from '@agladysh/bare-claude/usage';
@@ -99,6 +99,10 @@ function displayHelp() {
     '      --outcome-batch <file|->',
     '                         Read many {"id","result","journal"} or {"id","custody"}',
     '                         lines in one process, printing one JSON line per line',
+    '      --brief            With --outcome-custody or --outcome-batch: one compact',
+    '                         JSON line per custody directory instead of its reading,',
+    '                         with no prompt, result, error or stderr text. A batch seeks',
+    '                         each run\'s lineage among its own custody lines only',
     '      --doctor           Check bun, claude, git, the credential, the PATH install',
     '                         and the preset file; exit 1 when something required is missing',
     '  -v, --version          Print the version and exit',
@@ -218,12 +222,13 @@ async function reportOutcome(resultPath: string | undefined, journalPath: string
 
 /**
  * `--outcome-custody`: what a custody directory's files say, as JSON on
- * stdout. Exit 1 only when the directory itself cannot be listed; any other
- * state, `unreadable` records included, is the reading's to say.
+ * stdout, or under `--brief` as one line of its brief, whose lineage is then
+ * not sought. Exit 1 only when the directory itself cannot be listed; any
+ * other state, `unreadable` records included, is the reading's to say.
  */
-async function reportCustody(directory: string): Promise<number> {
+async function reportCustody(directory: string, brief: boolean): Promise<number> {
   const reading = await readCustody(path.resolve(directory));
-  process.stdout.write(`${JSON.stringify(reading, null, 2)}\n`);
+  process.stdout.write(brief ? `${JSON.stringify(briefCustody(reading))}\n` : `${JSON.stringify(reading, null, 2)}\n`);
   return reading.entries === null ? 1 : 0;
 }
 
@@ -239,7 +244,7 @@ function isCustodyRequest(request: OutcomeRequest | CustodyRequest): request is 
  * line's `error`. A custody line's reading is `readCustody`'s, which says
  * itself what could not be read; each distinct directory is read once.
  */
-async function reportOutcomeBatch(source: string): Promise<number> {
+async function reportOutcomeBatch(source: string, brief: boolean): Promise<number> {
   let text: string;
   try {
     text = source === '-' ? await Bun.stdin.text() : await Bun.file(source).text();
@@ -250,6 +255,10 @@ async function reportOutcomeBatch(source: string): Promise<number> {
 
   const lines = text.split('\n').flatMap((row, index) =>
     row.trim() === '' ? [] : [ { line: index + 1, parsed: parseOutcomeRequest(row) } ]);
+  if (brief) {
+    await reportBriefs(lines);
+    return 0;
+  }
   const requests = lines.flatMap(l => typeof l.parsed === 'string' || isCustodyRequest(l.parsed) ? [] : [ resolveRequest(l.parsed) ]);
   const entries = await readOutcomeFiles(requests, readBytes);
   const custodies = new Map<string, Promise<CustodyReading>>();
@@ -274,6 +283,42 @@ async function reportOutcomeBatch(source: string): Promise<number> {
     process.stdout.write(`${JSON.stringify({ reader: readerIdentity, line, ...entry })}\n`);
   }
   return 0;
+}
+
+/**
+ * `--outcome-batch` under `--brief`: one line out per non-empty line in, in
+ * order, each with a brief for a custody line. Every distinct directory is
+ * read once, and all of them before any brief is made, since each brief seeks
+ * its run's lineage among the batch's own readings. A line naming a result or
+ * journal is that line's `error`: their readings carry error text no brief
+ * does.
+ */
+async function reportBriefs(lines: readonly { line: number, parsed: OutcomeRequest | CustodyRequest | string }[]): Promise<void> {
+  const readings = new Map<string, CustodyReading>();
+  for (const { parsed } of lines) {
+    if (typeof parsed !== 'string' && isCustodyRequest(parsed)) {
+      const resolved = path.resolve(parsed.custody);
+      if (!readings.has(resolved)) {
+        readings.set(resolved, await readCustody(resolved));
+      }
+    }
+  }
+  const all = [ ...readings.values() ];
+
+  for (const { line, parsed } of lines) {
+    let entry: { id: string | null, brief: CustodyBrief | null, error: string | null };
+    if (typeof parsed === 'string') {
+      entry = { id: null, brief: null, error: `line ${line}: ${parsed}` };
+    } else if (!isCustodyRequest(parsed)) {
+      entry = { id: parsed.id, brief: null, error: `line ${line}: --brief reads custody lines only` };
+    } else {
+      const reading = readings.get(path.resolve(parsed.custody));
+      entry = reading === undefined
+        ? { id: parsed.id, brief: null, error: 'not read' }
+        : { id: parsed.id, brief: briefCustody(reading, all), error: null };
+    }
+    process.stdout.write(`${JSON.stringify({ reader: readerIdentity, line, ...entry })}\n`);
+  }
 }
 
 /**
@@ -365,6 +410,9 @@ async function loadPreset(): Promise<Startup> {
       'outcome-custody': {
         type: 'string',
       },
+      brief: {
+        type: 'boolean',
+      },
       doctor: {
         type: 'boolean',
       },
@@ -449,18 +497,23 @@ async function loadPreset(): Promise<Startup> {
 
   // Offline readers of a finished run's files: they read no configuration,
   // so neither --config, once or composed, nor any launch flag changes them.
+  const brief = values.brief === true;
+  if (brief && values['outcome-custody'] === undefined && values['outcome-batch'] === undefined) {
+    throw new Error('--brief needs --outcome-custody or --outcome-batch');
+  }
+
   if (values['outcome-custody'] !== undefined) {
     if (values.outcome !== undefined || values.journal !== undefined || values['outcome-batch'] !== undefined) {
       throw new Error('--outcome-custody cannot be combined with --outcome, --journal or --outcome-batch: a custody directory names its own');
     }
-    return { kind: 'done', exitCode: await reportCustody(values['outcome-custody']) };
+    return { kind: 'done', exitCode: await reportCustody(values['outcome-custody'], brief) };
   }
 
   if (values['outcome-batch'] !== undefined) {
     if (values.outcome !== undefined || values.journal !== undefined) {
       throw new Error('--outcome-batch cannot be combined with --outcome or --journal');
     }
-    return { kind: 'done', exitCode: await reportOutcomeBatch(values['outcome-batch']) };
+    return { kind: 'done', exitCode: await reportOutcomeBatch(values['outcome-batch'], brief) };
   }
 
   if (values.outcome !== undefined || values.journal !== undefined) {

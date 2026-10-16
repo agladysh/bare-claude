@@ -6,11 +6,12 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { cloneBranch, cloneRequired, eventually, processGone } from '../test/helpers.ts';
+import { cloneBranch, cloneRequired, eventually, processGone, runCli } from '../test/helpers.ts';
 import {
-  completionScope, configurationScope, custodyFiles, custodyReadingScope, custodyReadingVersion, custodyVersion,
-  readCustody, runInCustody, stdoutProvenance,
-  type CustodyConfiguration, type CustodyEvent, type CustodyOptions, type CustodyReading, type CustodyStart,
+  briefCostBasis, briefCustody, completionScope, configurationScope, custodyBriefScope, custodyBriefVersion, custodyFiles,
+  custodyReadingScope, custodyReadingVersion, custodyVersion, readCustody, runInCustody, stdoutProvenance,
+  type CustodyConfiguration, type CustodyEvent, type CustodyOptions, type CustodyReading, type CustodySession,
+  type CustodyStart,
 } from './custody.ts';
 import type { LaunchOptions } from './index.ts';
 import { processGroupState, type SignalSource, type StopSignal } from './lifecycle.ts';
@@ -1082,4 +1083,528 @@ describe.if(posix)('readCustody and the observation', () => {
     expect(missing).toMatchObject({ state: 'unreadable', entries: null, invocation: { status: 'absent' } });
     expect(missing.basis).toContain('could not be listed');
   });
+});
+
+///////////////////////////////////////////////////////////////////////////////
+// Briefs, over custody directories written by hand, record by record as
+// runInCustody writes them: nothing is spawned, and every value is
+// constructed. The CLI's --brief is tested here too, through the real CLI.
+
+/** Records as JSON lines, as a session journal holds them. */
+function journalOf(records: readonly object[]): string {
+  return records.map(record => JSON.stringify(record)).join('\n') + '\n';
+}
+
+/** The usage of one API call, whose prompt is `input + cacheCreation + cacheRead`. */
+interface ConstructedUsage {
+  input_tokens: number,
+  cache_creation_input_tokens: number,
+  cache_read_input_tokens: number,
+  output_tokens: number,
+}
+
+function usageOf(input: number, cacheCreation: number, cacheRead: number, output: number): ConstructedUsage {
+  return { input_tokens: input, cache_creation_input_tokens: cacheCreation, cache_read_input_tokens: cacheRead, output_tokens: output };
+}
+
+function callRecord(sessionId: string, uuid: string, usage: ConstructedUsage, text = 'constructed reply'): object {
+  return {
+    type: 'assistant', sessionId, uuid, version: '2.1.292', timestamp: '2026-10-16T00:00:00.000Z',
+    message: { model: 'constructed-model', role: 'assistant', content: [ { type: 'text', text } ], usage },
+  };
+}
+
+function promptRecord(sessionId: string, uuid: string, text: string): object {
+  return { type: 'user', sessionId, uuid, version: '2.1.292', message: { role: 'user', content: text } };
+}
+
+function costStateRecord(sessionId: string, costUsd: number, apiDurationMs: number): object {
+  return { type: 'cost-state', sessionId, totalCostUSD: costUsd, totalAPIDuration: apiDurationMs };
+}
+
+function apiErrorRecord(sessionId: string, uuid: string, text: string): object {
+  return {
+    type: 'assistant', sessionId, uuid, version: '2.1.292', isApiErrorMessage: true, error: 'invalid_request',
+    message: { model: '<synthetic>', role: 'assistant', content: [ { type: 'text', text } ] },
+  };
+}
+
+function compactionRecord(sessionId: string, uuid: string, preTokens: number): object {
+  return { type: 'system', subtype: 'compact_boundary', sessionId, uuid, version: '2.1.292', compactMetadata: { preTokens } };
+}
+
+/** A result in the shape `--output-format json` writes, with a 1,000,000-token window. */
+function resultText(fields: {
+  sessionId: string,
+  costUsd: number,
+  apiDurationMs: number,
+  usage: ConstructedUsage,
+  text?: string,
+  isError?: boolean,
+  stopReason?: string,
+  model?: string,
+}): string {
+  return JSON.stringify({
+    type: 'result', subtype: 'success', is_error: fields.isError ?? false, result: fields.text ?? 'constructed return',
+    terminal_reason: 'completed', stop_reason: fields.stopReason ?? 'end_turn', num_turns: 7, session_id: fields.sessionId,
+    total_cost_usd: fields.costUsd, duration_api_ms: fields.apiDurationMs, duration_ms: 500,
+    usage: { ...fields.usage, iterations: [ fields.usage ] },
+    modelUsage: {
+      [fields.model ?? 'constructed-model']: {
+        inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 1, cacheCreationInputTokens: 1,
+        costUSD: fields.costUsd, contextWindow: 1_000_000,
+      },
+    },
+  });
+}
+
+/** One custody directory, as {@link writeCustody} writes it. */
+interface CustodyFixture {
+  /** Must not exist; its parent must. */
+  directory: string,
+
+  /** The session the start names. */
+  sessionId: string,
+
+  /** As the invocation records it; fresh by default. */
+  session?: CustodySession,
+
+  /**
+   * The text the start records as seeded, by size and digest; null for
+   * nothing seeded. Absent, the start has no `seededJournal`, as 0.12 wrote it.
+   */
+  seeded?: string | null,
+
+  /** The whole journal as it stood at completion. */
+  journal: string,
+
+  stdout?: string,
+  stderr?: string,
+  extraArgs?: string[],
+  callToAction?: string,
+  custodyError?: string | null,
+
+  /** Written into the home as `settings.json`, as any kept home holds one. */
+  settings?: object,
+}
+
+/** Writes a custody directory's records, outputs, kept call to action and journal; returns the journal's path. */
+async function writeCustody(fixture: CustodyFixture): Promise<string> {
+  const { directory, sessionId } = fixture;
+  const home = path.join(directory, custodyFiles.home);
+  const journalPath = path.join(home, 'projects', '-constructed', `${sessionId}.jsonl`);
+  const stdout = fixture.stdout ?? '';
+  const stderr = fixture.stderr ?? '';
+  const callToAction = fixture.callToAction ?? '# constructed';
+  const output = (name: string, text: string) => ({ file: path.join(directory, name), bytes: Buffer.byteLength(text), sha256: sha256(text) });
+  const record = (name: string, value: object) => fs.writeFile(path.join(directory, name), `${JSON.stringify(value, null, 2)}\n`);
+
+  await fs.mkdir(directory, { mode: 0o700 });
+  await fs.mkdir(path.dirname(journalPath), { recursive: true });
+  await fs.writeFile(journalPath, fixture.journal);
+  await fs.writeFile(path.join(home, 'settings.json'), JSON.stringify(fixture.settings ?? {}));
+  await fs.writeFile(path.join(directory, custodyFiles.stdout), stdout);
+  await fs.writeFile(path.join(directory, custodyFiles.stderr), stderr);
+  await fs.writeFile(path.join(directory, custodyFiles.callToAction), callToAction);
+
+  await record(custodyFiles.invocation, {
+    format: 'bare-claude/run-invocation', version: custodyVersion, recorded: '2026-10-16T00:00:00.000Z',
+    package: { name: '@agladysh/bare-claude', version: '0.13.0' }, directory,
+    launcher: 'claude', executable: '/constructed/claude', model: 'constructed-model', effortLevel: 'high',
+    permissionMode: 'dontAsk', tools: null, disallowedTools: null, addDirs: [], maxBudgetUsd: null,
+    maxTokens: null, maxOutputLength: null, auth: 'caller', linkAuth: false, noProcessEnv: true,
+    extraArgs: fixture.extraArgs ?? [], cwd: directory, claudeHome: home, session: fixture.session ?? { kind: 'fresh' },
+    callToAction: {
+      bytes: Buffer.byteLength(callToAction), sha256: sha256(callToAction), kept: path.join(directory, custodyFiles.callToAction),
+    },
+    configuration: null,
+  });
+  const seeded = fixture.seeded;
+  await record(custodyFiles.start, {
+    format: 'bare-claude/run-start', version: custodyVersion, recorded: '2026-10-16T00:00:00.100Z', pid: 4242, processGroup: 4242,
+    sessionId, sessionJsonlPath: journalPath, claudeHome: home, identity: null,
+    // JSON drops an undefined value: a start as 0.12 wrote it.
+    seededJournal: seeded === undefined || seeded === null ? seeded : { bytes: Buffer.byteLength(seeded), sha256: sha256(seeded) },
+  });
+  await record(custodyFiles.completion, {
+    format: 'bare-claude/run-completion', version: custodyVersion, scope: completionScope, ended: '2026-10-16T00:00:01.000Z',
+    outcome: 'exited', notStarted: null, exitStatus: 0, exitCode: 0, signalCode: null, stoppedBy: null, stop: null,
+    processGroupAfter: { state: 'empty', observations: [] }, custodyError: fixture.custodyError ?? null,
+    stdout: output(custodyFiles.stdout, stdout),
+    stderr: output(custodyFiles.stderr, stderr),
+    journal: { path: journalPath, sessionId, exists: true, bytes: Buffer.byteLength(fixture.journal), sha256: sha256(fixture.journal) },
+  });
+  return journalPath;
+}
+
+/**
+ * Three runs of one session under `root`, each continuing the one before:
+ *
+ * - `first`, fresh, ending at a measured prompt of 240,671 tokens, with a
+ *   cost-state record and a JSON result that joins with it;
+ * - `second`, a file seed of `first`'s journal that requires its digest. It
+ *   appends a compaction, a context-limit API error, a measured call of
+ *   300,000 tokens and a cost-state record, with a JSON result that joins;
+ * - `third`, a memory seed of `second`'s whole journal, with a text stdout.
+ */
+async function writeLineage(root: string) {
+  const session = 'constructed-lineage-session';
+  const first = path.join(root, 'first');
+  const second = path.join(root, 'second');
+  const third = path.join(root, 'third');
+
+  const firstUsage = usageOf(1, 670, 240_000, 900);
+  const firstJournal = journalOf([
+    promptRecord(session, 'p1', 'constructed first prompt'),
+    callRecord(session, 'c1', firstUsage),
+    costStateRecord(session, 3.25, 1_000),
+  ]);
+  const firstJournalPath = await writeCustody({
+    directory: first, sessionId: session, seeded: null, journal: firstJournal, extraArgs: [ '--output-format', 'json' ],
+    stdout: resultText({ sessionId: session, costUsd: 3.25, apiDurationMs: 1_000, usage: firstUsage }),
+  });
+
+  const secondUsage = usageOf(2, 1_998, 298_000, 1_200);
+  const secondJournal = firstJournal + journalOf([
+    promptRecord(session, 'p2', 'constructed second prompt'),
+    compactionRecord(session, 'b2', 900_000),
+    apiErrorRecord(session, 'e2', 'Prompt is too long'),
+    callRecord(session, 'c2', secondUsage),
+    costStateRecord(session, 7.5, 3_000),
+  ]);
+  const secondJournalPath = await writeCustody({
+    directory: second, sessionId: session, seeded: firstJournal, journal: secondJournal,
+    session: { kind: 'file', sessionId: session, sourcePath: firstJournalPath, sourceSha256: sha256(firstJournal) },
+    extraArgs: [ '--output-format', 'json' ],
+    stdout: resultText({ sessionId: session, costUsd: 7.5, apiDurationMs: 3_000, usage: secondUsage }),
+  });
+
+  const thirdJournal = secondJournal + journalOf([ promptRecord(session, 'p3', 'constructed third prompt') ]);
+  await writeCustody({
+    directory: third, sessionId: session, seeded: secondJournal, journal: thirdJournal,
+    session: { kind: 'memory', sessionId: session }, stdout: 'constructed text return\n',
+  });
+
+  return { session, first, second, third, firstJournal, firstJournalPath, secondJournal, secondJournalPath };
+}
+
+describe('briefCustody', () => {
+  test('a run\'s figures each in its own scope: last call, window, process, session, inherited totals and appended records', async () => {
+    const lineage = await writeLineage(await tempDir());
+    const second = briefCustody(await readCustody(lineage.second));
+
+    expect(second).toMatchObject({
+      format: 'bare-claude/custody-brief',
+      version: custodyBriefVersion,
+      scope: custodyBriefScope,
+      directory: lineage.second,
+      state: 'exited',
+      problems: 0,
+      inPlace: true,
+      run: {
+        keptBy: '0.13.0', launcher: 'claude', model: 'constructed-model', effortLevel: 'high',
+        callToAction: { bytes: Buffer.byteLength('# constructed'), sha256: sha256('# constructed') },
+      },
+      end: { outcome: 'exited', exitCode: 0, signalCode: null, stopCause: null, custodyError: false },
+      session: {
+        kind: 'file',
+        sessionId: lineage.session,
+        sourcePath: lineage.firstJournalPath,
+        requiredSha256: sha256(lineage.firstJournal),
+        seeded: { bytes: Buffer.byteLength(lineage.firstJournal), sha256: sha256(lineage.firstJournal) },
+      },
+      // Sought only among predecessors given.
+      lineage: { links: [], end: { status: 'not-sought', candidates: [] } },
+      result: {
+        status: 'read', basis: 'json-requested', file: 'result', reported: 'no-error', terminalReason: 'completed',
+        stopReason: 'end_turn', numTurns: 7, apiErrorStatus: null, contextLimit: null, sessionId: lineage.session,
+      },
+      join: { kind: 'joined', over: 'appended' },
+      measured: {
+        // One call's prompt, against the one window the result reports; nothing compares them.
+        lastCall: { prompt: 300_000, output: 1_200, from: 'result' },
+        contextWindow: 1_000_000,
+        process: { tokens: { input: 2, cacheCreation: 1_998, cacheRead: 298_000, output: 1_200 }, durationMs: 500 },
+        // Cumulative over the session, and where it stood in what was seeded: two figures, not a difference.
+        session: { costUsd: 7.5, apiDurationMs: 3_000, models: [ 'constructed-model' ] },
+        inherited: { status: 'read', costUsd: 3.25, apiDurationMs: 1_000 },
+        costBasis: briefCostBasis,
+        // Appended records only: the first run's call and cost-state are not counted here.
+        appended: {
+          segments: 1, openTail: false, versions: [ '2.1.292' ], unmeasuredCalls: 0,
+          apiErrors: 1, contextLimitErrors: 1, compactions: 1, preTokens: [ 900_000 ],
+        },
+      },
+      stdout: { path: path.join(lineage.second, custodyFiles.stdout), changedSinceCompletion: false },
+      stderr: { bytes: 0, changedSinceCompletion: false },
+      journal: {
+        path: lineage.secondJournalPath, sessionId: lineage.session, changedSinceCompletion: false, boundary: 'seeded',
+        atCompletion: { exists: true, bytes: Buffer.byteLength(lineage.secondJournal), sha256: sha256(lineage.secondJournal) },
+      },
+    });
+
+    // A fresh run inherits nothing; a text stdout is no result, and the last call then comes from what was appended.
+    expect(briefCustody(await readCustody(lineage.first)).measured.inherited).toEqual({ status: 'nothing-seeded' });
+    expect(briefCustody(await readCustody(lineage.third))).toMatchObject({
+      session: { kind: 'memory', requiredSha256: null, sourcePath: null },
+      result: { status: 'not-read' },
+      join: null,
+      measured: { lastCall: null, contextWindow: null, session: null, inherited: { status: 'read', costUsd: 7.5 }, appended: { openTail: true } },
+    });
+  });
+
+  test('lineage is established by digest, link by link to a fresh run; each link says what the run after it inherited', async () => {
+    const lineage = await writeLineage(await tempDir());
+    const first = await readCustody(lineage.first);
+    const second = await readCustody(lineage.second);
+    const third = await readCustody(lineage.third);
+    const all = [ first, second, third ];
+
+    expect(briefCustody(third, all).lineage).toEqual({
+      links: [
+        {
+          directory: lineage.second, matchedBy: [ 'completion.journal', 'journal as read' ], state: 'exited',
+          inherited: { status: 'read', prompt: 300_000, output: 1_200 }, contextLimit: true, compactions: 1,
+        },
+        {
+          directory: lineage.first, matchedBy: [ 'completion.journal', 'journal as read' ], state: 'exited',
+          inherited: { status: 'read', prompt: 240_671, output: 900 }, contextLimit: false, compactions: 0,
+        },
+      ],
+      end: { status: 'fresh', candidates: [] },
+    });
+    expect(briefCustody(first, all).lineage).toEqual({ links: [], end: { status: 'fresh', candidates: [] } });
+
+    // A predecessor's journal written since its completion still matches by what the completion recorded,
+    // but what was inherited is no longer the journal as read.
+    await fs.appendFile(lineage.secondJournalPath, journalOf([ promptRecord(lineage.session, 'later', 'written since') ]));
+    const changed = await readCustody(lineage.second);
+    expect(briefCustody(third, [ first, changed ]).lineage).toMatchObject({
+      links: [
+        { directory: lineage.second, matchedBy: [ 'completion.journal' ], inherited: { status: 'journal-differs' } },
+        { directory: lineage.first },
+      ],
+      end: { status: 'fresh' },
+    });
+  });
+
+  test('a shared session id is never lineage: other bytes are a mismatch, no digest says so, and neither names a predecessor', async () => {
+    const root = await tempDir();
+    const lineage = await writeLineage(root);
+    const at = (name: string) => path.join(root, name);
+
+    // A branch of the session no custody kept: same session id, other bytes.
+    const branch = lineage.firstJournal + journalOf([ promptRecord(lineage.session, 'branch', 'a branch no custody kept') ]);
+    await writeCustody({
+      directory: at('forked'), sessionId: lineage.session, seeded: branch, journal: branch,
+      session: { kind: 'file', sessionId: lineage.session, sourcePath: at('elsewhere.jsonl'), sourceSha256: sha256(branch) },
+    });
+    // As 0.12 wrote a continued run: a memory seed, and no record of what was seeded.
+    await writeCustody({
+      directory: at('undigested'), sessionId: lineage.session, journal: lineage.secondJournal,
+      session: { kind: 'memory', sessionId: lineage.session },
+    });
+    // Another session, from bytes no run here holds.
+    await writeCustody({
+      directory: at('stranger'), sessionId: 'constructed-other-session', seeded: lineage.firstJournal.slice(1),
+      journal: lineage.firstJournal.slice(1), session: { kind: 'memory', sessionId: 'constructed-other-session' },
+    });
+    // A start whose seeded digest is not the one its invocation required.
+    await writeCustody({
+      directory: at('conflicted'), sessionId: lineage.session, seeded: lineage.firstJournal, journal: lineage.secondJournal,
+      session: { kind: 'file', sessionId: lineage.session, sourcePath: lineage.firstJournalPath, sourceSha256: sha256('other bytes') },
+    });
+
+    const names = [ 'first', 'second', 'third', 'forked', 'undigested', 'stranger', 'conflicted' ];
+    const all = await Promise.all(names.map(name => readCustody(at(name))));
+    const lineageOf = async (name: string) => briefCustody(await readCustody(at(name)), all).lineage;
+
+    expect(await lineageOf('forked')).toEqual({
+      links: [],
+      end: { status: 'mismatch', candidates: [ 'conflicted', 'first', 'second', 'third', 'undigested' ].map(at) },
+    });
+    expect(await lineageOf('undigested')).toEqual({
+      links: [],
+      end: { status: 'no-digest', candidates: [ 'conflicted', 'first', 'forked', 'second', 'third' ].map(at) },
+    });
+    expect(await lineageOf('stranger')).toEqual({ links: [], end: { status: 'unresolved', candidates: [] } });
+    expect(await lineageOf('conflicted')).toEqual({ links: [], end: { status: 'conflict', candidates: [] } });
+    // The 0.12 run's own records cannot be told from inherited ones, so none is counted as its own.
+    expect(briefCustody(await readCustody(at('undigested')))).toMatchObject({
+      session: { kind: 'memory', seeded: 'unrecorded' },
+      journal: { boundary: null },
+      measured: { appended: null, inherited: { status: 'unknown' } },
+    });
+  });
+
+  test('several journals with the digest seeded are ambiguous, and none is chosen; runs that appended nothing make a cycle', async () => {
+    const root = await tempDir();
+    const lineage = await writeLineage(root);
+    const copy = path.join(root, 'first-copy');
+    await fs.cp(lineage.first, copy, { recursive: true });
+    const first = await readCustody(lineage.first);
+    const copied = await readCustody(copy);
+    const second = await readCustody(lineage.second);
+
+    // The copy's journal is not read, being under the original; its completion recorded the same digest.
+    expect(briefCustody(copied)).toMatchObject({ inPlace: false, journal: { changedSinceCompletion: null } });
+    expect(briefCustody(second, [ first, copied, second ]).lineage).toEqual({
+      links: [],
+      end: { status: 'ambiguous', candidates: [ lineage.first, copy ] },
+    });
+
+    const session = 'constructed-cycle-session';
+    const seed = journalOf([ callRecord(session, 'k', usageOf(1, 1, 1, 1)) ]);
+    for (const name of [ 'a', 'b' ]) {
+      await writeCustody({ directory: path.join(root, name), sessionId: session, seeded: seed, journal: seed, session: { kind: 'memory', sessionId: session } });
+    }
+    const a = await readCustody(path.join(root, 'a'));
+    const b = await readCustody(path.join(root, 'b'));
+    expect(briefCustody(a, [ a, b ]).lineage).toMatchObject({
+      links: [ { directory: b.directory, inherited: { status: 'read', prompt: 3 } } ],
+      end: { status: 'cycle', candidates: [ a.directory ] },
+    });
+  });
+
+  test('no prompt, return, error, stderr, problem or extraArgs text and no environment reaches a brief; the return is read from the stdout it names', async () => {
+    const root = await tempDir();
+    const session = 'constructed-sentinel-session';
+    const usage = usageOf(1, 2, 3, 4);
+    // Neither a reading nor a brief carries these.
+    const unread = {
+      callToAction: 'CTA-LEAK-SENTINEL', prompt: 'PROMPT-LEAK-SENTINEL', reply: 'REPLY-LEAK-SENTINEL',
+      stderr: 'STDERR-LEAK-SENTINEL', env: 'ENV-LEAK-SENTINEL', attached: 'ATTACHED-LEAK-SENTINEL',
+    };
+    // A reading carries these; a brief must not.
+    const carried = {
+      arg: 'ARG-LEAK-SENTINEL', error: 'ERROR-LEAK-SENTINEL', apiError: 'APIERROR-LEAK-SENTINEL', custody: 'CUSTODY-LEAK-SENTINEL',
+      stop: 'STOP LEAK SENTINEL', model: 'MODEL LEAK SENTINEL', format: 'FORMAT-LEAK-SENTINEL',
+    };
+    const journal = journalOf([
+      promptRecord(session, 'p', unread.prompt),
+      callRecord(session, 'c', usage, unread.reply),
+      apiErrorRecord(session, 'e', carried.apiError),
+      costStateRecord(session, 1.5, 100),
+    ]);
+    const json = path.join(root, 'json');
+    const text = path.join(root, 'text');
+    const common = { sessionId: session, seeded: null, journal, callToAction: unread.callToAction, stderr: unread.stderr, settings: { env: { CONSTRUCTED_TOKEN: unread.env } } };
+    await writeCustody({
+      ...common, directory: json, extraArgs: [ '--output-format', 'json', `--secret=${carried.arg}` ], custodyError: carried.custody,
+      stdout: resultText({ sessionId: session, costUsd: 1.5, apiDurationMs: 100, usage, isError: true, text: carried.error, stopReason: carried.stop, model: carried.model }),
+    });
+    await writeCustody({ ...common, directory: text, extraArgs: [ '--output-format', carried.format ], stdout: `${unread.reply}\n` });
+
+    const readings = [ await readCustody(json), await readCustody(text) ];
+    // Something attached to a reading beyond its type does not pass through either.
+    for (const reading of readings) {
+      Object.assign(reading.reader, { leak: unread.attached });
+      if (reading.journal?.atCompletion) {
+        Object.assign(reading.journal.atCompletion, { leak: unread.attached });
+      }
+    }
+    const readingText = JSON.stringify(readings);
+    const briefs = readings.map(reading => briefCustody(reading, readings));
+    const briefText = JSON.stringify(briefs);
+
+    for (const sentinel of Object.values(carried)) {
+      expect(readingText).toContain(sentinel);
+      expect(briefText).not.toContain(sentinel);
+    }
+    for (const sentinel of Object.values(unread)) {
+      expect(briefText).not.toContain(sentinel);
+    }
+    for (const key of [ 'extraArgs', 'why', 'errorText', 'entries', 'outputFormat', 'settings', 'env', 'leak' ]) {
+      expect(keysIn(briefs)).not.toContain(key);
+    }
+    const [ jsonBrief, textBrief ] = briefs;
+    expect(jsonBrief).toMatchObject({
+      state: 'custody-error', problems: readings[0]?.problems.length ?? -1, end: { custodyError: true },
+      result: { status: 'read', reported: 'error', stopReason: null, contextLimit: null },
+      measured: { session: { models: [] }, appended: { apiErrors: 1, contextLimitErrors: 0 } },
+    });
+    expect(textBrief).toMatchObject({ result: { status: 'not-read' } });
+
+    // The return is not in the brief; it is the stdout the brief names, held to the digest the brief carries.
+    const returned = await Bun.file(jsonBrief?.stdout.path ?? '').text();
+    expect(sha256(returned)).toBe(jsonBrief?.stdout.sha256 ?? '');
+    const parsed: unknown = JSON.parse(returned);
+    expect(parsed).toMatchObject({ result: carried.error });
+  });
+});
+
+describe('--brief', () => {
+  test('--outcome-custody --brief prints one brief line; without it, the reading as before', async () => {
+    const lineage = await writeLineage(await tempDir());
+    const cwd = path.dirname(lineage.first);
+
+    const brief = await runCli([ '--outcome-custody', lineage.second, '--brief' ], { cwd });
+    expect(brief.stderr).toBe('');
+    expect(brief.exitCode).toBe(0);
+    expect(brief.stdout.endsWith('\n')).toBe(true);
+    expect(brief.stdout.trim().split('\n')).toHaveLength(1);
+    const parsed: unknown = JSON.parse(brief.stdout);
+    expect(parsed).toMatchObject({
+      format: 'bare-claude/custody-brief', directory: lineage.second, state: 'exited',
+      lineage: { links: [], end: { status: 'not-sought' } },
+    });
+
+    const whole = await runCli([ '--outcome-custody', lineage.second ], { cwd });
+    expect(whole.exitCode).toBe(0);
+    expect(whole.stdout).toContain('\n  "format": "bare-claude/custody-reading"');
+    const reading: unknown = JSON.parse(whole.stdout);
+    expect(reading).toMatchObject({ state: 'exited', invocation: { status: 'read', record: { extraArgs: [ '--output-format', 'json' ] } } });
+
+    const missing = await runCli([ '--outcome-custody', path.join(cwd, 'missing'), '--brief' ], { cwd });
+    expect(missing.exitCode).toBe(1);
+    const unlisted: unknown = JSON.parse(missing.stdout);
+    expect(unlisted).toMatchObject({ format: 'bare-claude/custody-brief', state: 'unreadable', run: null, journal: null });
+  }, 20_000);
+
+  test('--outcome-batch --brief seeks lineage among the batch\'s own custody lines; any other line is its own error', async () => {
+    const lineage = await writeLineage(await tempDir());
+    const cwd = path.dirname(lineage.first);
+    const lines = [
+      JSON.stringify({ id: 'third', custody: lineage.third }),
+      JSON.stringify({ id: 'result', result: path.join(lineage.second, custodyFiles.stdout) }),
+      'not json',
+      JSON.stringify({ id: 'second', custody: lineage.second }),
+      JSON.stringify({ id: 'first', custody: lineage.first }),
+    ].join('\n') + '\n';
+
+    const run = await runCli([ '--outcome-batch', '-', '--brief' ], { cwd, stdin: lines });
+    expect(run.stderr).toBe('');
+    expect(run.exitCode).toBe(0);
+    const out: unknown[] = run.stdout.trim().split('\n').map((line): unknown => JSON.parse(line));
+    expect(out).toMatchObject([
+      {
+        id: 'third', line: 1, error: null,
+        brief: { lineage: { links: [ { directory: lineage.second }, { directory: lineage.first } ], end: { status: 'fresh' } } },
+      },
+      { id: 'result', line: 2, brief: null, error: 'line 2: --brief reads custody lines only' },
+      { id: null, line: 3, brief: null, error: 'line 3: not one JSON object' },
+      { id: 'second', line: 4, error: null, brief: { lineage: { links: [ { directory: lineage.first } ], end: { status: 'fresh' } } } },
+      { id: 'first', line: 5, error: null, brief: { lineage: { links: [], end: { status: 'fresh' } } } },
+    ]);
+    expect(run.stdout).not.toContain('--output-format');
+
+    // Without its predecessor in the batch, a run's successor shares its session and is still no predecessor.
+    const partial = await runCli([ '--outcome-batch', '-', '--brief' ], {
+      cwd, stdin: `${JSON.stringify({ custody: lineage.third })}\n${JSON.stringify({ custody: lineage.second })}\n`,
+    });
+    const [ third ]: unknown[] = partial.stdout.trim().split('\n').map((line): unknown => JSON.parse(line));
+    expect(third).toMatchObject({
+      brief: { lineage: { links: [ { directory: lineage.second } ], end: { status: 'mismatch', candidates: [ lineage.third ] } } },
+    });
+  }, 20_000);
+
+  test('--brief needs --outcome-custody or --outcome-batch', async () => {
+    const cwd = await tempDir();
+    for (const args of [ [ '--brief' ], [ '--brief', '--outcome', path.join(cwd, 'result.json') ] ]) {
+      const run = await runCli(args, { cwd });
+      expect(run.exitCode).toBe(1);
+      expect(run.stdout).toBe('');
+      expect(run.stderr).toContain('--brief needs --outcome-custody or --outcome-batch');
+    }
+  }, 20_000);
 });
