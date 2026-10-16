@@ -14,7 +14,7 @@ import {
 } from './custody.ts';
 import type { LaunchOptions } from './index.ts';
 import { processGroupState, type SignalSource, type StopSignal } from './lifecycle.ts';
-import { processScope } from './outcome.ts';
+import { joinResult, processScope } from './outcome.ts';
 
 /**
  * Custody of real processes: the fake `claude` under test/, run with
@@ -684,8 +684,9 @@ describe.if(posix)('readCustody and the observation', () => {
         // Nothing was seeded: the whole journal is this run's.
         appended: { status: 'read', boundary: { bytes: 0, sha256: null, basis: 'nothing seeded' }, lineOffset: 0, reading: { lines: 2 } },
       },
-      // The constructed result names a session the journal never does.
-      join: { kind: 'no-match' },
+      // The constructed result names a session the journal never does; nothing was
+      // seeded, so the appended reading is the whole journal.
+      join: { kind: 'no-match', over: 'appended' },
     });
     // Not this run's session: said, without changing the state, which rests on custody's records.
     const [ start ] = startsIn(run.events);
@@ -908,6 +909,60 @@ describe.if(posix)('readCustody and the observation', () => {
     await fs.writeFile(journal, `x${bytes.slice(1)}`);
     expect((await readCustody(run.directory)).journal?.appended).toMatchObject({
       status: 'not-read', why: `its first ${seeded.bytes} bytes are no longer the bytes seeded, so where this run's records begin is not known`,
+    });
+  }, 20_000);
+
+  test('a continued run\'s result joins over what it appended, never an inherited context-limit record', async () => {
+    // The earlier process ended on the context limit and wrote no cost-state
+    // record, so over the whole journal its error shares this run's segment.
+    const inherited = [
+      { type: 'user', sessionId: priorSession, uuid: 'inherited-prompt', message: { role: 'user', content: 'earlier' } },
+      {
+        type: 'assistant', sessionId: priorSession, uuid: 'inherited-limit', isApiErrorMessage: true, error: 'invalid_request',
+        message: { model: '<synthetic>', role: 'assistant', content: [ { type: 'text', text: 'Prompt is too long' } ] },
+      },
+    ].map(record => JSON.stringify(record)).join('\n') + '\n';
+    const usage = { input_tokens: 1, cache_creation_input_tokens: 2, cache_read_input_tokens: 3, output_tokens: 4 };
+    const result = JSON.stringify({
+      type: 'result', subtype: 'success', is_error: false, result: 'done', stop_reason: 'end_turn',
+      session_id: priorSession, total_cost_usd: 2.5, duration_api_ms: 300, duration_ms: 100,
+      usage: { ...usage, iterations: [ usage ] },
+    });
+    const run = await begin({
+      customSessionData: { sessionId: priorSession, value: inherited }, extraArgs: [ '--output-format', 'json' ],
+    }, { FAKE_CLAUDE_STDOUT: result });
+    await run.completion;
+    const journal = observedIn(run.events)?.observation?.journal?.path ?? '';
+
+    // This run's own measured call and the cost-state record its process end
+    // writes, as Claude Code writes them; the fake writes neither.
+    await fs.appendFile(journal, [
+      { type: 'assistant', sessionId: priorSession, uuid: 'this-run-call', message: { model: 'constructed-model', role: 'assistant', content: [], usage } },
+      { type: 'cost-state', sessionId: priorSession, totalCostUSD: 2.5, totalAPIDuration: 300 },
+    ].map(record => JSON.stringify(record)).join('\n') + '\n');
+
+    const reading = await readCustody(run.directory);
+    expect(reading).toMatchObject({
+      state: 'exited',
+      problems: [],
+      stdout: { result: { status: 'read', basis: 'json-requested' } },
+      journal: { appended: { status: 'read', boundary: { basis: 'seeded' } } },
+      join: { kind: 'joined', over: 'appended', segment: 0, contextLimitRecord: null },
+    });
+    // The whole journal still holds the inherited error, and joined over it the
+    // same result would have named that error as its segment's.
+    expect(holdsContextLimit(reading.journal?.reading)).toBe(true);
+    const whole = reading.journal?.reading ?? null;
+    const resultReading = reading.stdout.result.status === 'read' ? reading.stdout.result.reading : null;
+    expect(resultReading !== null && whole !== null ? joinResult(resultReading, whole) : null)
+      .toMatchObject({ kind: 'joined', contextLimitRecord: 'inherited-limit' });
+
+    // A start from before the boundary was recorded: no verified boundary, so the
+    // join is over the whole journal, and says so; the caveat is then the reader's.
+    const start = path.join(run.directory, custodyFiles.start);
+    await fs.writeFile(start, edited(await Bun.file(start).text(), record => { delete record.seededJournal; }));
+    expect((await readCustody(run.directory)).join).toMatchObject({
+      kind: 'joined', over: 'whole', contextLimitRecord: 'inherited-limit',
     });
   }, 20_000);
 

@@ -35,7 +35,11 @@ A 0.13.0 candidate. `package.json` stays 0.12.0 until it is received and release
     naming another session is a problem line.
   - **Journal.** It is read whole, and, after the seeded bytes, as what was appended since the
     spawn, so a continued session's inherited context-limit and API-error records are not this
-    run's. Appended records naming another session are a problem line.
+    run's. Appended records naming another session are a problem line. The result is joined over
+    the appended reading whenever the boundary is verified (`join.over: 'appended'`), so an
+    inherited context-limit record is never this run's `join.contextLimitRecord`. Only without a
+    verified boundary, as in a continued 0.12.0 directory, is it joined over the whole journal
+    (`'whole'`), with the caveat that the joined segment may hold an earlier process's records.
   - **Changes since the completion.** Changes to stdout, stderr and the journal are reported as
     facts, and no continuation is offered.
   - **Moved or copied directories** are said to be such, and the original's journal is not read as

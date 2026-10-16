@@ -1050,15 +1050,34 @@ export interface CustodyReading {
   journal: CustodyJournalReading | null,
 
   /**
-   * `joinResult` from `@agladysh/bare-claude/outcome` over the stdout result
-   * and the whole journal, when both were read. It correlates the result with one
-   * journal segment's recorded figures; it is not process identity, and the
-   * segment's records — a context-limit record among them — may be another
-   * process's. `stdout.result.reading.process` stays the figures of the process that
-   * wrote the result, joined or not.
+   * The stdout result joined with the journal, when both were read; see
+   * {@link CustodyJoin} for which reading of the journal it is over.
    */
-  join: ResultJournalJoin | null,
+  join: CustodyJoin | null,
 }
+
+/**
+ * `joinResult` from `@agladysh/bare-claude/outcome` over the stdout result
+ * and one reading of the journal, and which: `over` says which `segments`
+ * list `segment` and `candidates` index.
+ *
+ * - `appended`, `journal.appended.reading`, whenever that reading exists:
+ *   the records after the verified seeded bytes. An inherited segment, and an
+ *   inherited context-limit record, cannot be joined to this run's result. A
+ *   fresh session's boundary is 0, so this is the whole journal for it.
+ * - `whole`, `journal.reading`, only when there is no verified boundary: a
+ *   continued session whose start was written before the seed was recorded
+ *   (0.12.0), or a journal that no longer begins with the bytes seeded
+ *   (`journal.appended.why` says which). There an earlier process that wrote no `cost-state` record
+ *   shares a segment with this run's records, and the joined segment's
+ *   `contextLimitRecord` may be that process's.
+ *
+ * Either way it correlates the result with one segment's recorded figures;
+ * it is not process identity, and a segment can span processes after the
+ * boundary too. `stdout.result.reading.process` stays the figures of the
+ * process that wrote the result, joined or not.
+ */
+export type CustodyJoin = ResultJournalJoin & { over: 'appended' | 'whole' };
 
 type Guard<T> = (value: unknown) => value is T;
 
@@ -1728,9 +1747,16 @@ export async function readCustody(directory: string): Promise<CustodyReading> {
     }
   }
 
-  const join = stdout.result.status === 'read' && journal !== null && journal.reading !== null
-    ? joinResult(stdout.result.reading, journal.reading)
-    : null;
+  // Over this run's appended records whenever the boundary is verified, so an
+  // inherited segment never joins; over the whole journal only without one.
+  let join: CustodyJoin | null = null;
+  if (stdout.result.status === 'read' && journal !== null) {
+    if (journal.appended.status === 'read') {
+      join = { ...joinResult(stdout.result.reading, journal.appended.reading), over: 'appended' };
+    } else if (journal.reading !== null) {
+      join = { ...joinResult(stdout.result.reading, journal.reading), over: 'whole' };
+    }
+  }
 
   const unlistable: StateBasis = { state: 'unreadable', basis: `the directory could not be listed: ${unlisted}` };
   const { state, basis } = unlisted === null ? stateOf(invocation, start, completion) : unlistable;

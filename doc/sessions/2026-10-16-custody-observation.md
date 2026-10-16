@@ -5,8 +5,14 @@ shell, no `bun`, no `tsc`, no `claude`, no model.
 
 - **First round.** The maintainer typechecked it and ran the synthetic suite: 497 pass, one skip,
   1812 assertions. An independent reading of that cut rejected ordinary use pending five repairs.
-- **Second round.** It makes those repairs and several smaller ones. **It has not been typechecked
-  or run.** `package.json` stays 0.12.0; the entry is under `[Unreleased]` as a 0.13.0 candidate.
+- **Second round.** It makes those repairs and several smaller ones. The maintainer typechecked
+  it and ran the suite: 504 pass, one skip, 1847 assertions. Directories written by published
+  0.12.0, one fresh and one continued, read `exited` and joined with no problems, and a BOM-prefixed
+  configuration parsed the same under both. A delta reception found one remaining defect: the
+  join still ran over the whole journal.
+- **Third round.** It joins over the appended reading whenever the boundary is verified (below).
+  **It has not been typechecked or run.** `package.json` stays 0.12.0; the entry is under
+  `[Unreleased]` as a 0.13.0 candidate.
 
 Sources: a private receiving design and its independent reception, the reception of the first
 round, and maintainer direction. Out of scope by that direction: an environment variable naming the
@@ -71,8 +77,16 @@ custody directory to the child, and any observer outside this package.
     a continued session it is unknown, and is said so.
   - **Not adopted from the reception: a deferral fallback.** The reception allowed one in place of
     the boundary, and this round implements the boundary instead. The whole-journal `reading` stays
-    for whoever needs it; the join still runs over it, since segment indices are the join's
-    vocabulary.
+    for whoever needs it.
+  - **The join, third round.** The second round still joined over the whole journal. Its own
+    reasoning was that segment indices are the join's vocabulary. That was wrong: an earlier
+    process that wrote no `cost-state` record shares this run's segment, so a joined result
+    named that process's context-limit record as its segment's. The join is now over the
+    appended reading whenever the boundary is verified, and `join.over` says which reading
+    `segment` indexes. Over the whole journal it runs only without a verified boundary, and the
+    old caveat applies there. The regression joins a matching result over a seed ending in a
+    context-limit record that has a uuid and no `cost-state`. Over the appended reading it joins
+    with no context-limit record; over the whole journal, the same result names the inherited one.
 - **Moved or copied directories.** `invocation.directory`, or for older records the directory of the
   completion's outputs, says where the records were written. When that is not, physically, the
   directory read:
@@ -104,16 +118,11 @@ custody directory to the child, and any observer outside this package.
 
 ## Not established
 
-- **This round:** typecheck and every test.
-  - Riskiest: the `satisfies` and `as const` signal list with its exhaustiveness check against the
-    installed `@types/node`, and the generic `shape`.
-  - Not established either: whether Bun's `fs.promises.open` honours a numeric `O_NONBLOCK`.
-    The FIFO test discriminates, and would hang to its timeout otherwise.
-- **0.12 compatibility is synthetic only.** Fields were deleted from 0.13 records. No directory
-  written by published 0.12.0 has been read.
-- **A `joined` reading through custody** has never been seen: every custody test is `no-match` or
-  has no result.
-- **BOM.** `TextDecoder` strips a byte-order mark; whether `Bun.file().text()` did is unknown.
+- **Third round:** typecheck and every test. The regression appends this run's measured call
+  and `cost-state` record by hand after the run, since the fake writes neither.
+- **Still unseen:** a join over the appended reading of a real continued `claude` run.
+- **A whole-journal join for a continued 0.12.0 directory** may still name an inherited error.
+  It is labelled `over: 'whole'` and is not repaired, because nothing records the boundary there.
 - **Unprobed outcomes:**
   - `realPath` coming out `null`: no test races a symlink swap.
 - **Known exposures left open:**
