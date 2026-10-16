@@ -905,7 +905,7 @@ async function runUnderCustody(
       }
       if (streaming) {
         try {
-          process.stdout.write(`${JSON.stringify(event)}\n`, error => {
+          process.stdout.write(`${JSON.stringify(streamed(event))}\n`, error => {
             if (error) {
               endStream(error);
             }
@@ -932,6 +932,33 @@ async function runUnderCustody(
     return 1;
   }
   return completion.exitStatus;
+}
+
+/**
+ * A custody event as stdout carries it. Every event goes as it is, but for
+ * `observed`, which goes as the reading's state, basis and problems: the
+ * whole reading holds the invocation, `extraArgs` verbatim among it, and
+ * stays in the custody directory's `observation.json`, mode 0600, rather
+ * than reaching whatever reads or logs this stream.
+ */
+function streamed(event: CustodyEvent): object {
+  if (event.kind !== 'observed') {
+    return event;
+  }
+  const { observation } = event;
+  return {
+    kind: event.kind,
+    directory: event.directory,
+    file: event.file,
+    error: event.error,
+    observation: observation === null ? null : {
+      format: observation.format,
+      version: observation.version,
+      state: observation.state,
+      basis: observation.basis,
+      problems: observation.problems,
+    },
+  };
 }
 
 /** The stderr lines for a custody event, as an ordinary run prints them. */

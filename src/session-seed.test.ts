@@ -80,6 +80,8 @@ describe('cloneSessionSeed', () => {
       const published = cloneSessionSeed(source, target, sha256(prior));
       const stats = await fs.stat(target, { bigint: true });
       expect([ published.dev, published.ino ]).toEqual([ stats.dev, stats.ino ]);
+      // The seeded byte boundary: exactly the prior bytes, by size and digest.
+      expect([ published.bytes, published.sha256 ]).toEqual([ Buffer.byteLength(prior), sha256(prior) ]);
       await fs.appendFile(target, 'next\n');
       await fs.appendFile(source, 'prior again\n');
 

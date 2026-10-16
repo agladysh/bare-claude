@@ -409,7 +409,8 @@ The files compose as though they were one, each validated on its own first:
 
 Each file is read once: its bytes are read whole through one open handle, and both the digest a
 custody run records and the configuration parsed come from those bytes (see
-[Run custody](#run-custody)).
+[Run custody](#run-custody)). The handle is opened without blocking, so a FIFO or anything else
+that is not a regular file is refused at once rather than waited on.
 
 The command line then goes on top, exactly as over one file. What the profile says reaches every
 run that names it; a credential in its `extraEnv` included.
@@ -621,10 +622,10 @@ writes there is ever rewritten or removed. Relative, it resolves against the dir
 
 | File | Written | Holds |
 | --- | --- | --- |
-| `invocation.json` | before the spawn | launcher, executable, model, effort, permission mode, tools, `addDirs`, budget and token caps, auth mode, `linkAuth`, `noProcessEnv`, `extraArgs` as given, the physical cwd, the Claude home, the session (`fresh`, `memory` with its id, or `file` with its source path and digest), the call to action's length and SHA-256, and the configuration that declared the run (below) |
+| `invocation.json` | before the spawn | the custody directory, launcher, executable, model, effort, permission mode, tools, `addDirs`, budget and token caps, auth mode, `linkAuth`, `noProcessEnv`, `extraArgs` as given, the physical cwd, the Claude home, the session (`fresh`, `memory` with its id, or `file` with its source path and digest), the call to action's length and SHA-256, and the configuration that declared the run (below) |
 | `call-to-action.txt` | before the spawn, only with `keepCallToAction: true` | the call to action, exactly |
 | `stdout`, `stderr` | by the spawned process, as it runs | its own standard output and error, byte for byte: its descriptors, not pipes. Empty when it never started |
-| `start.json` | after the spawn returned | PID, process group, session id, journal path, Claude home, when the record was written, and the caller's identity reading (`identify`), if any |
+| `start.json` | after the spawn returned | PID, process group, session id, journal path, Claude home, when the record was written, the caller's identity reading (`identify`), if any, and `seededJournal`: the size and SHA-256 of the bytes put in the journal before the spawn, or `null` when nothing was |
 | `completion.json` | once it was seen to end, or it never started, or a custody-error stop ran its bounded course | outcome, exit code and signal, the stop and its cause, the group's reading, and the size and SHA-256 of each output and of the journal |
 | `observation.json` | after the completion is written, or has failed to be | the directory as [`--outcome-custody`](#reading-a-custody-directory) reads it at that moment |
 | `home/` | by `spawnClaude` and the child | the Claude home, unless `ephemeralClaudeHomePath` names another |
@@ -633,24 +634,27 @@ writes there is ever rewritten or removed. Relative, it resolves against the dir
 the configuration (`files` for `--config`, `located` for the working copy's `bare-claude.yaml`,
 `none` for `--no-config`) and every file read, in the order composed. Each file is given by its path
 as named, made absolute, by the physical path that name led to, and by the size and SHA-256 of
-exactly the bytes that were parsed. The record also names the presets selected at the root (`use`),
+exactly the bytes that were parsed. The physical path is resolved just after the read, and it is
+`null` when by then it no longer led to the file read, by device and inode. The record also names
+the presets selected at the root (`use`),
 and whether `--use` or the configuration selected them (`useFrom`). No file's contents are
 recorded, but a file can hold a credential. A digest does not reveal it, yet anyone holding a
 candidate file can confirm it against the digest.
 
-The record states what the CLI read before the run. Nothing reads those files again or compares
-them later, so a profile replaced after the run leaves the record as it was. A library caller
-passes `configuration` to `runInCustody` itself, and the record then holds what that caller stated:
-custody reads no configuration. `scope` says so in the record. Without a stated configuration the
-field is `null`. In records written by 0.12.0 it is absent.
+Custody itself reads no configuration: the record holds what `runInCustody`'s caller stated, and
+its `scope` says no more than that, whoever wrote it. When that caller is the CLI, what it states
+is what its configuration reader read before the run. A library caller passes `configuration`
+itself, and the record cannot tell the two apart. Nothing reads those files again or compares them
+later, so a profile replaced after the run leaves the record as it was. Without a stated
+configuration the field is `null`. In records written by 0.12.0 it is absent.
 
 Custody's own records hold no environment value — not `extraEnv`, not `extraSettings`, not a token
 it read — and nothing in `invocation.json`, `start.json` or `completion.json` is read from the
 output. `observation.json` is a reading of the output: it holds what the outcome reader reports,
 an error result's text and the journal's API-error texts among it, each cut to 200 characters.
 Beyond those it holds identifiers, verbatim reason codes, counts, paths and digests: no message,
-prompt or tool output. They do hold `extraArgs` as given, as
-`--debug` prints them: a secret passed there is recorded with them. The directory as a whole is
+prompt or tool output. `invocation.json`, and so `observation.json`, hold `extraArgs` as given,
+as `--debug` prints them: a secret passed there is recorded with them. The directory as a whole is
 not free of sensitive material, and custody does not make it so: `home/` holds what a kept Claude
 home holds — `settings.json`, mode 0600, with `extraSettings` merged in, its `env` block included;
 the session journal, which holds the call to action and whatever tools read, whatever
@@ -660,8 +664,12 @@ whatever the spawned process wrote. Keeping the directory is keeping all of that
 
 Under custody the CLI's stdout is the custody event stream, one JSON object per line: `started`
 (with the start record), `supervisor` (each step of a stop), `completed` (with the completion
-record, as written), and `observed` last (with the observation, and the file it was written to or
-the error that kept it from being written). Nothing else goes there: the transcript is not
+record, as written), and `observed` last. `observed` carries the file the observation was written
+to, or the error that kept it from being written, and the observation's `format`, `version`,
+`state`, `basis` and `problems`, not the whole of it. The whole reading holds the invocation,
+`extraArgs` verbatim among it, and stays in `observation.json`, mode 0600, inside the 0700
+directory, rather than reaching whatever reads or logs the stream. Nothing else goes there: the
+transcript is not
 rendered, `--debug` prints to stderr, and `print` is refused, so a declaration needs no `--quiet`
 or `--print`. The usual lines still go to stderr, then `Claude run observed: STATE`, and
 `Claude run custody at DIR` last. Writing a line passes an event on; it is not its receipt, and
@@ -918,27 +926,55 @@ and no PID is looked up. Exit 1 means only that the directory could not be liste
 
 `basis` says why, and `problems` lists everything that could not be read or did not agree.
 
+Records that disagree make the state `unknown`. That covers a start and a completion naming
+different sessions or journals, and an invocation continuing another session or naming another
+home. A completion of a process seen to end with no invocation or no start is `unknown` too:
+custody writes both before it waits for an end. Two further checks bind the outputs to the start's
+session. A stdout result naming another session, and journal records appended under other
+sessions, are each one line in `problems`, and leave the state alone. The state rests on custody's
+records, and neither output is one.
+
 **What else it holds:**
 
 - **The records**, `invocation`, `start` and `completion`. Each is `absent`; `read`, typed as
   written, with the file's size, SHA-256 and the time it was read; or `unreadable`, with why. A
   record is read only when its `format`, its `version` and every field are as custody writes them.
+  A signal name is read if any platform names it, whichever host reads it.
 - **`entries`**: the directory's names, anyone else's files included, which are not read.
-- **`stdout`**: the bytes read and read as a result by `readResult`. It also carries what the
-  completion recorded of them, and `changedSinceCompletion`. `writtenBy` is the invocation's
-  `launcher` and `executable`, and `provenance` says what that is: what that executable wrote. It
-  is native Claude Code's result only where the executable is native Claude Code. Nothing here
-  establishes that, whatever the path is called or the output looks like. `outputFormat` is the
-  last `--output-format` the invocation's `extraArgs` asked for.
+- **`writtenIn`**: the directory custody wrote the records in. It comes from
+  `invocation.directory`, or, in a record written before that field existed, from the outputs the
+  completion names. `sameAsRead` is false when the directory has been moved or copied since. Then
+  one line in `problems` says so, and a journal under the original directory is not read: read
+  there, it would be the original's journal, or nothing, not this directory's. Mapping such paths
+  into the copy is not attempted. When no record says where they were written, the journal is read
+  where the records name it, and `problems` says that too.
+- **`stdout`**: the bytes read, and what the completion recorded of them, with
+  `changedSinceCompletion`. `writtenBy` is the invocation's `launcher` and `executable`, and
+  `provenance` says what that is: what that executable wrote. It is native Claude Code's result
+  only where the executable is native Claude Code. Nothing here establishes that, whatever the
+  path is called or the output looks like. `outputFormat` is the last `--output-format` the
+  invocation's `extraArgs` asked for. `result` is `read`, by `readResult`, either because the
+  invocation asked for `json` (`json-requested`, and an empty or cut-short result is then itself
+  the finding), or because the bytes are a result though it did not ask (`parsed-as-result`, as a
+  launcher that adds the flag itself would make them). Otherwise it is `not-read`, with why.
+  `claude --print` writes text by default, and text is not misread as a broken result. A run that
+  never started has its stdout read as nothing at all.
 - **`stderr`**: the same digest facts, unread.
 - **`journal`**: the journal the completion names, or else the start (`namedBy`), read by
   `readJournal`. Like `stdout`, it carries `atCompletion` and `changedSinceCompletion`: whether it
   was written, created or removed since. That is a fact about bytes. It does not say who wrote
-  them, or whether anything still writes, and it offers no continuation.
-- **`join`**: `joinResult` over the two, when both were read. It correlates the result with a
-  journal segment. It is not process identity, and a segment's context-limit or API-error record
-  may be another process's. `stdout.result.process` stays the figures of the process that wrote
-  the result, joined or not.
+  them, or whether anything still writes, and it offers no continuation. `reading` is the whole
+  journal. A continued session's journal begins with its whole earlier history, and an earlier
+  process's context-limit or API-error record is there. `appended` reads only the bytes after
+  those `spawnClaude` seeded before the spawn, which `start.seededJournal` records by size and
+  SHA-256. Its `boundary` says where they end and how that is known, and `lineOffset` how many
+  lines they held, since its line numbers count from there. It is `not-read` when the journal no
+  longer begins with the seeded bytes, or when a start written before 0.13 continued a session.
+  Count this run's records from `appended`, not `reading`.
+- **`join`**: `joinResult` over the result and the whole journal, when both were read. It
+  correlates the result with a journal segment. It is not process identity, and a segment's
+  context-limit or API-error record may be another process's. `stdout.result.reading.process`
+  stays the figures of the process that wrote the result, joined or not.
 
 A context limit, an error result, a stop reason, API-error records and compactions are reported
 where the outcome reader puts them, verbatim and in their own scope. No threshold is applied, and
@@ -949,8 +985,9 @@ stated when it was written.
 
 **Programmatically**, from `@agladysh/bare-claude/custody`: `readCustody(directory)`, which never
 throws, resolving with a `CustodyReading`: `CustodyState`, `CustodyRecordReading`,
-`CustodyFileRead`, `CustodyOutputReading`, `CustodyStdoutReading`, `CustodyJournalReading` and
-`RecordedDigest`, with the constants `custodyReadingVersion`, `custodyReadingScope` and
+`CustodyFileRead`, `CustodyWrittenIn`, `CustodyOutputReading`, `CustodyStdoutReading`,
+`CustodyStdoutResult`, `CustodyJournalReading`, `CustodyAppendedJournal`, `CustodyJournalBoundary`
+and `RecordedDigest`, with the constants `custodyReadingVersion`, `custodyReadingScope` and
 `stdoutProvenance`.
 
 
@@ -1196,6 +1233,9 @@ A promise that resolves to a `ClaudeSubprocess` object containing:
 - `sessionJsonlPath`: Path to the session JSONL file
 - `processGroup`: The process group the spawned process leads — its PID — when spawned with
   `spawnOptions.detached: true` on macOS or Linux; `null` otherwise
+- `seededJournal`: The size and SHA-256 of exactly the bytes put in the session journal before the
+  spawn — the `customSessionData` seed, with anything the CLI preloaded into it — or `null` when
+  nothing was seeded. Everything after them was appended once the spawn had happened
 - `dispose()`: Removes the ephemeral Claude home directory, but only when `spawnClaude` created it.
   Idempotent. Call it in a `finally`; without it every spawn leaks a temporary directory.
 
