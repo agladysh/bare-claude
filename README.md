@@ -88,6 +88,18 @@ The Anthropic API key use and alternate model provider use should be okay.
 
 ## Installation
 
+Releases are cut as Git tags. To install this release, 0.13.0, from its tag:
+
+```bash
+bun add github:agladysh/bare-claude#v0.13.0
+```
+
+A tag is a name. A consumer that depends on what it installed should record the commit that name
+resolved to, as well as the tag.
+
+The npm registry is a separate route. `@agladysh/bare-claude` there resolves to whatever version
+was last published, which a Git tag does not establish:
+
 ```bash
 bun add @agladysh/bare-claude
 ```
@@ -671,7 +683,7 @@ to, or the error that kept it from being written, and the observation's `format`
 directory, rather than reaching whatever reads or logs the stream. Nothing else goes there: the
 transcript is not
 rendered, `--debug` prints to stderr, and `print` is refused, so a declaration needs no `--quiet`
-or `--print`. The usual lines still go to stderr, then `Claude run observed: STATE`, and
+or `--print`. The usual lines still go to stderr, then `Claude run observed: STATE, in FILE`, and
 `Claude run custody at DIR` last. Writing a line passes an event on; it is not its receipt, and
 whether anyone read it is not known here. A reader that goes away ends the stream, with one line on
 stderr, not the run: the completion and the observation are still written to the directory.
@@ -688,8 +700,9 @@ changes none of that: one that could not be written is reported on stderr, and t
 **The observation is a reading, not a receipt.** Every run in custody is read at its end. Opting
 into custody already opts into keeping the run's records, and the observation reads only those
 records. It reports what they say, including a context limit, an error result, a stop reason and
-outputs that changed after the completion, and it decides nothing. Whoever receives the run still
-has to read the observation and act on it.
+outputs that changed after the completion, and it decides nothing. It does not attribute the
+output to native Claude Code, and it does not say the task was done or delivered. Whoever receives
+the run still has to read the observation and act on it.
 
 What a completion says is how the spawned process ended, and nothing more:
 
@@ -978,7 +991,8 @@ records, and neither output is one.
   - **`whole`** only without a verified boundary: a continued session whose start predates 0.13,
     or a journal whose seeded prefix changed. There an earlier process that wrote no `cost-state`
     record shares a segment with this run's records, and `contextLimitRecord` may be that
-    process's.
+    process's. Count a context limit as this run's only from an `appended` join or from
+    `journal.appended`.
 
   Either way the join correlates the result with a journal segment's recorded figures. It is not
   process identity. `stdout.result.reading.process` stays the figures of the process that wrote
@@ -1381,7 +1395,8 @@ the reading as `observation.json` and calls `onEvent` with `observed`. Whatever 
 that event's `error`, and changes neither the completion nor what `runInCustody` resolves with.
 
 The records are `CustodyInvocation`, `CustodyStart` and `CustodyCompletion`, each with `format` and
-`version` (`custodyVersion`, still 1: `configuration` was added, and nothing else changed meaning);
+`version` (`custodyVersion`, still 1: `configuration`, `directory` and `seededJournal` were added,
+and nothing else changed meaning);
 a completion's `scope` is `completionScope`. Within them: `CustodySession`, `CustodyOutput`,
 `CustodyJournal`, `CustodyOutcome`, `CustodyStopCause`, `ProcessIdentity`, `CustodyIdentity` and
 `RecordedConfiguration`; `processGroupAfter` is a `ProcessGroupReading` from

@@ -1,7 +1,8 @@
 # 2026-10-16 — configuration provenance, custody reading, observation at the end
 
-Base: published `4175f7f` (v0.12.0). Two rounds, both written by Opus 5.5 with file tools only: no
-shell, no `bun`, no `tsc`, no `claude`, no model.
+Base: published `4175f7f` (v0.12.0). Three rounds, all written by Opus 5.5 with file tools only:
+no shell, no `bun`, no `tsc`, no `claude`, no model. The maintainer ran every check below. It
+ships as 0.13.0.
 
 - **First round.** The maintainer typechecked it and ran the synthetic suite: 497 pass, one skip,
   1812 assertions. An independent reading of that cut rejected ordinary use pending five repairs.
@@ -11,11 +12,16 @@ shell, no `bun`, no `tsc`, no `claude`, no model.
   configuration parsed the same under both. A delta reception found one remaining defect: the
   join still ran over the whole journal.
 - **Third round.** It joins over the appended reading whenever the boundary is verified (below).
-  **It has not been typechecked or run.** `package.json` stays 0.12.0; the entry is under
-  `[Unreleased]` as a 0.13.0 candidate.
+  The maintainer typechecked it and ran the custody tests: 34 pass, 217 assertions. The same two
+  0.12.0 directories read again `exited`, joined, with no problems: the fresh one over the
+  appended reading, the continued one over the whole journal, its boundary unknown, with no
+  context-limit record. The BOM-prefixed configuration again parsed the same under 0.12.0 and
+  this round. A final reception found no remaining material defect.
+- **Release cut:** typecheck passed; the full suite passed with 505 tests, one skip and
+  1852 assertions on 16 October 2026 (UTC+00:00), after the third round's join fix.
 
-Sources: a private receiving design and its independent reception, the reception of the first
-round, and maintainer direction. Out of scope by that direction: an environment variable naming the
+Sources: a private receiving design and its independent reception, the receptions of each round,
+and maintainer direction. Out of scope by that direction: an environment variable naming the
 custody directory to the child, and any observer outside this package.
 
 ## Decisions
@@ -115,14 +121,18 @@ custody directory to the child, and any observer outside this package.
   `extraArgs`, as above.
 - **Its CHANGELOG** did not say that `observed` breaks exhaustive switches over `CustodyEvent`, or
   that `runInCustody` now resolves after a whole-directory read.
+- **The second round's join** ran over the whole journal, as above.
 
 ## Not established
 
-- **Third round:** typecheck and every test. The regression appends this run's measured call
-  and `cost-state` record by hand after the run, since the fake writes neither.
-- **Still unseen:** a join over the appended reading of a real continued `claude` run.
+- The join regression appends this run's measured call and `cost-state` record by hand after
+  the run, since the fake writes neither.
+- **Still unseen:** a join over the appended reading of a real continued `claude` run, and any
+  0.13.0 custody run of the real `claude`.
 - **A whole-journal join for a continued 0.12.0 directory** may still name an inherited error.
   It is labelled `over: 'whole'` and is not repaired, because nothing records the boundary there.
+  A consumer counts a context limit as this run's only from an `appended` join or
+  `journal.appended`. The one real continued 0.12.0 directory read had none to name.
 - **Unprobed outcomes:**
   - `realPath` coming out `null`: no test races a symlink swap.
 - **Known exposures left open:**
@@ -136,5 +146,5 @@ custody directory to the child, and any observer outside this package.
 
 ## What this is not
 
-It observes runs in custody only. It is not native attribution, it is not a receipt, and it makes
-no adequacy claim.
+It observes runs in custody only. It is not native attribution, it is not a receipt, it is not
+the task done or delivered, and it makes no adequacy claim.

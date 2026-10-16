@@ -1,8 +1,6 @@
 # Changelog
 
-## [Unreleased]
-
-A 0.13.0 candidate. `package.json` stays 0.12.0 until it is received and released.
+## [v0.13.0] - 2026-10-16
 
 ### Added
 
@@ -39,7 +37,8 @@ A 0.13.0 candidate. `package.json` stays 0.12.0 until it is received and release
     the appended reading whenever the boundary is verified (`join.over: 'appended'`), so an
     inherited context-limit record is never this run's `join.contextLimitRecord`. Only without a
     verified boundary, as in a continued 0.12.0 directory, is it joined over the whole journal
-    (`'whole'`), with the caveat that the joined segment may hold an earlier process's records.
+    (`'whole'`), with the caveat that the joined segment may hold an earlier process's records:
+    count a context limit as this run's only from an `'appended'` join or `journal.appended`.
   - **Changes since the completion.** Changes to stdout, stderr and the journal are reported as
     facts, and no continuation is offered.
   - **Moved or copied directories** are said to be such, and the original's journal is not read as
@@ -47,14 +46,16 @@ A 0.13.0 candidate. `package.json` stays 0.12.0 until it is received and release
   - **Boundaries.** Nothing is spawned or signalled, and no PID is looked up.
 - **Every custody run is observed at its end.** Once the completion is written, or has failed to
   be, custody reads the directory with `readCustody`, writes `observation.json` and emits an
-  `observed` event after `completed`, and the CLI prints `Claude run observed: STATE`.
-  - **On CLI stdout.** The event carries the observation's format, version, state, basis and
-    problems only. The whole reading, with the invocation's `extraArgs`, stays in
-    `observation.json` and the library event.
+  `observed` event after `completed`, and the CLI prints `Claude run observed: STATE, in FILE` on
+  stderr.
+  - **On CLI stdout.** Of the observation, the event carries only its format, version, state,
+    basis and problems, beside the directory, the file and any error. The whole reading, with the
+    invocation's `extraArgs`, stays in `observation.json` and the library event.
   - **Failures.** An observation that cannot be read or written is that event's `error` and a
     stderr line. It changes neither the completion, nor what `runInCustody` resolves with, nor the
     CLI's exit status.
-  - **Not a receipt.** It is a reading, not a receipt.
+  - **A reading, nothing more.** It reports what the records say. It is not a receipt, not
+    native attribution, and not the task done or delivered.
 
 ### Changed
 
@@ -72,6 +73,7 @@ A 0.13.0 candidate. `package.json` stays 0.12.0 until it is received and release
   for one root-only file composed it twice and repeated its arrays.
 - `parseOutcomeRequest()` returns `OutcomeRequest | CustodyRequest | string`.
 - Under custody, `Claude run custody at DIR` is printed after the observation line, still last.
+- The README installs a release from its Git tag, and says the npm registry is a separate route.
 
 ## [v0.12.0] - 2026-10-16
 
