@@ -126,6 +126,11 @@ Verified against `claude` 2.1.220 on macOS. Re-verify, with a dated note, when t
   false forever, however many times you await it. Take a fresh handle per check when the file is
   being written by someone else — this silently disabled transcript rendering for months.
 
+- On macOS with Bun 1.3.13, 16 October 2026, a numeric stdout descriptor passed to
+  `Bun.spawn` remained open in the parent at spawn and after child exit, naming the same
+  device/inode as its file. The caller then closed it. The discriminating test is in
+  `src/custody.test.ts`; this is not a claim about other Bun versions or platforms.
+
 ## Session reports
 
 A substantial session ends by writing `doc/sessions/YYYY-MM-DD-slug.md`. Substantial means: you

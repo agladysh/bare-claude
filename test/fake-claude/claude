@@ -52,6 +52,9 @@
  *   FAKE_CLAUDE_IGNORE_SIGTERM - `'1'` ignores SIGTERM, as a process that
  *                                will not shut down when asked; only SIGKILL
  *                                then ends it.
+ *   FAKE_CLAUDE_STDOUT_FIRST   - text written to stdout before the sleep, so
+ *                                a stopped run has output to keep.
+ *   FAKE_CLAUDE_STDERR         - text written to stderr just before exiting.
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -125,6 +128,11 @@ if (process.env.FAKE_CLAUDE_WRITE_SESSION !== '0') {
   }
 }
 
+const stdoutFirst = process.env.FAKE_CLAUDE_STDOUT_FIRST;
+if (stdoutFirst !== undefined) {
+  process.stdout.write(stdoutFirst);
+}
+
 const sleepMs = Number(process.env.FAKE_CLAUDE_SLEEP_MS ?? '0');
 const appendEveryMs = Number(process.env.FAKE_CLAUDE_APPEND_EVERY_MS ?? '0');
 const sleepUntil = Date.now() + sleepMs;
@@ -133,6 +141,11 @@ while (Date.now() < sleepUntil) {
   if (appendEveryMs > 0 && sessionPath !== null) {
     await fs.appendFile(sessionPath, `${JSON.stringify({ type: 'progress', at: Date.now() })}\n`);
   }
+}
+
+const stderrText = process.env.FAKE_CLAUDE_STDERR;
+if (stderrText !== undefined) {
+  process.stderr.write(stderrText);
 }
 
 const echo = process.env.FAKE_CLAUDE_ECHO_ENV;

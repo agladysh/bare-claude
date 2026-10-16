@@ -20,14 +20,18 @@ import { SessionBuilder } from '@agladysh/bare-claude/SessionBuilder';
 
 import pkg from '../package.json';
 import {
-  authMode, effortLevel, loadConfig, type ConfigSource, type EffortLevel
+  authMode, effortLevel, loadConfig, loadConfigFiles, type Config, type ConfigSource, type EffortLevel
 } from '@agladysh/bare-claude/config';
 import type { AuthMode } from '@agladysh/bare-claude';
 import { resolveInvocation, type DynamicPreset, type Preset } from '@agladysh/bare-claude/preset';
 import { formatDoctorReport, runDoctor } from '@agladysh/bare-claude/doctor';
 import {
-  notPermittedRecheckMs, readProcessGroup, signalExitStatus, superviseSignals, type StopReport, type SupervisorEvent
+  notPermittedRecheckMs, readProcessGroup, signalExitStatus, superviseSignals,
+  type ProcessGroupState, type StopReport, type SupervisorEvent
 } from '@agladysh/bare-claude/lifecycle';
+import {
+  custodyFiles, runInCustody, type CustodyDeclaration, type CustodyEvent
+} from '@agladysh/bare-claude/custody';
 import { alternateCredentialVariables, tokenVariable } from '@agladysh/bare-claude/token';
 import { readUsage } from '@agladysh/bare-claude/usage';
 
@@ -40,7 +44,8 @@ function displayHelp() {
     'Options:',
     '  -u, --use <preset>     Use configuration preset from bare-claude.yaml',
     '      --config <file>    Read this configuration file instead of bare-claude.yaml',
-    '                         at the Git root; it must exist',
+    '                         at the Git root; it must exist. Repeatable: later files',
+    '                         override earlier ones, and named presets are pooled',
     '      --no-config        Read no configuration file at all',
     '  -l, --launcher <name>  claude (default) or ollama',
     '  -m, --model <model>    Model to use',
@@ -73,6 +78,9 @@ function displayHelp() {
     '      --stop-grace-ms <n>',
     '                         After SIGTERM, SIGINT or SIGHUP, how long the run gets',
     '                         before its process group is sent SIGKILL (default 10000)',
+    '      --custody <dir>    Keep the run in this new directory: invocation, raw stdout',
+    '                         and stderr, start and completion records. stdout then',
+    '                         carries one JSON custody event per line and nothing else',
     '',
     '      --verbose          Print more events in the transcript',
     '      --debug            Print the resolved configuration and unrecognized events',
@@ -88,7 +96,7 @@ function displayHelp() {
     'ended, not that the task was done; after a stop signal, with 128 plus its number.',
     'SIGTERM, SIGINT and SIGHUP go to claude first; a second one sends SIGKILL at once.',
     'SIGKILL to bare-claude itself cannot be forwarded: signal the process group it',
-    'reports instead.',
+    'reports instead. Under custody, a run that never started exits 1.',
     '',
     'A bare run does not inherit the ambient login session: set CLAUDE_CODE_OAUTH_TOKEN',
     'from `claude setup-token`, or write the bare token to ~/.config/bare-claude/oauth',
@@ -100,23 +108,47 @@ function displayHelp() {
 }
 
 /**
- * `--config` and `--no-config` as a {@link ConfigSource}. Neither means the
- * located `bare-claude.yaml`; both is a contradiction, refused.
+ * What `--config` and `--no-config` select: the located `bare-claude.yaml`
+ * when neither is given, no file under `--no-config`, or the named files —
+ * each of which must exist, composed in order by `loadConfigFiles`. Both
+ * flags at once is a contradiction, refused.
  */
-function configSource(file: string | undefined, none: boolean | undefined): ConfigSource {
-  if (file !== undefined && none) {
+type ConfigChoice = { kind: 'located' } | { kind: 'none' } | { kind: 'files', paths: string[] };
+
+function configChoice(files: string[] | undefined, none: boolean | undefined): ConfigChoice {
+  if (files !== undefined && none) {
     throw new Error('--config and --no-config cannot be given together');
   }
   if (none) {
     return { kind: 'none' };
   }
-  if (file === undefined) {
+  if (files === undefined) {
     return { kind: 'located' };
   }
-  if (file === '') {
+  if (files.includes('')) {
     throw new Error('--config needs a file');
   }
-  return { kind: 'file', path: path.resolve(file) };
+  return { kind: 'files', paths: files.map(file => path.resolve(file)) };
+}
+
+/** The configuration a run reads for `choice`. */
+function readConfiguration(choice: ConfigChoice): Promise<Config> {
+  return choice.kind === 'files' ? loadConfigFiles(choice.paths) : loadConfig(choice);
+}
+
+/**
+ * `choice` as the doctor's {@link ConfigSource}, which names one file at
+ * most. Several are refused rather than checked as something else.
+ */
+function doctorSource(choice: ConfigChoice): ConfigSource {
+  if (choice.kind !== 'files') {
+    return choice;
+  }
+  const [ only, ...more ] = choice.paths;
+  if (only === undefined || more.length > 0) {
+    throw new Error('--doctor checks one --config file; it does not check several composed');
+  }
+  return { kind: 'file', path: only };
 }
 
 /**
@@ -135,6 +167,7 @@ async function loadPreset(): Promise<Startup> {
       },
       config: {
         type: 'string',
+        multiple: true,
       },
       'no-config': {
         type: 'boolean',
@@ -228,6 +261,9 @@ async function loadPreset(): Promise<Startup> {
       'stop-grace-ms': {
         type: 'string',
       },
+      custody: {
+        type: 'string',
+      },
     },
     strict: true,
     allowPositionals: true,
@@ -272,7 +308,7 @@ async function loadPreset(): Promise<Startup> {
     return { kind: 'done', exitCode: 0 };
   }
 
-  const source = configSource(values.config, values['no-config']);
+  const choice = configChoice(values.config, values['no-config']);
 
   const fromCli: DynamicPreset = {};
   const set = <K extends keyof DynamicPreset>(key: K, value: DynamicPreset[K] | undefined) => {
@@ -301,11 +337,12 @@ async function loadPreset(): Promise<Startup> {
   set('maxOutputLength', parseNumber('max-output-length', values['max-output-length']));
   set('extraArgs', values['claude-arg']);
   set('stopGraceMs', parseGrace(values['stop-grace-ms']));
+  set('custody', values.custody === undefined ? undefined : { directory: values.custody });
 
   if (values.doctor) {
     // The same configuration, overrides and `use` a run would merge, so the
     // doctor checks the invocation a run would make, not the shell around it.
-    const report = await runDoctor({ config: source, use: values.use, overrides: fromCli });
+    const report = await runDoctor({ config: doctorSource(choice), use: values.use, overrides: fromCli });
     process.stdout.write(formatDoctorReport(report));
     return { kind: 'done', exitCode: report.ok ? 0 : 1 };
   }
@@ -317,7 +354,7 @@ async function loadPreset(): Promise<Startup> {
     ? positionals.join(' ')
     : (process.stdin.isTTY ? undefined : (await Bun.stdin.text()).trim() || undefined));
 
-  return { kind: 'run', preset: resolveInvocation(await loadConfig(source), fromCli, values.use) };
+  return { kind: 'run', preset: resolveInvocation(await readConfiguration(choice), fromCli, values.use) };
 }
 
 function isLauncher(value: string): value is Launcher {
@@ -446,14 +483,21 @@ async function main() {
   }
   const { preset } = startup;
 
+  // Under custody, stdout carries custody events and nothing else.
   if (preset.debug) {
-    process.stdout.write(`Configuration:\n${JSON.stringify(debugView(preset), redactCredentials, 2)}\n`);
+    (preset.custody === undefined ? process.stdout : process.stderr)
+      .write(`Configuration:\n${JSON.stringify(debugView(preset), redactCredentials, 2)}\n`);
   }
 
   // Resolved now for its refusals alone — an unknown or contradictory auth
   // mode, a session id that cannot name a file — so they land before a
   // preload has run anybody's shell command.
   LaunchConfig(preset);
+  if (preset.custody !== undefined && preset.print) {
+    throw new Error(
+      `print cannot be combined with custody: the child's stdout goes to the custody directory's ${custodyFiles.stdout} file`
+    );
+  }
 
   // The run's own directory, resolved exactly as spawnClaude will resolve it:
   // what the child runs in, and so what preloads resolve against and the
@@ -517,6 +561,10 @@ async function main() {
   }
 
   preset.permissionMode ??= 'acceptEdits';
+
+  if (preset.custody !== undefined) {
+    return runUnderCustody(preset, preset.custody);
+  }
 
   // The library's own supervision, installed before the spawn so a signal
   // that arrives meanwhile is held rather than ending this process and
@@ -654,6 +702,123 @@ async function main() {
   }
 }
 
+/**
+ * A run in custody, the library's own: each custody event goes to stdout as
+ * one JSON line, and the usual lines to stderr. Exits as an ordinary run does
+ * — the child's status, or 128+n after a stop signal — and 1 when the run
+ * never started, or when custody failed to record something and the child's
+ * status would otherwise read as success.
+ */
+async function runUnderCustody(preset: Preset, custody: CustodyDeclaration): Promise<number> {
+  // Writing a line passes an event on; it is not its receipt. A reader that
+  // has gone ends the stream here, never the run: the completion is still
+  // written to the directory, and the exit status is still the run's.
+  let streaming = true;
+  const endStream = (error: unknown) => {
+    if (streaming) {
+      streaming = false;
+      process.stderr.write(`bare-claude: custody events no longer reach stdout (${messageOf(error)}); `
+        + `the run goes on, and ${custodyFiles.completion} in its custody directory records its end\n`);
+    }
+  };
+  process.stdout.on('error', endStream);
+
+  let group: number | null = null;
+  const completion = await runInCustody(preset, {
+    directory: custody.directory,
+    keepCallToAction: custody.keepCallToAction,
+    graceMs: preset.stopGraceMs ?? defaultStopGraceMs,
+    onEvent: event => {
+      if (event.kind === 'started') {
+        group = event.start.processGroup;
+      }
+      if (streaming) {
+        try {
+          process.stdout.write(`${JSON.stringify(event)}\n`, error => {
+            if (error) {
+              endStream(error);
+            }
+          });
+        } catch (error) {
+          endStream(error);
+        }
+      }
+      process.stderr.write(describeCustodyEvent(event, group));
+    },
+  });
+
+  if (completion.outcome === 'not-started') {
+    return 1;
+  }
+  if (completion.custodyError !== null) {
+    process.stderr.write(`bare-claude: custody: ${completion.custodyError}\n`);
+  }
+  if (completion.stoppedBy !== null) {
+    return signalExitStatus(completion.stoppedBy);
+  }
+  // A run whose custody failed is not passed off as a success.
+  if (completion.exitStatus === null || (completion.exitStatus === 0 && completion.custodyError !== null)) {
+    return 1;
+  }
+  return completion.exitStatus;
+}
+
+/** The stderr lines for a custody event, as an ordinary run prints them. */
+function describeCustodyEvent(event: CustodyEvent, group: number | null): string {
+  switch (event.kind) {
+    case 'started': {
+      const { start } = event;
+      const spawned = start.processGroup === null
+        ? `Claude process ${start.pid}`
+        : `Claude process group ${start.processGroup}`;
+      return `Claude session journal at ${start.sessionJsonlPath}\n${spawned}\n`;
+    }
+    case 'supervisor':
+      return describeSupervisorEvent(event.event);
+    case 'completed': {
+      const { completion } = event;
+      const lines: string[] = [];
+      if (completion.outcome === 'not-started') {
+        lines.push(`bare-claude: claude was not started: ${completion.notStarted ?? 'no reason was recorded'}`);
+      } else {
+        lines.push(`Claude process ended: ${describeEnd(completion)}`);
+        if (completion.stop !== null) {
+          lines.push(completion.stop.report === null
+            ? `Claude stop: started by ${completion.stop.cause}; it failed before it could report`
+            : describeStop(completion.stop.report));
+        } else if (completion.processGroupAfter !== null && group !== null) {
+          const left = describeLeftovers(completion.processGroupAfter.state, group);
+          if (left !== null) {
+            lines.push(left);
+          }
+        }
+      }
+      lines.push(`Claude run custody at ${event.directory}`);
+      return `${lines.join('\n')}\n`;
+    }
+  }
+}
+
+/**
+ * What a run that ended on its own left in its process group, as one stderr
+ * line; null when the group read empty, which covers that group alone.
+ */
+function describeLeftovers(state: ProcessGroupState, group: number): string | null {
+  switch (state) {
+    case 'empty':
+      return null;
+    case 'occupied':
+      return `bare-claude: claude exited, but process group ${group} still has processes; `
+        + 'they were not signalled and may still be running';
+    case 'not-permitted':
+      return `bare-claude: claude exited, but process group ${group} was ${notShownEmpty}; nothing in it was signalled`;
+  }
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 /** One stderr line for each thing the supervisor did. */
 function describeSupervisorEvent(event: SupervisorEvent): string {
   switch (event.kind) {
@@ -701,7 +866,7 @@ async function within<T>(promise: Promise<T>, ms: number, fallback: T): Promise<
 }
 
 /** How the spawned process ended, as Bun reports it. */
-function describeEnd(subprocess: { exitCode: number | null, signalCode: NodeJS.Signals | null }): string {
+function describeEnd(subprocess: { exitCode: number | null, signalCode: number | NodeJS.Signals | null }): string {
   if (subprocess.signalCode !== null) {
     return `signal ${subprocess.signalCode}`;
   }

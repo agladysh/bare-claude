@@ -133,8 +133,9 @@ bare-claude --use claude -- 'Explain this project'
 Options:
 
 - `-u, --use [presetId]`: use configuration preset `presetId`
-- `--config [file]`: read this configuration file instead of `bare-claude.yaml` at the Git root
-  (see [Choosing the configuration](#choosing-the-configuration))
+- `--config [file]`: read this configuration file instead of `bare-claude.yaml` at the Git root;
+  may be included several times, later files over earlier ones (see
+  [Choosing the configuration](#choosing-the-configuration))
 - `--no-config`: read no configuration file
 - `-l, --launcher [value]`: `claude` for native Anthropic modes (default), `ollama` for `ollama launch`
 - `-m, --model [model]`: model to be used
@@ -175,6 +176,8 @@ Options:
 - `--stop-grace-ms [n]`: after `bare-claude` receives SIGTERM, SIGINT or SIGHUP, how long the run
   gets before its process group is sent SIGKILL; default 10000 (see
   [Stopping a run](#stopping-a-run))
+- `--custody [dir]`: keep the run in this new directory, and make stdout one JSON custody event per
+  line and nothing else (see [Run custody](#run-custody))
 - `--claude-arg [arg]`: forward a flag to `claude` verbatim, may be included several times
 - `-v, --version`: print the version and exit
 - `-h, --help`: print this help and exit
@@ -312,8 +315,10 @@ someone else's working copy, or from none, chooses instead:
 
 - `--config FILE` reads that file, which must exist, and no other. No Git working copy is needed.
   Its named presets serve `--use`. This is how one invocation is declared whole: working
-  directory, Claude home, tools and read scope, auth mode and session seed in one validated file,
-  with nothing copied from a launcher script.
+  directory, Claude home, tools and read scope, auth mode, session seed and output in one
+  validated file, with nothing copied from a launcher script and no flag left to remember. Given
+  several times, it reads each file, in order, and composes them (see
+  [Composing several files](#composing-several-files)).
 - `--no-config` reads none: only the command line and the library defaults apply.
 
 The file is validated the same way whichever route selected it, before anything is spawned. The
@@ -333,11 +338,15 @@ customSessionData:
   sessionId: 0199e7a0-5b1c-7c2e-9d4f-3a6b8c0d1e2f
   sourcePath: /work/runs/0041/claude-home/projects/-work-checkout/0199e7a0-5b1c-7c2e-9d4f-3a6b8c0d1e2f.jsonl
   # sourceSha256: the 64 lowercase hex digits recorded when run 0041 ended
+callToAction: Continue
+# What `claude --print` prints, and no transcript beside it, on stdout.
+quiet: true
+print: true
 ```
 
 ```bash
 env -i PATH="$PATH" HOME="$HOME" USER="$USER" TMPDIR="${TMPDIR:-/tmp}" \
-  bare-claude --config invocation.yaml --quiet --print -- 'Continue'
+  bare-claude --config invocation.yaml
 ```
 
 `env -i` is the command line's way to scrub the environment the run inherits; `noProcessEnv`
@@ -349,7 +358,50 @@ come first; a list copied from here is not a substitute for them.
 
 The doctor reads the same configuration the same way: `bare-claude --doctor --config
 invocation.yaml`, with the same `--use` and flags, checks the executable, working directory,
-auth mode and child environment that run would have.
+auth mode and child environment that run would have. It reads one named file: `--doctor` with
+several `--config` files is refused rather than checked as something else. For a composed run,
+`bare-claude --doctor --config profile.yaml --use worker` checks the profile's launcher, auth
+and environment; fields only the run's own file sets, such as its `cwd`, are not checked.
+
+#### Composing several files
+
+A shared profile and one run's own declaration need not be copied into one file. Name both, the
+profile first:
+
+```yaml
+# profile.yaml, maintained once
+presets:
+  worker:
+    auth: caller
+    claudePath: /opt/launchers/claude
+    extraArgs: [--output-format, json]
+```
+
+```yaml
+# run-0042.yaml, written for one run
+use: worker
+cwd: /work/checkout
+model: opus
+tools: [Read, Grep, Glob]
+callToAction: '# Review the change described in NOTES.md'
+custody:
+  directory: /work/runs/0042
+```
+
+```bash
+bare-claude --config profile.yaml --config run-0042.yaml
+```
+
+The files compose as though they were one, each validated on its own first:
+
+- named presets are pooled, and a name two files define is refused;
+- root presets merge in order, as presets do: a later file's values win, records merge key by key,
+  arrays concatenate;
+- at most one file's root may name a `use`; two are refused, and `--use` still replaces it;
+- naming one file twice is refused.
+
+The command line then goes on top, exactly as over one file. What the profile says reaches every
+run that names it; a credential in its `extraEnv` included.
 
 #### Preset
 
@@ -430,7 +482,8 @@ Presets are merged in the following order (later sources override earlier ones):
 2. Values from presets specified by the `--use` option or `use` Preset field
    (can be a single Preset or a list; Presets are merged left to right,
    with later Presets overriding earlier ones)
-3. Values from `bare-claude.yaml` (top-level keys, excluding the `presets` section)
+3. Values from `bare-claude.yaml` (top-level keys, excluding the `presets` section), or from the
+   `--config` files, composed in order
 4. Command-line options
 
 A preset's own directly-set fields win over anything it pulls in via `use` — inheritance, not a
@@ -546,6 +599,77 @@ If anything fails after the journal is published but before `claude` is spawned 
 are taken back, so the same invocation can simply be retried. Each is taken back only while it is
 provably still what this run wrote: the journal while the path names the same file, the history
 line while nothing has been appended after it. Anything else is left, and the error says so.
+
+## Run custody
+
+`--custody DIR` (`custody: { directory, keepCallToAction? }` in a configuration file) keeps one run
+in a directory of its own, from before the spawn until the spawned process has been seen to end.
+The directory must not exist, and its parent must: custody begins fresh, mode 0700, and nothing it
+writes there is ever rewritten or removed. Relative, it resolves against the directory
+`bare-claude` runs in.
+
+| File | Written | Holds |
+| --- | --- | --- |
+| `invocation.json` | before the spawn | launcher, executable, model, effort, permission mode, tools, `addDirs`, budget and token caps, auth mode, `linkAuth`, `noProcessEnv`, `extraArgs` as given, the physical cwd, the Claude home, the session (`fresh`, `memory` with its id, or `file` with its source path and digest), and the call to action's length and SHA-256 |
+| `call-to-action.txt` | before the spawn, only with `keepCallToAction: true` | the call to action, exactly |
+| `stdout`, `stderr` | by the spawned process, as it runs | its own standard output and error, byte for byte: its descriptors, not pipes. Empty when it never started |
+| `start.json` | after the spawn returned | PID, process group, session id, journal path, Claude home, when the record was written, and the caller's identity reading (`identify`), if any |
+| `completion.json` | once it was seen to end, or it never started, or a custody-error stop ran its bounded course | outcome, exit code and signal, the stop and its cause, the group's reading, and the size and SHA-256 of each output and of the journal |
+| `home/` | by `spawnClaude` and the child | the Claude home, unless `ephemeralClaudeHomePath` names another |
+
+Custody's own records hold no environment value — not `extraEnv`, not `extraSettings`, not a token
+it read — and nothing in them is read from the output. They do hold `extraArgs` as given, as
+`--debug` prints them: a secret passed there is recorded with them. The directory as a whole is
+not free of sensitive material, and custody does not make it so: `home/` holds what a kept Claude
+home holds — `settings.json`, mode 0600, with `extraSettings` merged in, its `env` block included;
+the session journal, which holds the call to action and whatever tools read, whatever
+`keepCallToAction` says; under `auth: fallback` with `linkAuth`, a symbolic link to the real
+credential file where one was found; and Claude Code's own state. `stdout` and `stderr` hold
+whatever the spawned process wrote. Keeping the directory is keeping all of that.
+
+Under custody the CLI's stdout is the custody event stream, one JSON object per line: `started`
+(with the start record), `supervisor` (each step of a stop), `completed` (with the completion
+record, as written). Nothing else goes there: the transcript is not rendered, `--debug` prints to
+stderr, and `print` is refused, so a declaration needs no `--quiet` or `--print`. The usual lines
+still go to stderr, and `Claude run custody at DIR` last. Writing a line passes an event on; it is
+not its receipt, and whether anyone read it is not known here. A reader that goes away ends the
+stream, with one line on stderr, not the run: the completion is still written to the directory.
+
+The exit status is the child's own, or 128+n after a stop signal, as for any run; 1 when the run
+never started, and 1 rather than 0 when custody failed to record something.
+
+What a completion says is how the spawned process ended, and nothing more:
+
+- `exited`: it was seen to end without custody stopping it — its own exit, or a signal someone
+  else sent (`exitCode`, `signalCode`);
+- `stopped`: custody started a stop through the supervisor (`stop.cause`: the signal, `cancelled`
+  for a library caller's abort, or `custody-error` when custody could not record the start).
+  After a `custody-error` stop, both `exitCode` and `signalCode` null mean it had not been seen to
+  end when the stop's bounded waits ran out; after any other stop, custody waits for its exit
+  without a bound, as an ordinary run does;
+- `not-started`: it never started, and `notStarted` says why.
+
+That process is whatever `--claude-path` names, a launcher perhaps, not native Claude Code. Its
+exit is not native's, and not the task done, delivered or accepted; `stdout` is what it wrote —
+native's result only when it is native, or as far as a launcher passed it on. `ended` is when
+custody wrote the completion, not when anything the run started last acted.
+
+A directory with `invocation.json` and no `start.json` may hold a run spawned just before its
+runner died, since the start is recorded after the spawn; one with `start.json` and no
+`completion.json` is a run whose end custody did not record: its runner died before or after
+the spawned process ended, and nothing here says which. Either outcome is unknown, not failed
+and not done. `start.json` names the PID and group as they were; its `recorded` time is when custody wrote
+it, not when the process began. A PID names whatever holds it when it is read, so acting on one
+later needs an identity — `identity`, when a library caller gave `identify` — established by
+whoever acts.
+
+Custody offers no continuation. `journal` records the session's path, id, size and SHA-256 as read,
+and `processGroupAfter` the group's reading; neither shows that nothing is still writing the
+session. `empty` covers that one process group: a process that started a session of its own — a
+launcher's native child, say — is outside it and may outlive it. Whether to continue is the
+caller's to establish, with whatever knows the native process. A caller that decides to passes
+`{ sessionId, sourcePath: journal.path, sourceSha256: journal.sha256 }` as `customSessionData`, and
+the digest makes the next spawn refuse a journal that changed since it was read.
 
 ## Preloading Context
 
@@ -950,6 +1074,47 @@ with `{ state, observations }`: the last state, and every reading with its time.
 `not-permitted` that lasts the whole second is reported as it is. A stop ends processes; it does
 not undo what they wrote or sent.
 
+### runInCustody(launchOptions, options)
+
+From `@agladysh/bare-claude/custody`: the library behind `--custody`. Spawns as `spawnClaude`
+does, detached on macOS and Linux, under `superviseSignals`, and keeps the run as
+[Run custody](#run-custody) describes. `options`, a `CustodyOptions`:
+
+- `directory` and `keepCallToAction`, a `CustodyDeclaration`, what a preset's `custody` holds;
+- `graceMs`, and optionally `signals` and `source`, passed to `superviseSignals`;
+- `env`, the spawn's environment layer (`spawnOptions.env`), never recorded;
+- `signal`, an `AbortSignal` that stops the run with SIGTERM, recorded as `cancelled`;
+- `onEvent`, called with each `CustodyEvent` synchronously, best-effort as `superviseSignals`'
+  reporter is: an exception it throws is ignored, and a call hands an event to the caller's code,
+  which is not evidence anyone received it;
+- `identify`, a synchronous reader of the spawned PID's identity by the caller's own means, called
+  once as soon as the spawn returns and before custody awaits anything. Its `ProcessIdentity` —
+  `method`, `start`, `boot` — is recorded in `start.json` as given, three fields only, or the
+  error it threw. Custody reads no process table itself, and whether the PID still named the
+  spawned process when it was read is the reader's to establish.
+
+```typescript
+import { runInCustody } from '@agladysh/bare-claude/custody';
+
+const completion = await runInCustody(
+  { callToAction: 'Explain this project to me', extraArgs: [ '--output-format', 'json' ] },
+  { directory: '/work/runs/0042', graceMs: 10_000, onEvent: event => console.error(event.kind) },
+);
+```
+
+Throws, writing nothing, when the launch options or call to action are refused, the cwd does not
+exist, `graceMs` or `signals` are invalid, the signal is already aborted, or the directory exists
+or has no parent. Once the directory is made it resolves with a `CustodyCompletion`: a failure to
+spawn is `outcome: 'not-started'`; when custody cannot write `start.json` it stops the run
+(`stop.cause: 'custody-error'`), since a run nobody could later find is not one it keeps. When
+`completion.json` itself cannot be written, the resolved completion's `custodyError` says so.
+
+The records are `CustodyInvocation`, `CustodyStart` and `CustodyCompletion`, each with `format` and
+`version` (`custodyVersion`, now 1); a completion's `scope` is `completionScope`. Within them:
+`CustodySession`, `CustodyOutput`, `CustodyJournal`, `CustodyOutcome`, `CustodyStopCause`,
+`ProcessIdentity` and `CustodyIdentity`; `processGroupAfter` is a `ProcessGroupReading` from
+`@agladysh/bare-claude/lifecycle`. `custodyFiles` names every file.
+
 ### Pure launch configuration
 
 `spawnClaude` is assembly plus side effects. The assembly is exported separately, so the whole
@@ -1019,7 +1184,9 @@ the enclosing Git working copy, whether or not the file exists — or `null` out
 `loadConfig(source, cwd?)` reads the configuration a `ConfigSource` selects —
 `{ kind: 'located' }`, `{ kind: 'file', path }` or `{ kind: 'none' }`, the library side of the
 default, `--config` and `--no-config` — and validates it; see
-[Choosing the configuration](#choosing-the-configuration). `authMode` is the schema for the
+[Choosing the configuration](#choosing-the-configuration). `loadConfigFiles(paths)` reads several
+named files, each of which must exist, validates each, and composes them in order with
+`composeConfigs`; it is what the CLI reads for any `--config`. `authMode` is the schema for the
 `auth` field, as `effortLevel` is for its own.
 
 `@agladysh/bare-claude/preset` exports `resolvePreset(preset, presets)`, which folds a
@@ -1029,7 +1196,10 @@ default, `--config` and `--no-config` — and validates it; see
 configuration's root preset, the command line's fields over it, `--use` replacing the root's
 `use` — into a `MergedPreset` that need not be runnable; `resolveInvocation` does the same and
 then requires a `callToAction`. The CLI runs through the second and `--doctor` through the first,
-so both read an invocation identically. A `Preset` also carries the CLI-only `stopGraceMs`.
+so both read an invocation identically. A `Preset` also carries the CLI-only `stopGraceMs` and
+`custody`. `composeConfigs(layers)` composes `Config`s, each a `ConfigLayer` `{ source, config }`
+named by `source` in its refusals, as [Composing several files](#composing-several-files)
+describes.
 
 ### Token file
 
