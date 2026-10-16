@@ -1794,7 +1794,7 @@ export const custodyBriefVersion = 1;
 export const custodyBriefScope = 'one custody reading without its named payload fields (call to action, prompt, result, error and API-error text, stderr, problem text, extraArgs, environment); not redaction. Showing it is not reception of the run\'s return, which is read from its stdout, and says nothing of whether the task was done, delivered, received or accepted';
 
 /** What every `costUsd` in a brief is. */
-export const briefCostBasis = 'Claude Code\'s own reported dollar estimate: not a bill, and not subscription usage';
+export const briefCostBasis = 'Claude Code\'s own reported dollar figure: not a bill, and not subscription usage';
 
 /** How a run's custody ended, as its completion records it: classifications and numbers only. */
 export interface BriefEnd {
@@ -1875,11 +1875,12 @@ export type LineageMatch = 'completion.journal' | 'journal as read';
  *   other than the one its invocation required, or a continued session with
  *   nothing seeded.
  * - `ambiguous`: the journals of all the `candidates` have the digest
- *   seeded, a directory and a copy of it among them. None is chosen.
+ *   seeded, for example a directory and a copy of it. None is chosen.
  * - `source-differs`: no journal given has the digest seeded, and the
  *   `candidates` are the runs whose recorded journal path is the file the
- *   invocation names as its source: that journal, as its completion recorded
- *   it and as read, is not the bytes seeded. Paths are compared as recorded.
+ *   invocation names as its source: its completion digest, and its digest
+ *   as read when available, differ from the bytes seeded. Paths are compared
+ *   as recorded.
  * - `unresolved`: no journal given has the digest seeded. Its predecessor
  *   may simply not be among those given; bytes preloaded into a seed also
  *   make it so, as they change the digest.
