@@ -27,8 +27,30 @@
  * is; a library caller should too, rather than rebuilding it.
  */
 
-/** Whether a process group still has members this process may signal. */
+/**
+ * What signal 0 to a process group answered: `occupied` when it succeeded,
+ * so some member could be signalled; `empty` on ESRCH, when there is no such
+ * group; `not-permitted` on EPERM, when this process may signal none of the
+ * members `kill(2)` found. EPERM does not say whether any of them is still
+ * running, whose it is, or whether it will go: it is not `empty`, and it is
+ * not evidence of anyone's ownership.
+ */
 export type ProcessGroupState = 'empty' | 'occupied' | 'not-permitted';
+
+/** One signal-0 reading of a process group, `elapsedMs` after the first. */
+export interface ProcessGroupObservation {
+  elapsedMs: number,
+  state: ProcessGroupState,
+}
+
+/** A process group's state, with every reading it was decided from. */
+export interface ProcessGroupReading {
+  /** The last reading's state. */
+  state: ProcessGroupState,
+
+  /** Every reading, in order; the first at 0 ms. */
+  observations: ProcessGroupObservation[],
+}
 
 /** The part of a spawned run that {@link stopClaude} needs. */
 export interface StoppableRun {
@@ -81,12 +103,18 @@ export interface StopReport {
   processGroup: number | null,
 
   /**
-   * The group's state at the end: `empty` when nothing is left in it,
-   * `occupied` when something outlived even `SIGKILL` within the wait, and
-   * `not-permitted` when what is left there is not this process's to signal.
-   * Null when the run has no group.
+   * The group's state at the end, read by {@link readProcessGroup}: `empty`
+   * when nothing is left in it, `occupied` when something in it could still
+   * be signalled (after `SIGKILL` and its wait when `escalated`; otherwise
+   * the group had not read `occupied` when `SIGKILL` was decided against),
+   * and `not-permitted` when signal 0 failed with EPERM throughout the
+   * recheck, which shows neither that something is left nor whose it would
+   * be. Null when the run has no group.
    */
   groupState: ProcessGroupState | null,
+
+  /** Every reading `groupState` was decided from, in order; empty when the run has no group. */
+  groupObservations: ProcessGroupObservation[],
 }
 
 /** How often a group is polled for members while waiting for it to empty. */
@@ -131,6 +159,38 @@ export function processGroupState(pgid: number): ProcessGroupState {
         throw error;
     }
   }
+}
+
+/**
+ * How long {@link readProcessGroup} goes on reading a group that reads
+ * `not-permitted`. Observed on macOS on 16 October 2026: signal 0 to the
+ * group of a stopped run whose processes had exited failed with EPERM, and a
+ * later reading of the same group with ESRCH. It happened repeatedly in this
+ * module's own tests, and in a 37-case native Claude Code probe, which
+ * completed once it read again for up to 1 s. Why the kernel answers EPERM
+ * there was not established.
+ */
+export const notPermittedRecheckMs = 1_000;
+
+/**
+ * Reads process group `pgid` with {@link processGroupState}, and while it
+ * reads `not-permitted`, reads it again every 50 ms for up to
+ * {@link notPermittedRecheckMs}. Resolves with the last state and every
+ * reading; a `not-permitted` that persists is reported as it is, never as
+ * `empty`. Delivers no signal, and resolves within the recheck plus one poll.
+ * @param pgid - A group a run spawned with `detached: true` leads
+ * @throws What {@link processGroupState} throws
+ */
+export async function readProcessGroup(pgid: number): Promise<ProcessGroupReading> {
+  const started = performance.now();
+  let state = processGroupState(pgid);
+  const observations: ProcessGroupObservation[] = [ { elapsedMs: 0, state } ];
+  while (state === 'not-permitted' && performance.now() - started < notPermittedRecheckMs) {
+    await settle(null, Math.min(pollMs, notPermittedRecheckMs - (performance.now() - started)), undefined);
+    state = processGroupState(pgid);
+    observations.push({ elapsedMs: performance.now() - started, state });
+  }
+  return { state, observations };
 }
 
 /** Sends `signal` to every process in `pgid`; a group that emptied meanwhile is not an error. */
@@ -208,8 +268,10 @@ async function settle(waitFor: Promise<number> | null, ms: number, abort: AbortS
  *
  * Resolves with what was done and what was left; it does not throw for a
  * process that ended on its own meanwhile. The spawned process's exit is
- * reported as it happened. Whether the run's task was done, and what it
- * changed before it stopped, are not things a stop can tell.
+ * reported as it happened, and the group's state as {@link readProcessGroup}
+ * reads it, so a `not-permitted` reading is read again for up to
+ * {@link notPermittedRecheckMs} first. Whether the run's task was done, and
+ * what it changed before it stopped, are not things a stop can tell.
  * @param run - The value `spawnClaude` returned, or anything shaped like it
  * @param options - See {@link StopOptions}
  * @throws When `run.processGroup` is not the spawned process's own PID, or
@@ -269,13 +331,15 @@ export async function stopClaude(run: StoppableRun, options: StopOptions): Promi
     }
   }
 
+  const group = processGroup === null ? null : await readProcessGroup(processGroup);
   return {
     signal: options.signal,
     escalated: leftovers,
     exitCode: subprocess.exitCode,
     signalCode: subprocess.signalCode,
     processGroup,
-    groupState: processGroup === null ? null : processGroupState(processGroup),
+    groupState: group?.state ?? null,
+    groupObservations: group?.observations ?? [],
   };
 }
 
