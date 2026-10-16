@@ -971,10 +971,18 @@ records, and neither output is one.
   lines they held, since its line numbers count from there. It is `not-read` when the journal no
   longer begins with the seeded bytes, or when a start written before 0.13 continued a session.
   Count this run's records from `appended`, not `reading`.
-- **`join`**: `joinResult` over the result and the whole journal, when both were read. It
-  correlates the result with a journal segment. It is not process identity, and a segment's
-  context-limit or API-error record may be another process's. `stdout.result.reading.process`
-  stays the figures of the process that wrote the result, joined or not.
+- **`join`**: `joinResult` over the result and one reading of the journal, when both were read.
+  `over` says which reading, and so which `segments` list `segment` and `candidates` index.
+  - **`appended`** whenever the boundary is verified, a fresh session's included. An inherited
+    segment, or an inherited context-limit record, is then never joined to this run's result.
+  - **`whole`** only without a verified boundary: a continued session whose start predates 0.13,
+    or a journal whose seeded prefix changed. There an earlier process that wrote no `cost-state`
+    record shares a segment with this run's records, and `contextLimitRecord` may be that
+    process's.
+
+  Either way the join correlates the result with a journal segment's recorded figures. It is not
+  process identity. `stdout.result.reading.process` stays the figures of the process that wrote
+  the result, joined or not.
 
 A context limit, an error result, a stop reason, API-error records and compactions are reported
 where the outcome reader puts them, verbatim and in their own scope. No threshold is applied, and
@@ -986,8 +994,8 @@ stated when it was written.
 **Programmatically**, from `@agladysh/bare-claude/custody`: `readCustody(directory)`, which never
 throws, resolving with a `CustodyReading`: `CustodyState`, `CustodyRecordReading`,
 `CustodyFileRead`, `CustodyWrittenIn`, `CustodyOutputReading`, `CustodyStdoutReading`,
-`CustodyStdoutResult`, `CustodyJournalReading`, `CustodyAppendedJournal`, `CustodyJournalBoundary`
-and `RecordedDigest`, with the constants `custodyReadingVersion`, `custodyReadingScope` and
+`CustodyStdoutResult`, `CustodyJournalReading`, `CustodyAppendedJournal`, `CustodyJournalBoundary`,
+`CustodyJoin` and `RecordedDigest`, with the constants `custodyReadingVersion`, `custodyReadingScope` and
 `stdoutProvenance`.
 
 
