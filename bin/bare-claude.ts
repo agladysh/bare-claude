@@ -34,6 +34,7 @@ import {
 } from '@agladysh/bare-claude/custody';
 import { alternateCredentialVariables, tokenVariable } from '@agladysh/bare-claude/token';
 import { readUsage } from '@agladysh/bare-claude/usage';
+import { parseOutcomeRequest, readOutcomeFiles, type OutcomeEntry, type OutcomeRequest } from '@agladysh/bare-claude/outcome';
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -86,6 +87,12 @@ function displayHelp() {
     '      --debug            Print the resolved configuration and unrecognized events',
     '      --display <file>   Render an existing session JSONL and exit',
     '      --usage            Report subscription usage as JSON and exit',
+    '      --outcome <file>   Read a finished run\'s --output-format json result and',
+    '                         print what it says as JSON; exit 1 only if unreadable',
+    '      --journal <file>   Its session journal, with --outcome or alone',
+    '      --outcome-batch <file|->',
+    '                         Read many {"id","result","journal"} lines in one process,',
+    '                         printing one JSON line per request line',
     '      --doctor           Check bun, claude, git, the credential, the PATH install',
     '                         and the preset file; exit 1 when something required is missing',
     '  -v, --version          Print the version and exit',
@@ -149,6 +156,77 @@ function doctorSource(choice: ConfigChoice): ConfigSource {
     throw new Error('--doctor checks one --config file; it does not check several composed');
   }
   return { kind: 'file', path: only };
+}
+
+/** Which package read the files, printed with every outcome reading. */
+const readerIdentity = { name: pkg.name, version: pkg.version };
+
+/** The whole of a file, through a fresh handle: `Bun.file` caches its stat (CLAUDE.md). */
+async function readBytes(file: string): Promise<Uint8Array> {
+  return new Uint8Array(await Bun.file(file).arrayBuffer());
+}
+
+/** A batch request with its paths resolved against this process's cwd. */
+function resolveRequest(request: OutcomeRequest): OutcomeRequest {
+  return {
+    id: request.id,
+    result: request.result === null ? null : path.resolve(request.result),
+    journal: request.journal === null ? null : path.resolve(request.journal),
+  };
+}
+
+/**
+ * `--outcome` and `--journal`: what a finished run's files say, as JSON on
+ * stdout. The exit status says whether the named files were read, never how
+ * the run ended.
+ */
+async function reportOutcome(resultPath: string | undefined, journalPath: string | undefined): Promise<number> {
+  const [ entry ] = await readOutcomeFiles([ resolveRequest({
+    id: null,
+    result: resultPath ?? null,
+    journal: journalPath ?? null,
+  }) ], readBytes);
+  if (entry === undefined || entry.reading === null) {
+    process.stderr.write(`bare-claude: ${entry?.error ?? 'nothing was read'}\n`);
+    return 1;
+  }
+  process.stdout.write(`${JSON.stringify({ reader: readerIdentity, ...entry.reading }, null, 2)}\n`);
+  return 0;
+}
+
+/**
+ * `--outcome-batch`: one request per line of a file, or of stdin for `-`,
+ * read in this one process; one JSON line out per non-empty line in, in
+ * order, each carrying its input line number. Exit 1 only when the requests
+ * themselves cannot be read; a bad line or an unreadable file is that
+ * line's `error`.
+ */
+async function reportOutcomeBatch(source: string): Promise<number> {
+  let text: string;
+  try {
+    text = source === '-' ? await Bun.stdin.text() : await Bun.file(source).text();
+  } catch (error) {
+    process.stderr.write(`bare-claude: --outcome-batch: cannot read ${source}: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+
+  const lines = text.split('\n').flatMap((row, index) =>
+    row.trim() === '' ? [] : [ { line: index + 1, parsed: parseOutcomeRequest(row) } ]);
+  const requests = lines.flatMap(l => typeof l.parsed === 'string' ? [] : [ resolveRequest(l.parsed) ]);
+  const entries = await readOutcomeFiles(requests, readBytes);
+
+  let next = 0;
+  for (const { line, parsed } of lines) {
+    let entry: OutcomeEntry;
+    if (typeof parsed === 'string') {
+      entry = { id: null, reading: null, error: `line ${line}: ${parsed}` };
+    } else {
+      entry = entries[next] ?? { id: parsed.id, reading: null, error: 'not read' };
+      next += 1;
+    }
+    process.stdout.write(`${JSON.stringify({ reader: readerIdentity, line, ...entry })}\n`);
+  }
+  return 0;
 }
 
 /**
@@ -225,6 +303,15 @@ async function loadPreset(): Promise<Startup> {
       },
       usage: {
         type: 'boolean',
+      },
+      outcome: {
+        type: 'string',
+      },
+      journal: {
+        type: 'string',
+      },
+      'outcome-batch': {
+        type: 'string',
       },
       doctor: {
         type: 'boolean',
@@ -306,6 +393,19 @@ async function loadPreset(): Promise<Startup> {
     }
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     return { kind: 'done', exitCode: 0 };
+  }
+
+  // Offline readers of a finished run's files: they read no configuration,
+  // so neither --config, once or composed, nor any launch flag changes them.
+  if (values['outcome-batch'] !== undefined) {
+    if (values.outcome !== undefined || values.journal !== undefined) {
+      throw new Error('--outcome-batch cannot be combined with --outcome or --journal');
+    }
+    return { kind: 'done', exitCode: await reportOutcomeBatch(values['outcome-batch']) };
+  }
+
+  if (values.outcome !== undefined || values.journal !== undefined) {
+    return { kind: 'done', exitCode: await reportOutcome(values.outcome, values.journal) };
   }
 
   const choice = configChoice(values.config, values['no-config']);
