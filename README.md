@@ -240,14 +240,18 @@ Claude home kept at /work/runs/0042/claude-home
 group, a kill aimed at that group — `timeout -k`'s final SIGKILL, a job-control kill of a shell
 job — ends `bare-claude` alone, and the run goes on unreported. A supervisor must do one of:
 
-- signal `bare-claude` itself, and allow it at least `--stop-grace-ms` plus 5 seconds — the two
-  bounded 2-second waits after SIGKILL, and a second for the last of the child's output — before
+- signal `bare-claude` itself, and allow it at least `--stop-grace-ms` plus 6 seconds — the two
+  bounded 2-second waits after SIGKILL, up to a second reading again a group that answers EPERM,
+  and a second for the last of the child's output — before
   any kill of its own, plus whatever removing a temporary home takes. With the default grace,
   `timeout -k 20 60 bare-claude …` leaves room; `timeout -k 5` does not.
 - or signal the reported `Claude process group` directly.
 
 `Claude stop:` says whether SIGKILL was needed and what was left in the group: `empty`,
-`still occupied after SIGKILL`, or `holds processes this user may not signal; left alone`. A run
+`still occupied after SIGKILL`, `occupied; it was not sent SIGKILL` (it had not read occupied
+when SIGKILL was decided against), or `not shown empty: signal 0 failed with EPERM for 1000 ms, …`.
+EPERM means `bare-claude` could signal none of the group's members; it does not show that anything
+there is still running, or whose it is. A run
 that ends without being asked is not signalled. If its group still has processes then, they are
 left alone — they may be work the run meant to leave running — and reported as such, the home is
 kept rather than removed under them, and `bare-claude` stops reading the child's stdout and exits
@@ -257,6 +261,14 @@ with `claude`'s own code even if one of them still holds that pipe open:
 Claude process ended: exit code 0
 bare-claude: claude exited, but process group 41321 still has processes; they were not signalled and may still be running
 Claude home kept at /var/folders/…/bare-claude-home-…
+```
+
+A group that answers EPERM then is read again for up to a second, as a stopped run's is. If it
+answers EPERM throughout, it is not taken for empty: nothing in it is signalled, the home is kept
+as for a group with processes, and the line says so:
+
+```
+bare-claude: claude exited, but process group 41321 was not shown empty: signal 0 failed with EPERM for 1000 ms, which shows neither what is left nor whose it is; nothing in it was signalled
 ```
 
 That exit code says how the spawned process ended, not that everything the run started has.
@@ -920,13 +932,23 @@ the spawned process alone; once it has exited, the same signal once to what it l
 group; SIGKILL to the whole group when `options.graceMs` runs out or `options.escalate` (an
 `AbortSignal`) is aborted. Without a process group, the spawned process alone is signalled at
 each step. Resolves with a `StopReport`: `signal`, `escalated`, the spawned process's `exitCode`
-and `signalCode` (a signal name or number, as Bun reports it), `processGroup`, and `groupState` — `empty`, `occupied` (something outlived
-SIGKILL within two seconds), `not-permitted`, or `null` without a group.
+and `signalCode` (a signal name or number, as Bun reports it), `processGroup`, `groupState` and
+`groupObservations`. `groupState` is `empty`, `occupied` (something could still be signalled:
+after SIGKILL and a two-second wait when `escalated`; otherwise the group had not read occupied
+when SIGKILL was decided against), `not-permitted`, or `null` without a group. It is read by
+`readProcessGroup`, and `groupObservations` keeps every reading it was decided from.
 
 It signals only the process Bun spawned, through Bun's handle, and only a group whose id is that
 process's PID; any other `processGroup` is refused, as are ids 0 and 1 and the caller's own PID.
-`processGroupState(pgid)` probes a group with signal 0. A stop ends processes; it does not undo what
-they wrote or sent.
+`processGroupState(pgid)` reads a group once with signal 0: `occupied` when that succeeds, `empty`
+on ESRCH, `not-permitted` on EPERM. EPERM means this process may signal none of the members the
+kernel found. It does not show that any of them is still running, whose it is, or that it will go,
+so it is never read as `empty`. On macOS a stopped run's group has been seen to answer EPERM
+briefly after its processes exited, and ESRCH soon after. `readProcessGroup(pgid)` therefore reads
+a `not-permitted` group again every 50 ms for up to `notPermittedRecheckMs` (1 s), and resolves
+with `{ state, observations }`: the last state, and every reading with its time. A
+`not-permitted` that lasts the whole second is reported as it is. A stop ends processes; it does
+not undo what they wrote or sent.
 
 ### Pure launch configuration
 

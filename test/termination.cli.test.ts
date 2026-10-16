@@ -81,6 +81,27 @@ async function writeLauncher(): Promise<string> {
   return file;
 }
 
+/**
+ * Loaded into the CLI with `bun --preload`: signal 0 to any process group
+ * fails with EPERM, as macOS answered for stopped runs' groups on 16 October
+ * 2026, and every signal to a group is logged to `$FAKE_GROUP_KILL_LOG` as
+ * `<pid> <signal>`. Every other call reaches the real `process.kill`.
+ */
+const groupNotPermittedPreload = [
+  'import { appendFileSync } from \'node:fs\';',
+  'const kill = process.kill.bind(process);',
+  'process.kill = (pid, signal) => {',
+  '  if (pid < 0) {',
+  '    appendFileSync(process.env.FAKE_GROUP_KILL_LOG, `${pid} ${signal}\\n`);',
+  '    if (signal === 0) {',
+  '      throw Object.assign(new Error(`kill(${pid}, 0): EPERM, from the test`), { code: \'EPERM\' });',
+  '    }',
+  '  }',
+  '  return kill(pid, signal);',
+  '};',
+  '',
+].join('\n');
+
 /** A PID a fake wrote to `file`, once it has. */
 async function pidFrom(file: string): Promise<number> {
   const written = await eventually(async () => (await Bun.file(file).exists()) && (await Bun.file(file).text()) !== '', 10_000);
@@ -97,9 +118,9 @@ interface Running {
   stderr: () => string,
 }
 
-function startCli(args: string[], cwd: string, env: Record<string, string>): Running {
+function startCli(args: string[], cwd: string, env: Record<string, string>, bunFlags: string[] = []): Running {
   const cli = Bun.spawn({
-    cmd: [ 'bun', cliPath, ...args ],
+    cmd: [ 'bun', ...bunFlags, cliPath, ...args ],
     cwd,
     env: {
       ...process.env,
@@ -314,6 +335,42 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('stop
     expect(path.isAbsolute(home) && path.basename(home).startsWith('bare-claude-home-')).toBe(true);
     dirs.push(home);
     expect(await fs.stat(home).then(stats => stats.isDirectory())).toBe(true);
+  }, 30_000);
+
+  test('a run that ends on its own while its group answers EPERM keeps its home and says so: unknown is never empty', async () => {
+    // EPERM cannot be caused here for real, so the CLI runs with a preload
+    // that answers it for every group: the kernel's answer to signal 0 is
+    // the only thing faked. The fake exits 0 at once with a temporary home,
+    // which a group taken for empty would see removed without a word.
+    const { cwd } = await setUp();
+    const dir = await tempDir('eperm');
+    const preload = path.join(dir, 'group-not-permitted.mjs');
+    await fs.writeFile(preload, groupNotPermittedPreload);
+    const log = path.join(dir, 'group-kills');
+
+    const run = startCli([ '--no-config', '--quiet', 'hello' ], cwd, { FAKE_GROUP_KILL_LOG: log }, [ '--preload', preload ]);
+    expect(await run.cli.exited).toBe(0);
+
+    expect(await eventually(() => run.stderr().includes('Claude home kept at '), 2_000)).toBe(true);
+    const stderr = run.stderr();
+    const group = stderr.match(/^Claude process group (\d+)$/m)?.[1];
+    expect(group).toBeDefined();
+    expect(stderr).toContain('Claude process ended: exit code 0\n');
+    expect(stderr).toContain(
+      `bare-claude: claude exited, but process group ${group} was not shown empty: signal 0 failed with EPERM `
+      + 'for 1000 ms, which shows neither what is left nor whose it is; nothing in it was signalled\n'
+    );
+    expect(stderr).not.toContain('still has processes');
+    expect(stderr).not.toContain('Claude stop:');
+    const home = stderr.match(/^Claude home kept at (.+)$/m)?.[1] ?? '';
+    expect(path.isAbsolute(home) && path.basename(home).startsWith('bare-claude-home-')).toBe(true);
+    dirs.push(home);
+    expect(await fs.stat(home).then(stats => stats.isDirectory())).toBe(true);
+
+    // Read again, as a stop's last reading is, and only ever with signal 0.
+    const calls = (await Bun.file(log).text()).trim().split('\n');
+    expect(calls.length).toBeGreaterThan(1);
+    expect(calls.every(call => call === `-${group} 0`)).toBe(true);
   }, 30_000);
 
   test('a run that ends on its own is not signalled, and its exit stands', async () => {

@@ -54,7 +54,7 @@
   final SIGKILL, a job-control kill of the shell's job — ends the CLI alone, and the run goes on.
   Every run now reports `Claude process group N` on stderr as soon as it is spawned, whatever
   its home; a supervisor must either signal `bare-claude` itself and allow it at least
-  `--stop-grace-ms` plus 5 seconds before any kill of its own, or signal that group directly.
+  `--stop-grace-ms` plus 6 seconds before any kill of its own, or signal that group directly.
 - `--debug` withholds every value of `extraEnv` and `extraSettings.env`, printing its length in
   place of it and keeping its name, and prints an in-memory session journal
   (`customSessionData.value`) as its length. Everything else in the configuration is printed as
@@ -123,7 +123,12 @@
     128+n status.
   - `stopClaude()` and `processGroupState()`: the stop itself — the spawned process, then its
     process group, then SIGKILL, each bounded, signalling nothing but that process and a group
-    whose id is its PID.
+    whose id is its PID. Its `StopReport` gives the group's final state and, in
+    `groupObservations`, every reading that state was decided from.
+  - `readProcessGroup()` and `notPermittedRecheckMs`: a group whose signal 0 fails with EPERM is
+    read again every 50 ms for up to 1 s, since on macOS a stopped run's group has been seen to
+    answer EPERM for a moment before ESRCH. One that answers EPERM throughout is reported as
+    `not-permitted`, never as `empty`: EPERM shows neither what is left nor whose it is.
   - `processGroup` on the value `spawnClaude` returns, set when spawned with `detached: true`.
 
   A signal during any stop, one `finish()` started included, hurries that same stop to SIGKILL.
@@ -133,6 +138,8 @@
 - When `claude` exits on its own but leaves processes in its group, the CLI says they were not
   signalled and may still be running, keeps the home rather than removing it under them, and
   stops reading the child's stdout, so one holding that pipe cannot keep the CLI from exiting.
+  A group that answers EPERM throughout `readProcessGroup`'s recheck is not taken for empty
+  either: the CLI says it was not shown empty, signals nothing, and keeps the home.
 - `--stop-grace-ms`, and the CLI-only preset field `stopGraceMs`.
 - `mergeInvocation()` and `resolveInvocation()` from `@agladysh/bare-claude/preset`: one merge of
   configuration, command line and `--use`, shared by a run and `--doctor`. `runDoctor()` takes

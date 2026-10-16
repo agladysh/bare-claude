@@ -26,7 +26,7 @@ import type { AuthMode } from '@agladysh/bare-claude';
 import { resolveInvocation, type DynamicPreset, type Preset } from '@agladysh/bare-claude/preset';
 import { formatDoctorReport, runDoctor } from '@agladysh/bare-claude/doctor';
 import {
-  processGroupState, signalExitStatus, superviseSignals, type StopReport, type SupervisorEvent
+  notPermittedRecheckMs, readProcessGroup, signalExitStatus, superviseSignals, type StopReport, type SupervisorEvent
 } from '@agladysh/bare-claude/lifecycle';
 import { alternateCredentialVariables, tokenVariable } from '@agladysh/bare-claude/token';
 import { readUsage } from '@agladysh/bare-claude/usage';
@@ -613,12 +613,15 @@ async function main() {
     // it would keep this process from exiting; nothing more is wanted from it.
     capture?.stop();
 
-    // Something the run started outlived it. Reported, not acted on: nobody
-    // asked for a stop, and it may be work the run deliberately left running.
-    // Nor is the home removed under it, since it may still be using it.
-    const leftovers = report === null && claude.processGroup !== null
-      && processGroupState(claude.processGroup) === 'occupied';
-    if (leftovers) {
+    // Something the run started may have outlived it. Reported, not acted on:
+    // nobody asked for a stop, and it may be work the run deliberately left
+    // running. Nor is the home removed under it, since it may still be using
+    // it. A group that answers EPERM throughout the recheck is not known to
+    // be empty, so it keeps the home too.
+    const groupState = report === null && claude.processGroup !== null
+      ? (await readProcessGroup(claude.processGroup)).state
+      : null;
+    if (groupState !== null && groupState !== 'empty') {
       keepHome = true;
     }
 
@@ -627,10 +630,15 @@ async function main() {
     }
     if (report !== null) {
       process.stderr.write(`${describeStop(report)}\n`);
-    } else if (leftovers) {
+    } else if (groupState === 'occupied') {
       process.stderr.write(
         `bare-claude: claude exited, but process group ${claude.processGroup} still has processes; `
         + 'they were not signalled and may still be running\n'
+      );
+    } else if (groupState === 'not-permitted') {
+      process.stderr.write(
+        `bare-claude: claude exited, but process group ${claude.processGroup} was ${notShownEmpty}; `
+        + 'nothing in it was signalled\n'
       );
     }
 
@@ -700,6 +708,12 @@ function describeEnd(subprocess: { exitCode: number | null, signalCode: NodeJS.S
   return subprocess.exitCode === null ? 'not observed' : `exit code ${subprocess.exitCode}`;
 }
 
+/**
+ * What a group that read `not-permitted` to the end of {@link readProcessGroup}'s
+ * recheck shows, and what it does not.
+ */
+const notShownEmpty = `not shown empty: signal 0 failed with EPERM for ${notPermittedRecheckMs} ms, which shows neither what is left nor whose it is`;
+
 /** One line saying how a stop went, and what it left. */
 function describeStop(report: StopReport): string {
   const sent = report.escalated ? `${report.signal}, then SIGKILL` : report.signal;
@@ -708,8 +722,8 @@ function describeStop(report: StopReport): string {
   }
   const left = {
     'empty': 'empty',
-    'occupied': 'still occupied after SIGKILL',
-    'not-permitted': 'holds processes this user may not signal; left alone',
+    'occupied': report.escalated ? 'still occupied after SIGKILL' : 'occupied; it was not sent SIGKILL',
+    'not-permitted': notShownEmpty,
   } satisfies Record<NonNullable<StopReport['groupState']>, string>;
   return `Claude stop: ${sent}; process group ${report.processGroup} ${left[report.groupState ?? 'empty']}`;
 }

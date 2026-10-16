@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -6,7 +6,7 @@ import path from 'node:path';
 
 import { eventually, processGone } from '../test/helpers.ts';
 import {
-  processGroupState, signalExitStatus, stopClaude, superviseSignals,
+  notPermittedRecheckMs, processGroupState, readProcessGroup, signalExitStatus, stopClaude, superviseSignals,
   type SignalSource, type StopOptions, type StopSignal, type SupervisorEvent,
 } from './lifecycle.ts';
 
@@ -91,6 +91,21 @@ async function pidIn(file: string): Promise<number> {
   return pid;
 }
 
+/**
+ * Makes signal 0 to group `pgid` fail with EPERM whenever `deny()` holds, as
+ * macOS answered for stopped runs' groups on 16 October 2026; every other
+ * call reaches the real `process.kill`. Undo it with `mockRestore()`.
+ */
+function denySignalZero(pgid: number, deny: () => boolean) {
+  const real = process.kill.bind(process);
+  return spyOn(process, 'kill').mockImplementation((pid: number, signal?: string | number): true => {
+    if (pid === -pgid && signal === 0 && deny()) {
+      throw Object.assign(new Error(`kill(${pid}, 0): EPERM, from the test`), { code: 'EPERM' });
+    }
+    return real(pid, signal);
+  });
+}
+
 describe.if(process.platform === 'darwin' || process.platform === 'linux')('stopClaude', () => {
   test('never probes a process group that no spawned run can lead', () => {
     for (const pgid of [ 0, 1, -5, 1.5, Number.NaN, process.pid ]) {
@@ -125,6 +140,43 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('stop
     expect(report.escalated).toBe(false);
     expect(report.exitCode).toBe(4);
     expect(report.groupState).toBe('empty');
+  });
+
+  test('a group read not-permitted at first is read again until it reads empty, and every reading is kept', async () => {
+    const run = detachedRun('exit 0');
+    await run.subprocess.exited;
+    let answered = 0;
+    const kill = denySignalZero(run.processGroup, () => {
+      answered += 1;
+      return answered <= 5;
+    });
+    try {
+      const report = await stopClaude(run, { signal: 'SIGTERM', graceMs: 1_000 });
+      const states = report.groupObservations.map(observation => observation.state);
+
+      expect(report.escalated).toBe(false);
+      expect(report.groupState).toBe('empty');
+      expect(states[0]).toBe('not-permitted');
+      expect(states.at(-1)).toBe('empty');
+      expect(states.slice(0, -1).every(state => state === 'not-permitted')).toBe(true);
+      expect(report.groupObservations.at(-1)?.elapsedMs).toBeLessThan(notPermittedRecheckMs);
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  test('readProcessGroup reads a live group once, an ended one as empty, and refuses ids no run can lead', async () => {
+    const live = detachedRun('exec sleep 30');
+    expect(await readProcessGroup(live.processGroup)).toEqual({ state: 'occupied', observations: [ { elapsedMs: 0, state: 'occupied' } ] });
+    expect(processGone(live.subprocess.pid)).toBe(false);
+
+    const ended = detachedRun('exit 0');
+    await ended.subprocess.exited;
+    expect((await readProcessGroup(ended.processGroup)).state).toBe('empty');
+
+    for (const pgid of [ 0, 1, process.pid ]) {
+      await expect(readProcessGroup(pgid)).rejects.toThrow('refusing to signal process group');
+    }
   });
 });
 
@@ -238,6 +290,44 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('supe
     expect(reported).toEqual([ 'stopping', 'escalating' ]);
     expect(await eventually(() => processGone(run.subprocess.pid) && processGone(child), 5_000)).toBe(true);
     expect(signals.listening).toBe(0);
+  }, 20_000);
+
+  test('a reporter that always throws, and a group read not-permitted to the end: the stop ends in bounds and reports not-permitted, never empty', async () => {
+    const signals = new TestSignals();
+    const reported: SupervisorEvent['kind'][] = [];
+    const supervisor = superviseSignals({
+      graceMs: 5_000,
+      source: signals,
+      onEvent: event => {
+        reported.push(event.kind);
+        throw new Error('reporter failed');
+      },
+    });
+    const run = detachedRun('exec sleep 30');
+    // Denied only once the spawned process has ended, as observed on macOS;
+    // before that, the real answer decides what there is to stop.
+    const kill = denySignalZero(run.processGroup, () => run.subprocess.exitCode !== null || run.subprocess.signalCode !== null);
+    try {
+      supervisor.attach(run);
+      const startedAt = Date.now();
+      expect(() => signals.send('SIGTERM')).not.toThrow();
+      const report = await supervisor.finish();
+
+      expect(Date.now() - startedAt).toBeLessThan(5_000);
+      expect(report?.signalCode).toBe('SIGTERM');
+      expect(report?.escalated).toBe(false);
+      expect(report?.groupState).toBe('not-permitted');
+      expect(report?.groupObservations.every(observation => observation.state === 'not-permitted')).toBe(true);
+      // A timer may fire a little early; the recheck still spans its bound.
+      expect(report?.groupObservations.at(-1)?.elapsedMs).toBeGreaterThanOrEqual(notPermittedRecheckMs - 50);
+      expect(kill.mock.calls.some(([ pid, signal ]) => pid === -run.processGroup && signal === 'SIGKILL')).toBe(false);
+      expect(reported).toEqual([ 'stopping' ]);
+      expect(signals.listening).toBe(0);
+    } finally {
+      kill.mockRestore();
+    }
+    // The group was empty all along: the EPERM was the test's.
+    expect(await eventually(() => processGone(run.subprocess.pid), 5_000)).toBe(true);
   }, 20_000);
 
   test('a signal after the run ended on its own stops nothing and is not the run\'s outcome', async () => {
