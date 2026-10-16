@@ -745,6 +745,17 @@ export interface OutcomeRequest {
   journal: string | null,
 }
 
+/**
+ * One batch request naming a run's custody directory, which `readCustody`
+ * from `@agladysh/bare-claude/custody` reads; the directory names its own
+ * result and journal.
+ */
+export interface CustodyRequest {
+  /** Echoed back so the caller can match an entry to its request. */
+  id: string | null,
+  custody: string,
+}
+
 /** One batch entry: a reading, or why there is none. */
 export interface OutcomeEntry {
   id: string | null,
@@ -755,16 +766,26 @@ export interface OutcomeEntry {
 /**
  * Reads one batch request from a line of JSON:
  * `{ "id"?: string, "result"?: string, "journal"?: string }`, with at least
- * one of `result` and `journal`. Returns the request, or why it is not one.
+ * one of `result` and `journal`, or `{ "id"?: string, "custody": string }`.
+ * Returns the request, or why it is not one.
  */
-export function parseOutcomeRequest(line: string): OutcomeRequest | string {
+export function parseOutcomeRequest(line: string): OutcomeRequest | CustodyRequest | string {
   const parsed = parseObject(line);
   if (parsed === null) {
     return 'not one JSON object';
   }
-  const { id, result, journal } = parsed;
+  const { id, result, journal, custody } = parsed;
   if (id !== undefined && typeof id !== 'string') {
     return '`id` must be a string';
+  }
+  if (custody !== undefined) {
+    if (typeof custody !== 'string') {
+      return '`custody` must be a path';
+    }
+    if (result !== undefined || journal !== undefined) {
+      return '`custody` cannot be combined with `result` or `journal`: a custody directory names its own';
+    }
+    return { id: typeof id === 'string' ? id : null, custody };
   }
   if (result !== undefined && typeof result !== 'string') {
     return '`result` must be a path';

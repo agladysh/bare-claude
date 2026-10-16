@@ -6,10 +6,12 @@
  * token file is read and no credential linked.
  */
 import { afterEach, describe, expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+import { configurationScope } from '../src/custody.ts';
 import { processGroupState } from '../src/lifecycle.ts';
 import { cliPath, eventually, fakeClaudeDir, makeTempRepo, runCli } from './helpers.ts';
 
@@ -140,10 +142,12 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('--cu
     expect(events).toMatchObject([
       { kind: 'started', directory },
       { kind: 'completed', directory, completion: { outcome: 'exited', exitCode: 0 } },
+      { kind: 'observed', directory, file: path.join(directory, 'observation.json'), error: null, observation: { state: 'exited' } },
     ]);
-    expect(events.at(-1)).toEqual({
+    expect(events.at(1)).toEqual({
       kind: 'completed', directory, completion: await readJson(path.join(directory, 'completion.json')),
     });
+    expect(events.at(2)).toMatchObject({ observation: await readJson(path.join(directory, 'observation.json')) });
     // Neither the child's own output nor a rendered transcript reaches stdout.
     expect(result.stdout).not.toContain('raw reply');
     expect(result.stdout).not.toContain('Done.');
@@ -163,6 +167,9 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('--cu
     const again = await runCli(args, { cwd });
     expect(again.exitCode).toBe(1);
     expect(again.stderr).toContain('already exists');
+    // Refused before custody: no event at all, so a reader of the stream
+    // learns neither the status nor the cause from it.
+    expect(again.stdout).toBe('');
     expect(await readJson(path.join(directory, 'completion.json'))).toMatchObject({ exitCode: 7 });
 
     const other = `${directory}-print`;
@@ -200,7 +207,7 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('--cu
     });
 
     expect(result.exitCode).toBe(0);
-    expect(eventsIn(result.stdout).map(kindOf)).toEqual([ 'started', 'completed' ]);
+    expect(eventsIn(result.stdout).map(kindOf)).toEqual([ 'started', 'completed', 'observed' ]);
     expect(await Bun.file(path.join(directory, 'call-to-action.txt')).text()).toBe('# from the run file');
     expect(await readJson(path.join(directory, 'invocation.json'))).toMatchObject({
       auth: 'caller', effortLevel: 'low', extraArgs: [ '--from-profile' ],
@@ -232,7 +239,8 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('--cu
       processGroupAfter: { state: 'empty' },
       stdout: { bytes: 8 },
     });
-    expect(eventsIn(await run.stdout).map(kindOf)).toEqual([ 'started', 'supervisor', 'completed' ]);
+    expect(eventsIn(await run.stdout).map(kindOf)).toEqual([ 'started', 'supervisor', 'completed', 'observed' ]);
+    expect(await readJson(path.join(directory, 'observation.json'))).toMatchObject({ state: 'stopped' });
   }, 30_000);
 
   test('SIGKILL to the CLI leaves a start with no completion: an end nobody observed', async () => {
@@ -253,8 +261,22 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('--cu
     // ago and the fake sleeps for 30 s. A later reader of start.json knows a
     // number, and needs an identity before acting on it.
     expect(processGroupState(group)).toBe('occupied');
+    const whileRunning = await runCli([ '--outcome-custody', directory ], { cwd });
     process.kill(-group, 'SIGKILL');
     expect(await eventually(() => processGroupState(group) === 'empty', 5_000)).toBe(true);
+
+    // Before and after its group emptied, the same: the reader reads records,
+    // not processes, and a missing completion is no end.
+    const afterwards = await runCli([ '--outcome-custody', directory ], { cwd });
+    for (const reading of [ whileRunning, afterwards ]) {
+      expect(reading.exitCode).toBe(0);
+      expect(JSON.parse(reading.stdout)).toMatchObject({
+        state: 'start-only',
+        completion: { status: 'absent' },
+        journal: { namedBy: 'start.sessionJsonlPath', changedSinceCompletion: null },
+      });
+    }
+    expect(await exists(path.join(directory, 'observation.json'))).toBe(false);
   }, 30_000);
 
   test('a reader that goes away ends the event stream, not the run, its completion or its exit status', async () => {
@@ -290,8 +312,137 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('--cu
 
     expect((await textOf(status))?.trim()).toBe('3');
     expect(await readJson(path.join(directory, 'completion.json'))).toMatchObject({ outcome: 'exited', exitCode: 3 });
+    // The observation does not depend on anyone reading the stream either.
+    expect(await readJson(path.join(directory, 'observation.json'))).toMatchObject({ state: 'exited' });
     expect(await stderr).toContain('custody events no longer reach stdout');
   }, 30_000);
+
+  test('an observation that cannot be written is said so, and changes neither the completion nor the exit status', async () => {
+    const { cwd, directory } = await setUp();
+    const observation = path.join(directory, 'observation.json');
+    const result = await runCli([ '--no-config', '--auth', 'caller', '--custody', directory, 'hello' ], {
+      cwd, env: { FAKE_CLAUDE_WRITE_FILE: observation },
+    });
+
+    // Not the 1 a failure to record the run itself would be.
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain('observation.json was not written');
+    expect(result.stderr).toContain('the completion and the exit status stand');
+    expect(await Bun.file(observation).text()).toBe('fake');
+    expect(eventsIn(result.stdout).at(-1)).toMatchObject({ kind: 'observed', file: null, observation: { state: 'exited' } });
+    expect(await readJson(path.join(directory, 'completion.json'))).toMatchObject({ outcome: 'exited', exitCode: 0, custodyError: null });
+  }, 20_000);
+
+  test('a composed declaration is recorded by its files\' paths and digests, never their contents, and none is read again', async () => {
+    const { cwd, directory } = await setUp();
+    const files = path.dirname(directory);
+    const profile = path.join(files, 'profile.yaml');
+    const alias = path.join(files, 'profile-alias.yaml');
+    const declaration = path.join(files, 'run.yaml');
+    const profileText = [
+      'presets:', '  worker:', '    auth: caller', '    extraEnv:', '      PROFILE_SECRET: provenance-profile-sentinel', '',
+    ].join('\n');
+    const declarationText = [
+      'use: worker', 'callToAction: "# provenance"', 'custody:', `  directory: ${JSON.stringify(directory)}`, '',
+    ].join('\n');
+    await fs.writeFile(profile, profileText);
+    await fs.symlink(profile, alias);
+    await fs.writeFile(declaration, declarationText);
+    const sha = (text: string) => createHash('sha256').update(text).digest('hex');
+    const configuration = {
+      scope: configurationScope,
+      source: 'files',
+      files: [
+        { path: alias, realPath: profile, bytes: Buffer.byteLength(profileText), sha256: sha(profileText) },
+        { path: declaration, realPath: declaration, bytes: Buffer.byteLength(declarationText), sha256: sha(declarationText) },
+      ],
+      use: [ 'worker' ],
+      useFrom: 'configuration',
+    };
+
+    const result = await runCli([ '--config', alias, '--config', declaration ], { cwd });
+    expect(result.exitCode).toBe(0);
+    expect(await readJson(path.join(directory, 'invocation.json'))).toMatchObject({ configuration });
+    for (const text of [
+      await Bun.file(path.join(directory, 'invocation.json')).text(),
+      await Bun.file(path.join(directory, 'observation.json')).text(),
+      result.stdout,
+      result.stderr,
+    ]) {
+      expect(text).not.toContain('provenance-profile-sentinel');
+    }
+
+    // A profile replaced after the run changes nothing that was recorded,
+    // and nothing compares the record with the file as it is now.
+    const replaced = 'presets: {}\n';
+    await fs.writeFile(profile, replaced);
+    const reading = await runCli([ '--outcome-custody', directory ], { cwd });
+    expect(reading.exitCode).toBe(0);
+    expect(JSON.parse(reading.stdout)).toMatchObject({ state: 'exited', invocation: { status: 'read', record: { configuration } } });
+    expect(reading.stdout).not.toContain(sha(replaced));
+
+    const twice = await runCli([ '--config', profile, '--config', alias, '--config', declaration ], { cwd });
+    expect(twice.exitCode).toBe(1);
+    expect(twice.stderr).toContain('is named twice');
+  }, 20_000);
+
+  test('the selected presets are recorded with where the selection came from; no configuration is recorded as none', async () => {
+    const { cwd, directory } = await setUp();
+    const profile = path.join(path.dirname(directory), 'profile.yaml');
+    await fs.writeFile(profile, 'presets:\n  worker:\n    auth: caller\n');
+
+    const used = await runCli([ '--config', profile, '--use', 'worker', '--custody', directory, 'hello' ], { cwd });
+    expect(used.exitCode).toBe(0);
+    expect(await readJson(path.join(directory, 'invocation.json'))).toMatchObject({
+      configuration: { source: 'files', use: [ 'worker' ], useFrom: 'command-line' },
+    });
+
+    const bare = `${directory}-bare`;
+    expect((await runCli([ '--no-config', '--auth', 'caller', '--custody', bare, 'hello' ], { cwd })).exitCode).toBe(0);
+    expect(await readJson(path.join(bare, 'invocation.json'))).toMatchObject({
+      configuration: { scope: configurationScope, source: 'none', files: [], use: null, useFrom: null },
+    });
+  }, 20_000);
+});
+
+describe.if(process.platform === 'darwin' || process.platform === 'linux')('--outcome-custody and custody batch lines', () => {
+  test('read directories, each once per batch; a custody line naming files too is refused; a missing directory is a state', async () => {
+    const { cwd, directory } = await setUp();
+    expect((await runCli([ '--no-config', '--auth', 'caller', '--custody', directory, 'hello' ], { cwd })).exitCode).toBe(0);
+    const missing = path.join(path.dirname(directory), 'missing');
+
+    const lines = [
+      JSON.stringify({ id: 'one', custody: directory }),
+      JSON.stringify({ id: 'again', custody: directory }),
+      JSON.stringify({ id: 'mixed', custody: directory, result: path.join(directory, 'stdout') }),
+      JSON.stringify({ id: 'missing', custody: missing }),
+      JSON.stringify({ id: 'file', result: path.join(directory, 'stdout') }),
+    ].join('\n') + '\n';
+    const batch = await runCli([ '--outcome-batch', '-' ], { cwd, stdin: lines });
+    expect(batch.exitCode).toBe(0);
+    const out: unknown[] = batch.stdout.trim().split('\n').map((line): unknown => JSON.parse(line));
+    expect(out).toMatchObject([
+      { id: 'one', line: 1, error: null, reading: { state: 'exited', directory } },
+      { id: 'again', line: 2, error: null, reading: { state: 'exited' } },
+      { id: null, line: 3, reading: null },
+      { id: 'missing', line: 4, error: null, reading: { state: 'unreadable', entries: null } },
+      { id: 'file', line: 5, error: null, reading: { result: { file: 'unreadable' } } },
+    ]);
+    // One reading for both lines: the same read, at the same moment.
+    const readOf = (entry: unknown) => typeof entry === 'object' && entry !== null && 'reading' in entry
+      && typeof entry.reading === 'object' && entry.reading !== null && 'read' in entry.reading ? entry.reading.read : null;
+    expect(readOf(out[0])).not.toBeNull();
+    expect(readOf(out[1])).toBe(readOf(out[0]));
+    expect(JSON.stringify(out[2])).toContain('cannot be combined');
+
+    const single = await runCli([ '--outcome-custody', missing ], { cwd });
+    expect(single.exitCode).toBe(1);
+    expect(JSON.parse(single.stdout)).toMatchObject({ state: 'unreadable', entries: null });
+
+    const combined = await runCli([ '--outcome-custody', directory, '--outcome', path.join(directory, 'stdout') ], { cwd });
+    expect(combined.exitCode).toBe(1);
+    expect(combined.stderr).toContain('--outcome-custody cannot be combined');
+  }, 20_000);
 });
 
 describe('several --config files', () => {

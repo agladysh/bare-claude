@@ -275,6 +275,14 @@ describe('parseOutcomeRequest', () => {
     expect(parseOutcomeRequest('{"result":1}')).toBe('`result` must be a path');
     expect(parseOutcomeRequest('[1]')).toBe('not one JSON object');
   });
+
+  test('takes a custody directory alone: it names its own result and journal', () => {
+    expect(parseOutcomeRequest('{"id":"c","custody":"runs/0042"}')).toEqual({ id: 'c', custody: 'runs/0042' });
+    expect(parseOutcomeRequest('{"custody":"runs/0042"}')).toEqual({ id: null, custody: 'runs/0042' });
+    expect(parseOutcomeRequest('{"custody":7}')).toBe('`custody` must be a path');
+    expect(parseOutcomeRequest('{"custody":"d","journal":"j.jsonl"}')).toContain('cannot be combined');
+    expect(parseOutcomeRequest('{"id":3,"custody":"d"}')).toBe('`id` must be a string');
+  });
 });
 
 describe('readOutcomeFiles', () => {

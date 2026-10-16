@@ -1,12 +1,15 @@
 import { describe, expect, test } from 'bun:test';
 
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import { type } from 'arktype';
 
-import { emptyConfig, loadConfig, loadConfigFiles, locateConfig, parseConfig, sessionIdSchema } from './config.ts';
+import {
+  emptyConfig, loadConfig, loadConfigFiles, locateConfig, parseConfig, readConfig, readConfigFiles, sessionIdSchema,
+} from './config.ts';
 import { sessionIdPattern } from './index.ts';
 import { composeConfigs, resolveInvocation } from './preset.ts';
 
@@ -325,6 +328,82 @@ describe('composed configuration files', () => {
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('configuration provenance', () => {
+  const digest = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
+
+  async function scratch<T>(use: (dir: string) => Promise<T>): Promise<T> {
+    const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'bare-claude-config-test-')));
+    try {
+      return await use(dir);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  test('each file is recorded by the digest of exactly the bytes parsed, a byte-order mark and CRLFs included', async () => {
+    await scratch(async dir => {
+      const profile = path.join(dir, 'profile.yaml');
+      const run = path.join(dir, 'run.yaml');
+      // Bytes a decode-then-hash or a re-serialised hash would not reproduce.
+      const profileBytes = new Uint8Array([ 0xef, 0xbb, 0xbf, ...new TextEncoder().encode('presets:\r\n  worker:\r\n    model: from-profile\r\n') ]);
+      const runBytes = new TextEncoder().encode('use: worker\nextraEnv:\n  SECRET_NAME: config-provenance-sentinel\n');
+      await fs.writeFile(profile, profileBytes);
+      await fs.writeFile(run, runBytes);
+
+      const { config, provenance } = await readConfigFiles([ profile, run ]);
+
+      expect(config.presets.worker?.model).toBe('from-profile');
+      expect(provenance).toEqual({
+        source: 'files',
+        files: [
+          { path: profile, realPath: profile, bytes: profileBytes.length, sha256: digest(profileBytes) },
+          { path: run, realPath: run, bytes: runBytes.length, sha256: digest(runBytes) },
+        ],
+      });
+      expect(JSON.stringify(provenance)).not.toContain('config-provenance-sentinel');
+    });
+  });
+
+  test('an alias is recorded as named, beside the file it led to, and one file under two names is refused', async () => {
+    await scratch(async dir => {
+      const profile = path.join(dir, 'profile.yaml');
+      const alias = path.join(dir, 'alias.yaml');
+      const run = path.join(dir, 'run.yaml');
+      await fs.writeFile(profile, 'presets:\n  worker:\n    model: m\n');
+      await fs.writeFile(run, 'use: worker\n');
+      await fs.symlink(profile, alias);
+
+      const { provenance } = await readConfigFiles([ alias, run ]);
+      expect(provenance.files[0]).toMatchObject({ path: alias, realPath: profile });
+
+      // Root-only files would compose twice and their arrays repeat: one file is one layer.
+      const root = path.join(dir, 'root.yaml');
+      const rootAlias = path.join(dir, 'root-alias.yaml');
+      await fs.writeFile(root, 'extraArgs: [--once]\n');
+      await fs.symlink(root, rootAlias);
+      await expect(readConfigFiles([ root, rootAlias ])).rejects.toThrow(`configuration file ${rootAlias} is named twice: it is the file ${root} names`);
+      await expect(loadConfigFiles([ rootAlias, root ])).rejects.toThrow('is named twice');
+    });
+  });
+
+  test('the located file, a named one and none are each recorded as what was read', async () => {
+    await scratch(async dir => {
+      const init = Bun.spawn({ cmd: [ 'git', 'init', '-q' ], cwd: dir, stdout: 'ignore', stderr: 'ignore' });
+      await init.exited;
+      expect(await readConfig({ kind: 'located' }, dir)).toEqual({ config: emptyConfig(), provenance: { source: 'located', files: [] } });
+
+      const located = path.join(dir, 'bare-claude.yaml');
+      const bytes = new TextEncoder().encode('model: located\n');
+      await fs.writeFile(located, bytes);
+      const record = { path: located, realPath: located, bytes: bytes.length, sha256: digest(bytes) };
+      expect((await readConfig({ kind: 'located' }, dir)).provenance).toEqual({ source: 'located', files: [ record ] });
+      expect((await readConfig({ kind: 'file', path: located })).provenance).toEqual({ source: 'file', files: [ record ] });
+      expect((await readConfig({ kind: 'none' })).provenance).toEqual({ source: 'none', files: [] });
+      await expect(readConfig({ kind: 'file', path: dir })).rejects.toThrow('is not a regular file');
+    });
   });
 });
 

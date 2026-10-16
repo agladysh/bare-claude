@@ -55,6 +55,9 @@
  *   FAKE_CLAUDE_STDOUT_FIRST   - text written to stdout before the sleep, so
  *                                a stopped run has output to keep.
  *   FAKE_CLAUDE_STDERR         - text written to stderr just before exiting.
+ *   FAKE_CLAUDE_WRITE_FILE     - path this process creates, holding `fake`,
+ *                                just before exiting: a file someone else put
+ *                                where a wrapper means to write one.
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -141,6 +144,11 @@ while (Date.now() < sleepUntil) {
   if (appendEveryMs > 0 && sessionPath !== null) {
     await fs.appendFile(sessionPath, `${JSON.stringify({ type: 'progress', at: Date.now() })}\n`);
   }
+}
+
+const writeFile = process.env.FAKE_CLAUDE_WRITE_FILE;
+if (writeFile !== undefined) {
+  await fs.writeFile(writeFile, 'fake');
 }
 
 const stderrText = process.env.FAKE_CLAUDE_STDERR;

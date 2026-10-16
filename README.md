@@ -158,7 +158,10 @@ Options:
 - `--usage`: report subscription usage as JSON and exit (see [Usage Introspection](#usage-introspection))
 - `--outcome [file]`, `--journal [file]`: read a finished run's result and session journal as JSON
   and exit (see [Reading a finished run](#reading-a-finished-run))
-- `--outcome-batch [file|-]`: read many result/journal requests in one process, one JSON line each
+- `--outcome-custody [dir]`: read a run's custody directory as JSON and exit (see
+  [Reading a custody directory](#reading-a-custody-directory))
+- `--outcome-batch [file|-]`: read many result/journal or custody requests in one process, one JSON
+  line each
 - `--doctor`: report what a run needs and exit 1 when something required is missing
   (see [Doctor](#doctor))
 - `--effort [level]`: `low`, `medium`, `high` (default), `xhigh` or `max`
@@ -401,7 +404,12 @@ The files compose as though they were one, each validated on its own first:
 - root presets merge in order, as presets do: a later file's values win, records merge key by key,
   arrays concatenate;
 - at most one file's root may name a `use`; two are refused, and `--use` still replaces it;
-- naming one file twice is refused.
+- naming one file twice is refused, by the same name or another: a symbolic link to it, or a path
+  through a linked directory.
+
+Each file is read once: its bytes are read whole through one open handle, and both the digest a
+custody run records and the configuration parsed come from those bytes (see
+[Run custody](#run-custody)).
 
 The command line then goes on top, exactly as over one file. What the profile says reaches every
 run that names it; a credential in its `extraEnv` included.
@@ -613,15 +621,35 @@ writes there is ever rewritten or removed. Relative, it resolves against the dir
 
 | File | Written | Holds |
 | --- | --- | --- |
-| `invocation.json` | before the spawn | launcher, executable, model, effort, permission mode, tools, `addDirs`, budget and token caps, auth mode, `linkAuth`, `noProcessEnv`, `extraArgs` as given, the physical cwd, the Claude home, the session (`fresh`, `memory` with its id, or `file` with its source path and digest), and the call to action's length and SHA-256 |
+| `invocation.json` | before the spawn | launcher, executable, model, effort, permission mode, tools, `addDirs`, budget and token caps, auth mode, `linkAuth`, `noProcessEnv`, `extraArgs` as given, the physical cwd, the Claude home, the session (`fresh`, `memory` with its id, or `file` with its source path and digest), the call to action's length and SHA-256, and the configuration that declared the run (below) |
 | `call-to-action.txt` | before the spawn, only with `keepCallToAction: true` | the call to action, exactly |
 | `stdout`, `stderr` | by the spawned process, as it runs | its own standard output and error, byte for byte: its descriptors, not pipes. Empty when it never started |
 | `start.json` | after the spawn returned | PID, process group, session id, journal path, Claude home, when the record was written, and the caller's identity reading (`identify`), if any |
 | `completion.json` | once it was seen to end, or it never started, or a custody-error stop ran its bounded course | outcome, exit code and signal, the stop and its cause, the group's reading, and the size and SHA-256 of each output and of the journal |
+| `observation.json` | after the completion is written, or has failed to be | the directory as [`--outcome-custody`](#reading-a-custody-directory) reads it at that moment |
 | `home/` | by `spawnClaude` and the child | the Claude home, unless `ephemeralClaudeHomePath` names another |
 
+**Configuration.** Under the CLI, `invocation.json`'s `configuration` names the route that chose
+the configuration (`files` for `--config`, `located` for the working copy's `bare-claude.yaml`,
+`none` for `--no-config`) and every file read, in the order composed. Each file is given by its path
+as named, made absolute, by the physical path that name led to, and by the size and SHA-256 of
+exactly the bytes that were parsed. The record also names the presets selected at the root (`use`),
+and whether `--use` or the configuration selected them (`useFrom`). No file's contents are
+recorded, but a file can hold a credential. A digest does not reveal it, yet anyone holding a
+candidate file can confirm it against the digest.
+
+The record states what the CLI read before the run. Nothing reads those files again or compares
+them later, so a profile replaced after the run leaves the record as it was. A library caller
+passes `configuration` to `runInCustody` itself, and the record then holds what that caller stated:
+custody reads no configuration. `scope` says so in the record. Without a stated configuration the
+field is `null`. In records written by 0.12.0 it is absent.
+
 Custody's own records hold no environment value — not `extraEnv`, not `extraSettings`, not a token
-it read — and nothing in them is read from the output. They do hold `extraArgs` as given, as
+it read — and nothing in `invocation.json`, `start.json` or `completion.json` is read from the
+output. `observation.json` is a reading of the output: it holds what the outcome reader reports,
+an error result's text and the journal's API-error texts among it, each cut to 200 characters.
+Beyond those it holds identifiers, verbatim reason codes, counts, paths and digests: no message,
+prompt or tool output. They do hold `extraArgs` as given, as
 `--debug` prints them: a secret passed there is recorded with them. The directory as a whole is
 not free of sensitive material, and custody does not make it so: `home/` holds what a kept Claude
 home holds — `settings.json`, mode 0600, with `extraSettings` merged in, its `env` block included;
@@ -632,14 +660,28 @@ whatever the spawned process wrote. Keeping the directory is keeping all of that
 
 Under custody the CLI's stdout is the custody event stream, one JSON object per line: `started`
 (with the start record), `supervisor` (each step of a stop), `completed` (with the completion
-record, as written). Nothing else goes there: the transcript is not rendered, `--debug` prints to
-stderr, and `print` is refused, so a declaration needs no `--quiet` or `--print`. The usual lines
-still go to stderr, and `Claude run custody at DIR` last. Writing a line passes an event on; it is
-not its receipt, and whether anyone read it is not known here. A reader that goes away ends the
-stream, with one line on stderr, not the run: the completion is still written to the directory.
+record, as written), and `observed` last (with the observation, and the file it was written to or
+the error that kept it from being written). Nothing else goes there: the transcript is not
+rendered, `--debug` prints to stderr, and `print` is refused, so a declaration needs no `--quiet`
+or `--print`. The usual lines still go to stderr, then `Claude run observed: STATE`, and
+`Claude run custody at DIR` last. Writing a line passes an event on; it is not its receipt, and
+whether anyone read it is not known here. A reader that goes away ends the stream, with one line on
+stderr, not the run: the completion and the observation are still written to the directory.
+
+A run refused before custody began — an invalid configuration, a used directory, a missing parent —
+writes no event and leaves no directory. An event stream that ends with no `started` or `completed`
+line therefore says nothing about the exit status or the cause; both are on the CLI's own exit
+status and stderr, which only whoever ran it holds.
 
 The exit status is the child's own, or 128+n after a stop signal, as for any run; 1 when the run
-never started, and 1 rather than 0 when custody failed to record something.
+never started, and 1 rather than 0 when custody failed to record something. The observation
+changes none of that: one that could not be written is reported on stderr, and the status stands.
+
+**The observation is a reading, not a receipt.** Every run in custody is read at its end. Opting
+into custody already opts into keeping the run's records, and the observation reads only those
+records. It reports what they say, including a context limit, an error result, a stop reason and
+outputs that changed after the completion, and it decides nothing. Whoever receives the run still
+has to read the observation and act on it.
 
 What a completion says is how the spawned process ended, and nothing more:
 
@@ -762,12 +804,15 @@ For many files, read them in one process:
 bare-claude --outcome-batch requests.jsonl     # or `-` for stdin
 ```
 
-- **Input.** Each non-empty line is `{"id"?: string, "result"?: path, "journal"?: path}`.
-  Relative paths resolve against the current directory.
+- **Input.** Each non-empty line is `{"id"?: string, "result"?: path, "journal"?: path}`, or
+  `{"id"?: string, "custody": dir}`, read as [`--outcome-custody`](#reading-a-custody-directory)
+  reads it. A custody line that also names a result or journal is refused: the directory names its
+  own. Relative paths resolve against the current directory.
 - **Output.** One JSON line per input line, in order, with `line`, `id`, `reading` and `error`.
   A bad line, or a file that cannot be read, is that line's `error`; the others are still read.
 - **Each file is read once.** Each distinct path is read once per batch, so every line naming a
-  file refers to the same bytes. Exit 1 only when the requests themselves cannot be read.
+  file refers to the same bytes; each distinct custody directory likewise. Exit 1 only when the
+  requests themselves cannot be read.
 
 **What a reading says, and what it does not.** Nothing here decides whether a process has ended,
 whether the work was done, or whether anything was delivered. `status: "no-error"` means only that
@@ -840,11 +885,73 @@ alone cannot attribute a context-limit ending to the result's process.
   never throw.
 - `readOutcome(result, journal)`: puts two readings together.
 - `readOutcomeFiles(requests, readFile)`: the batch reader, with your own file reader.
-- `parseOutcomeRequest(line)`: reads one batch line.
+- `parseOutcomeRequest(line)`: reads one batch line, as an `OutcomeRequest`, a `CustodyRequest`
+  or why it is neither.
 - `callTokens(usage)` and `isMeasuredPrompt(tokens)`.
 - Constants: `contextLimitText`, `contextLimitTerminalReason`, `processScope` and `sessionScope`.
 - Types: `TokenSums`, `ResultReading`, `JournalReading`, `JournalSegment`, `ResultJournalJoin`, `JoinKind`,
-  `OutcomeRequest` and `OutcomeEntry`, with their parts.
+  `OutcomeRequest`, `CustodyRequest` and `OutcomeEntry`, with their parts.
+
+### Reading a custody directory
+
+```bash
+bare-claude --outcome-custody /work/runs/0042
+```
+
+This prints one JSON object (`format: "bare-claude/custody-reading"`, `version` 1): what the
+directory's files held when they were read. Every run in custody gets the same reading written as
+its `observation.json` once its completion is written. Nothing is spawned, signalled or written,
+and no PID is looked up. Exit 1 means only that the directory could not be listed.
+
+**`state`** says what the records say, never what a process is doing:
+
+| State | The records |
+| --- | --- |
+| `invocation-only` | an invocation and nothing after it. The run may have been spawned just before its runner died. Unknown, not failed and not done |
+| `start-only` | a start and no completion. Custody did not record an end, and its runner may have died before or after the process ended. Unknown, not failed and not done, however old the start |
+| `not-started` | a completion saying the run never started |
+| `exited` | a completion saying the spawned process was seen to end without custody stopping it |
+| `stopped` | a completion saying custody stopped it, by a signal or the caller's abort |
+| `custody-error` | a completion saying custody failed at something of its own. Its `outcome` and exit fields are still as recorded |
+| `unknown` | records custody never writes together, or that disagree with each other, or no custody record at all |
+| `unreadable` | the directory could not be listed, or the record the state rests on could not be read as one this reader knows |
+
+`basis` says why, and `problems` lists everything that could not be read or did not agree.
+
+**What else it holds:**
+
+- **The records**, `invocation`, `start` and `completion`. Each is `absent`; `read`, typed as
+  written, with the file's size, SHA-256 and the time it was read; or `unreadable`, with why. A
+  record is read only when its `format`, its `version` and every field are as custody writes them.
+- **`entries`**: the directory's names, anyone else's files included, which are not read.
+- **`stdout`**: the bytes read and read as a result by `readResult`. It also carries what the
+  completion recorded of them, and `changedSinceCompletion`. `writtenBy` is the invocation's
+  `launcher` and `executable`, and `provenance` says what that is: what that executable wrote. It
+  is native Claude Code's result only where the executable is native Claude Code. Nothing here
+  establishes that, whatever the path is called or the output looks like. `outputFormat` is the
+  last `--output-format` the invocation's `extraArgs` asked for.
+- **`stderr`**: the same digest facts, unread.
+- **`journal`**: the journal the completion names, or else the start (`namedBy`), read by
+  `readJournal`. Like `stdout`, it carries `atCompletion` and `changedSinceCompletion`: whether it
+  was written, created or removed since. That is a fact about bytes. It does not say who wrote
+  them, or whether anything still writes, and it offers no continuation.
+- **`join`**: `joinResult` over the two, when both were read. It correlates the result with a
+  journal segment. It is not process identity, and a segment's context-limit or API-error record
+  may be another process's. `stdout.result.process` stays the figures of the process that wrote
+  the result, joined or not.
+
+A context limit, an error result, a stop reason, API-error records and compactions are reported
+where the outcome reader puts them, verbatim and in their own scope. No threshold is applied, and
+nothing is inferred about purpose or about why the run ended.
+
+The configuration files an invocation names are not read again. What the record says is what was
+stated when it was written.
+
+**Programmatically**, from `@agladysh/bare-claude/custody`: `readCustody(directory)`, which never
+throws, resolving with a `CustodyReading`: `CustodyState`, `CustodyRecordReading`,
+`CustodyFileRead`, `CustodyOutputReading`, `CustodyStdoutReading`, `CustodyJournalReading` and
+`RecordedDigest`, with the constants `custodyReadingVersion`, `custodyReadingScope` and
+`stdoutProvenance`.
 
 
 ## Doctor
@@ -1200,7 +1307,11 @@ does, detached on macOS and Linux, under `superviseSignals`, and keeps the run a
   once as soon as the spawn returns and before custody awaits anything. Its `ProcessIdentity` —
   `method`, `start`, `boot` — is recorded in `start.json` as given, three fields only, or the
   error it threw. Custody reads no process table itself, and whether the PID still named the
-  spawned process when it was read is the reader's to establish.
+  spawned process when it was read is the reader's to establish;
+- `configuration`, a `CustodyConfiguration`: the files that declared the run and the presets
+  selected, as `readConfig` or `readConfigFiles` from `@agladysh/bare-claude/config` give their
+  provenance. It is recorded field by field in `invocation.json` as stated, with
+  `configurationScope`; custody reads none of it.
 
 ```typescript
 import { runInCustody } from '@agladysh/bare-claude/custody';
@@ -1217,12 +1328,17 @@ or has no parent. Once the directory is made it resolves with a `CustodyCompleti
 spawn is `outcome: 'not-started'`; when custody cannot write `start.json` it stops the run
 (`stop.cause: 'custody-error'`), since a run nobody could later find is not one it keeps. When
 `completion.json` itself cannot be written, the resolved completion's `custodyError` says so.
+Then, on every route that writes a completion, it reads the directory with `readCustody`, writes
+the reading as `observation.json` and calls `onEvent` with `observed`. Whatever fails there is
+that event's `error`, and changes neither the completion nor what `runInCustody` resolves with.
 
 The records are `CustodyInvocation`, `CustodyStart` and `CustodyCompletion`, each with `format` and
-`version` (`custodyVersion`, now 1); a completion's `scope` is `completionScope`. Within them:
-`CustodySession`, `CustodyOutput`, `CustodyJournal`, `CustodyOutcome`, `CustodyStopCause`,
-`ProcessIdentity` and `CustodyIdentity`; `processGroupAfter` is a `ProcessGroupReading` from
-`@agladysh/bare-claude/lifecycle`. `custodyFiles` names every file.
+`version` (`custodyVersion`, still 1: `configuration` was added, and nothing else changed meaning);
+a completion's `scope` is `completionScope`. Within them: `CustodySession`, `CustodyOutput`,
+`CustodyJournal`, `CustodyOutcome`, `CustodyStopCause`, `ProcessIdentity`, `CustodyIdentity` and
+`RecordedConfiguration`; `processGroupAfter` is a `ProcessGroupReading` from
+`@agladysh/bare-claude/lifecycle`. `custodyFiles` names every file. The observation is a
+`CustodyReading` (see [Reading a custody directory](#reading-a-custody-directory)).
 
 ### Pure launch configuration
 
@@ -1295,8 +1411,14 @@ the enclosing Git working copy, whether or not the file exists — or `null` out
 default, `--config` and `--no-config` — and validates it; see
 [Choosing the configuration](#choosing-the-configuration). `loadConfigFiles(paths)` reads several
 named files, each of which must exist, validates each, and composes them in order with
-`composeConfigs`; it is what the CLI reads for any `--config`. `authMode` is the schema for the
-`auth` field, as `effortLevel` is for its own.
+`composeConfigs`. One file named twice is refused, by whatever names. `authMode` is the schema for
+the `auth` field, as `effortLevel` is for its own.
+
+`readConfig(source, cwd?)` and `readConfigFiles(paths)` do the same and also return where the
+configuration came from: a `ConfigReading`, `{ config, provenance }`. A `ConfigProvenance` is the
+route (`source`) and every file read (`files`, each a `ConfigFileRecord`: `path`, `realPath`,
+`bytes` and `sha256`). Each file is read once, and its digest is of exactly the bytes parsed. The
+CLI reads through these two and passes the provenance to custody.
 
 `@agladysh/bare-claude/preset` exports `resolvePreset(preset, presets)`, which folds a
 `DynamicPreset`'s `use` chain and applies the CLI display defaults to produce a runnable `Preset`

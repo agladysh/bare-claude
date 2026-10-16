@@ -20,7 +20,7 @@ import { SessionBuilder } from '@agladysh/bare-claude/SessionBuilder';
 
 import pkg from '../package.json';
 import {
-  authMode, effortLevel, loadConfig, loadConfigFiles, type Config, type ConfigSource, type EffortLevel
+  authMode, effortLevel, readConfig, readConfigFiles, type ConfigReading, type ConfigSource, type EffortLevel
 } from '@agladysh/bare-claude/config';
 import type { AuthMode } from '@agladysh/bare-claude';
 import { resolveInvocation, type DynamicPreset, type Preset } from '@agladysh/bare-claude/preset';
@@ -30,11 +30,14 @@ import {
   type ProcessGroupState, type StopReport, type SupervisorEvent
 } from '@agladysh/bare-claude/lifecycle';
 import {
-  custodyFiles, runInCustody, type CustodyDeclaration, type CustodyEvent
+  custodyFiles, readCustody, runInCustody,
+  type CustodyConfiguration, type CustodyDeclaration, type CustodyEvent, type CustodyReading
 } from '@agladysh/bare-claude/custody';
 import { alternateCredentialVariables, tokenVariable } from '@agladysh/bare-claude/token';
 import { readUsage } from '@agladysh/bare-claude/usage';
-import { parseOutcomeRequest, readOutcomeFiles, type OutcomeEntry, type OutcomeRequest } from '@agladysh/bare-claude/outcome';
+import {
+  parseOutcomeRequest, readOutcomeFiles, type CustodyRequest, type OutcomeEntry, type OutcomeRequest
+} from '@agladysh/bare-claude/outcome';
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -90,9 +93,12 @@ function displayHelp() {
     '      --outcome <file>   Read a finished run\'s --output-format json result and',
     '                         print what it says as JSON; exit 1 only if unreadable',
     '      --journal <file>   Its session journal, with --outcome or alone',
+    '      --outcome-custody <dir>',
+    '                         Read a custody directory: its records, its stdout as a',
+    '                         result, its journal, and what changed since completion',
     '      --outcome-batch <file|->',
-    '                         Read many {"id","result","journal"} lines in one process,',
-    '                         printing one JSON line per request line',
+    '                         Read many {"id","result","journal"} or {"id","custody"}',
+    '                         lines in one process, printing one JSON line per line',
     '      --doctor           Check bun, claude, git, the credential, the PATH install',
     '                         and the preset file; exit 1 when something required is missing',
     '  -v, --version          Print the version and exit',
@@ -138,9 +144,25 @@ function configChoice(files: string[] | undefined, none: boolean | undefined): C
   return { kind: 'files', paths: files.map(file => path.resolve(file)) };
 }
 
-/** The configuration a run reads for `choice`. */
-function readConfiguration(choice: ConfigChoice): Promise<Config> {
-  return choice.kind === 'files' ? loadConfigFiles(choice.paths) : loadConfig(choice);
+/** The configuration a run reads for `choice`, and the files it was read from. */
+function readConfiguration(choice: ConfigChoice): Promise<ConfigReading> {
+  return choice.kind === 'files' ? readConfigFiles(choice.paths) : readConfig(choice);
+}
+
+/**
+ * Which configuration declared the run, as custody records it: the files read
+ * and their digests, and the presets selected at the root — `--use`, which
+ * replaces the root's own, else the root's.
+ */
+function configurationOf({ config, provenance }: ConfigReading, use: string | undefined): CustodyConfiguration {
+  const fromRoot = config.configPreset.use;
+  if (use) {
+    return { ...provenance, use: [ use ], useFrom: 'command-line' };
+  }
+  if (fromRoot !== undefined) {
+    return { ...provenance, use: Array.isArray(fromRoot) ? fromRoot : [ fromRoot ], useFrom: 'configuration' };
+  }
+  return { ...provenance, use: null, useFrom: null };
 }
 
 /**
@@ -195,11 +217,27 @@ async function reportOutcome(resultPath: string | undefined, journalPath: string
 }
 
 /**
+ * `--outcome-custody`: what a custody directory's files say, as JSON on
+ * stdout. Exit 1 only when the directory itself cannot be listed; any other
+ * state, `unreadable` records included, is the reading's to say.
+ */
+async function reportCustody(directory: string): Promise<number> {
+  const reading = await readCustody(path.resolve(directory));
+  process.stdout.write(`${JSON.stringify(reading, null, 2)}\n`);
+  return reading.entries === null ? 1 : 0;
+}
+
+function isCustodyRequest(request: OutcomeRequest | CustodyRequest): request is CustodyRequest {
+  return 'custody' in request;
+}
+
+/**
  * `--outcome-batch`: one request per line of a file, or of stdin for `-`,
  * read in this one process; one JSON line out per non-empty line in, in
  * order, each carrying its input line number. Exit 1 only when the requests
  * themselves cannot be read; a bad line or an unreadable file is that
- * line's `error`.
+ * line's `error`. A custody line's reading is `readCustody`'s, which says
+ * itself what could not be read; each distinct directory is read once.
  */
 async function reportOutcomeBatch(source: string): Promise<number> {
   let text: string;
@@ -212,14 +250,23 @@ async function reportOutcomeBatch(source: string): Promise<number> {
 
   const lines = text.split('\n').flatMap((row, index) =>
     row.trim() === '' ? [] : [ { line: index + 1, parsed: parseOutcomeRequest(row) } ]);
-  const requests = lines.flatMap(l => typeof l.parsed === 'string' ? [] : [ resolveRequest(l.parsed) ]);
+  const requests = lines.flatMap(l => typeof l.parsed === 'string' || isCustodyRequest(l.parsed) ? [] : [ resolveRequest(l.parsed) ]);
   const entries = await readOutcomeFiles(requests, readBytes);
+  const custodies = new Map<string, Promise<CustodyReading>>();
+  const custodyAt = (directory: string): Promise<CustodyReading> => {
+    const resolved = path.resolve(directory);
+    const cached = custodies.get(resolved) ?? readCustody(resolved);
+    custodies.set(resolved, cached);
+    return cached;
+  };
 
   let next = 0;
   for (const { line, parsed } of lines) {
-    let entry: OutcomeEntry;
+    let entry: OutcomeEntry | { id: string | null, reading: CustodyReading, error: null };
     if (typeof parsed === 'string') {
       entry = { id: null, reading: null, error: `line ${line}: ${parsed}` };
+    } else if (isCustodyRequest(parsed)) {
+      entry = { id: parsed.id, reading: await custodyAt(parsed.custody), error: null };
     } else {
       entry = entries[next] ?? { id: parsed.id, reading: null, error: 'not read' };
       next += 1;
@@ -233,7 +280,9 @@ async function reportOutcomeBatch(source: string): Promise<number> {
  * Either a resolved preset to run, or an exit code for a mode that has already
  * done its work and produced its own output.
  */
-type Startup = { kind: 'run', preset: Preset } | { kind: 'done', exitCode: number };
+type Startup =
+  | { kind: 'run', preset: Preset, configuration: CustodyConfiguration }
+  | { kind: 'done', exitCode: number };
 
 async function loadPreset(): Promise<Startup> {
   const { values, positionals } = parseArgs({
@@ -311,6 +360,9 @@ async function loadPreset(): Promise<Startup> {
         type: 'string',
       },
       'outcome-batch': {
+        type: 'string',
+      },
+      'outcome-custody': {
         type: 'string',
       },
       doctor: {
@@ -397,6 +449,13 @@ async function loadPreset(): Promise<Startup> {
 
   // Offline readers of a finished run's files: they read no configuration,
   // so neither --config, once or composed, nor any launch flag changes them.
+  if (values['outcome-custody'] !== undefined) {
+    if (values.outcome !== undefined || values.journal !== undefined || values['outcome-batch'] !== undefined) {
+      throw new Error('--outcome-custody cannot be combined with --outcome, --journal or --outcome-batch: a custody directory names its own');
+    }
+    return { kind: 'done', exitCode: await reportCustody(values['outcome-custody']) };
+  }
+
   if (values['outcome-batch'] !== undefined) {
     if (values.outcome !== undefined || values.journal !== undefined) {
       throw new Error('--outcome-batch cannot be combined with --outcome or --journal');
@@ -454,7 +513,13 @@ async function loadPreset(): Promise<Startup> {
     ? positionals.join(' ')
     : (process.stdin.isTTY ? undefined : (await Bun.stdin.text()).trim() || undefined));
 
-  return { kind: 'run', preset: resolveInvocation(await readConfiguration(choice), fromCli, values.use) };
+  // Read once: what is resolved and what custody records of it are the same bytes.
+  const configuration = await readConfiguration(choice);
+  return {
+    kind: 'run',
+    preset: resolveInvocation(configuration.config, fromCli, values.use),
+    configuration: configurationOf(configuration, values.use),
+  };
 }
 
 function isLauncher(value: string): value is Launcher {
@@ -581,7 +646,7 @@ async function main() {
   if (startup.kind === 'done') {
     return startup.exitCode;
   }
-  const { preset } = startup;
+  const { preset, configuration } = startup;
 
   // Under custody, stdout carries custody events and nothing else.
   if (preset.debug) {
@@ -663,7 +728,7 @@ async function main() {
   preset.permissionMode ??= 'acceptEdits';
 
   if (preset.custody !== undefined) {
-    return runUnderCustody(preset, preset.custody);
+    return runUnderCustody(preset, preset.custody, configuration);
   }
 
   // The library's own supervision, installed before the spawn so a signal
@@ -807,9 +872,14 @@ async function main() {
  * one JSON line, and the usual lines to stderr. Exits as an ordinary run does
  * — the child's status, or 128+n after a stop signal — and 1 when the run
  * never started, or when custody failed to record something and the child's
- * status would otherwise read as success.
+ * status would otherwise read as success. The observation after the
+ * completion is reported, and changes none of that.
  */
-async function runUnderCustody(preset: Preset, custody: CustodyDeclaration): Promise<number> {
+async function runUnderCustody(
+  preset: Preset,
+  custody: CustodyDeclaration,
+  configuration: CustodyConfiguration,
+): Promise<number> {
   // Writing a line passes an event on; it is not its receipt. A reader that
   // has gone ends the stream here, never the run: the completion is still
   // written to the directory, and the exit status is still the run's.
@@ -828,6 +898,7 @@ async function runUnderCustody(preset: Preset, custody: CustodyDeclaration): Pro
     directory: custody.directory,
     keepCallToAction: custody.keepCallToAction,
     graceMs: preset.stopGraceMs ?? defaultStopGraceMs,
+    configuration,
     onEvent: event => {
       if (event.kind === 'started') {
         group = event.start.processGroup;
@@ -893,8 +964,13 @@ function describeCustodyEvent(event: CustodyEvent, group: number | null): string
           }
         }
       }
-      lines.push(`Claude run custody at ${event.directory}`);
       return `${lines.join('\n')}\n`;
+    }
+    case 'observed': {
+      const said = event.error === null
+        ? `Claude run observed: ${event.observation?.state ?? 'not read'}, in ${event.file ?? custodyFiles.observation}`
+        : `bare-claude: custody observation: ${event.error}; the completion and the exit status stand`;
+      return `${said}\nClaude run custody at ${event.directory}\n`;
     }
   }
 }
