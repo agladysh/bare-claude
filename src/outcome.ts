@@ -224,7 +224,7 @@ export interface ResultReading {
     apiDurationMs: number | null,
     models: ModelTotals[],
 
-    /** The one context window every model reports, or null when none or several. */
+    /** The shared window among models that report one; null when none report one or their windows differ. */
     contextWindow: number | null,
     scope: string,
   } | null,

@@ -2001,7 +2001,7 @@ export interface BriefMeasured {
    */
   lastCall: { prompt: number | null, output: number | null, from: 'result' | 'appended journal' } | null,
 
-  /** The one context window the result reports for every model it names; null when none or several. */
+  /** The shared window among models that report one; null when none report one or their windows differ. */
   contextWindow: number | null,
 
   /** The result's sums over this process's calls: no context size. */
