@@ -36,7 +36,7 @@ export interface StoppableRun {
   subprocess: {
     readonly pid: number,
     readonly exitCode: number | null,
-    readonly signalCode: NodeJS.Signals | null,
+    readonly signalCode: number | NodeJS.Signals | null,
     readonly exited: Promise<number>,
     kill(signal?: number | NodeJS.Signals): void,
   },
@@ -74,8 +74,8 @@ export interface StopReport {
   /** The spawned process's exit code, null when it ended by a signal or has not ended. */
   exitCode: number | null,
 
-  /** The signal that ended the spawned process, if one did. */
-  signalCode: NodeJS.Signals | null,
+  /** The signal that ended the spawned process, as Bun reports it (name or number), if one did. */
+  signalCode: number | NodeJS.Signals | null,
 
   /** The process group signalled, null when the run has none. */
   processGroup: number | null,

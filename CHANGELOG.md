@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- The lifecycle contract accepts and preserves numeric subprocess signal codes as well as signal names, matching newer Bun type declarations without narrowing their result.
 - **A fresh run in a cwd given through a symbolic link reported a journal that did not exist.**
   The project directory was keyed on the alias (`/tmp/…`), while Claude Code writes under the key
   of the physical directory it runs in (`/private/tmp/…`). The cwd is now made physical, by
