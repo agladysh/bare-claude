@@ -4,7 +4,7 @@ import { $ } from 'bun';
 
 import { parseArgs } from 'node:util';
 import path from 'node:path';
-import { watch } from 'node:fs/promises';
+import { realpath, watch } from 'node:fs/promises';
 
 import TailFile from '@logdna/tail-file';
 import { type } from 'arktype';
@@ -285,21 +285,38 @@ async function reportOutcomeBatch(source: string, brief: boolean): Promise<numbe
   return 0;
 }
 
+/** A directory's physical path when it resolves to one, else the path as given, resolved. */
+async function physicalDirectory(directory: string): Promise<string> {
+  const resolved = path.resolve(directory);
+  try {
+    return await realpath(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
 /**
  * `--outcome-batch` under `--brief`: one line out per non-empty line in, in
  * order, each with a brief for a custody line. Every distinct directory is
- * read once, and all of them before any brief is made, since each brief seeks
- * its run's lineage among the batch's own readings. A line naming a result or
- * journal is that line's `error`: their readings carry error text no brief
- * does.
+ * read once, at its physical path, and all of them before any brief is made,
+ * since each brief seeks its run's lineage among the batch's own readings.
+ * A directory named by two paths, a symbolic link among them, is one reading,
+ * and its briefs name its physical path; a copy is another directory. A line
+ * naming a result or journal is that line's `error`: their readings carry
+ * error text no brief does.
  */
 async function reportBriefs(lines: readonly { line: number, parsed: OutcomeRequest | CustodyRequest | string }[]): Promise<void> {
+  const physical = new Map<string, string>();
   const readings = new Map<string, CustodyReading>();
   for (const { parsed } of lines) {
     if (typeof parsed !== 'string' && isCustodyRequest(parsed)) {
       const resolved = path.resolve(parsed.custody);
-      if (!readings.has(resolved)) {
-        readings.set(resolved, await readCustody(resolved));
+      if (!physical.has(resolved)) {
+        const directory = await physicalDirectory(resolved);
+        physical.set(resolved, directory);
+        if (!readings.has(directory)) {
+          readings.set(directory, await readCustody(directory));
+        }
       }
     }
   }
@@ -312,7 +329,8 @@ async function reportBriefs(lines: readonly { line: number, parsed: OutcomeReque
     } else if (!isCustodyRequest(parsed)) {
       entry = { id: parsed.id, brief: null, error: `line ${line}: --brief reads custody lines only` };
     } else {
-      const reading = readings.get(path.resolve(parsed.custody));
+      const directory = physical.get(path.resolve(parsed.custody));
+      const reading = directory === undefined ? undefined : readings.get(directory);
       entry = reading === undefined
         ? { id: parsed.id, brief: null, error: 'not read' }
         : { id: parsed.id, brief: briefCustody(reading, all), error: null };
@@ -464,6 +482,12 @@ async function loadPreset(): Promise<Startup> {
     return { kind: 'done', exitCode: 0 };
   }
 
+  // Before every other mode, so it is never silently ignored.
+  const brief = values.brief === true;
+  if (brief && values['outcome-custody'] === undefined && values['outcome-batch'] === undefined) {
+    throw new Error('--brief needs --outcome-custody or --outcome-batch');
+  }
+
   if (values.version) {
     process.stdout.write(`${pkg.version}\n`);
     return { kind: 'done', exitCode: 0 };
@@ -497,11 +521,6 @@ async function loadPreset(): Promise<Startup> {
 
   // Offline readers of a finished run's files: they read no configuration,
   // so neither --config, once or composed, nor any launch flag changes them.
-  const brief = values.brief === true;
-  if (brief && values['outcome-custody'] === undefined && values['outcome-batch'] === undefined) {
-    throw new Error('--brief needs --outcome-custody or --outcome-batch');
-  }
-
   if (values['outcome-custody'] !== undefined) {
     if (values.outcome !== undefined || values.journal !== undefined || values['outcome-batch'] !== undefined) {
       throw new Error('--outcome-custody cannot be combined with --outcome, --journal or --outcome-batch: a custody directory names its own');

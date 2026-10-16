@@ -1791,10 +1791,10 @@ export async function readCustody(directory: string): Promise<CustodyReading> {
 export const custodyBriefVersion = 1;
 
 /** What a brief reports, and the limit of it. */
-export const custodyBriefScope = 'a projection of one custody reading to classifications, counts, digests and recorded figures, each in its own scope: no prompt, result, error, stderr or problem text, no extraArgs and no environment. Producing, printing or showing it is not anyone\'s reception of the run\'s return, which is read from the run\'s stdout; and it does not say whether the task was done, delivered, received or accepted';
+export const custodyBriefScope = 'one custody reading without its named payload fields (call to action, prompt, result, error and API-error text, stderr, problem text, extraArgs, environment); not redaction. Showing it is not reception of the run\'s return, which is read from its stdout, and says nothing of whether the task was done, delivered, received or accepted';
 
 /** What every `costUsd` in a brief is. */
-export const briefCostBasis = 'Claude Code\'s own dollar figure as it recorded it, a list-price estimate: not a bill, and not subscription usage';
+export const briefCostBasis = 'Claude Code\'s own reported dollar estimate: not a bill, and not subscription usage';
 
 /** How a run's custody ended, as its completion records it: classifications and numbers only. */
 export interface BriefEnd {
@@ -1812,7 +1812,7 @@ export interface BriefEnd {
 /** What the invocation chose, of what a brief carries. */
 export interface BriefRun {
   /** The version of the package that kept the run. */
-  keptBy: string,
+  packageVersion: string,
 
   launcher: Launcher,
   model: string | null,
@@ -1824,17 +1824,19 @@ export interface BriefRun {
 
 /**
  * What `spawnClaude` put in the journal before the spawn, as `start.json`
- * recorded it: the size and digest of those bytes; `nothing`; or
- * `unrecorded`, with no readable start or one written before the seed was
- * recorded (0.12).
+ * recorded it: the size and digest of those bytes; `nothing`; `unrecorded`,
+ * by a start written before the seed was recorded (0.12); or `no-start`,
+ * with no readable start at all, so no record that anything was seeded:
+ * a run that never started, or whose start was never written.
  */
-export type BriefSeeded = RecordedDigest | 'nothing' | 'unrecorded';
+export type BriefSeeded = RecordedDigest | 'nothing' | 'unrecorded' | 'no-start';
 
 /**
  * How the run's session began. `requiredSha256` is the digest a file seed's
  * caller required of its source, which the spawn refuses to seed without;
  * `seeded` the digest of the bytes seeded, which the spawn measured. Lineage
- * rests on these digests alone. A session id is not lineage: a session can be
+ * rests on these digests alone, and on the required one only where a start
+ * shows the spawn happened. A session id is not lineage: a session can be
  * continued from any of its journals, or from bytes no custody kept.
  */
 export interface BriefSession {
@@ -1862,39 +1864,52 @@ export type LineageMatch = 'completion.journal' | 'journal as read';
  *
  * - `fresh`: it continued nothing. A chain ending here is whole.
  * - `not-sought`: no predecessors were given to look among.
+ * - `unknown`: the records do not say what was seeded: no readable start,
+ *   which is what records that the spawn happened, or a start written by 0.12
+ *   with no readable invocation. A digest the invocation required is not
+ *   bytes seeded: a run that never started, or was refused its seed, has one.
  * - `no-digest`: it continued a session, but no record holds a digest of the
  *   bytes it seeded: records written by 0.12, a memory seed among them, or a
- *   file seed whose caller required none. `candidates` share its session id,
- *   which does not make any of them its predecessor.
+ *   file seed whose caller required none.
  * - `conflict`: its records disagree about what was seeded: a start's digest
  *   other than the one its invocation required, or a continued session with
  *   nothing seeded.
- * - `ambiguous`: the journals of all the `candidates` have the digest seeded.
- *   None is chosen.
- * - `mismatch`: no journal has it, though the `candidates` share the session
- *   id: by digest, none of them is what was seeded. A run's own successors
- *   share it too.
- * - `unresolved`: no journal has it, and none shares the session id. Bytes
- *   preloaded into a seed make it so, as they change the digest.
- * - `unknown`: the records do not say how the session began.
+ * - `ambiguous`: the journals of all the `candidates` have the digest
+ *   seeded, a directory and a copy of it among them. None is chosen.
+ * - `source-differs`: no journal given has the digest seeded, and the
+ *   `candidates` are the runs whose recorded journal path is the file the
+ *   invocation names as its source: that journal, as its completion recorded
+ *   it and as read, is not the bytes seeded. Paths are compared as recorded.
+ * - `unresolved`: no journal given has the digest seeded. Its predecessor
+ *   may simply not be among those given; bytes preloaded into a seed also
+ *   make it so, as they change the digest.
  * - `cycle`: the next predecessor, the one candidate, is already in the chain.
  *   Runs that appended nothing to what they seeded can make one.
  */
 export type LineageEndStatus =
   | 'fresh'
   | 'not-sought'
+  | 'unknown'
   | 'no-digest'
   | 'conflict'
   | 'ambiguous'
-  | 'mismatch'
+  | 'source-differs'
   | 'unresolved'
-  | 'unknown'
   | 'cycle';
 
-/** Where a lineage stops, and the directories its status names, sorted; never a choice among them. */
+/** Where a lineage stops. Directories are sorted, and none is a choice among them. */
 export interface LineageEnd {
   status: LineageEndStatus,
+
+  /** The directories `ambiguous`, `source-differs` or `cycle` names; otherwise empty. */
   candidates: string[],
+
+  /**
+   * Under `no-digest` and `unresolved`, the runs given that share the session
+   * id; otherwise empty. A hint, not lineage and not evidence against it: a
+   * run's own successors share its session id too.
+   */
+  sameSession: string[],
 }
 
 /**
@@ -1903,7 +1918,7 @@ export interface LineageEnd {
  * call, whose prompt is what Claude Code reads back as the context size on
  * resume. Otherwise why that is not known.
  */
-export type LineageInherited =
+export type LineageInheritedCall =
   | { status: 'read', prompt: number | null, output: number | null }
   | { status: 'no-measured-call' | 'journal-differs' | 'journal-not-read' };
 
@@ -1915,7 +1930,7 @@ export interface LineageLink {
   matchedBy: LineageMatch[],
 
   state: CustodyState,
-  inherited: LineageInherited,
+  inheritedCall: LineageInheritedCall,
 
   /** Whether its result or its appended records show a context limit; null when it has neither. */
   contextLimit: boolean | null,
@@ -1939,8 +1954,9 @@ export type BriefResult =
     file: ResultFile,
 
     /** What the result says about itself, from `is_error` alone. */
-    reported: ResultStatus,
+    resultStatus: ResultStatus,
 
+    /** Null when absent, or not one word (see {@link CustodyBrief}). */
     terminalReason: string | null,
     stopReason: string | null,
     numTurns: number | null,
@@ -1971,7 +1987,7 @@ export interface BriefAppended {
  * the last `cost-state` record in the seeded bytes states them. Whether
  * Claude Code resumes its totals from that record is not established here.
  */
-export type BriefInherited =
+export type BriefInheritedTotals =
   | { status: 'read', costUsd: number | null, apiDurationMs: number | null }
   | { status: 'nothing-seeded' | 'no-cost-state' | 'unknown' };
 
@@ -1990,10 +2006,13 @@ export interface BriefMeasured {
   /** The result's sums over this process's calls: no context size. */
   process: { tokens: TokenSums, durationMs: number | null } | null,
 
-  /** The result's session totals, earlier processes of a resumed session included. */
+  /**
+   * The result's session totals, earlier processes of a resumed session
+   * included. `models` leaves out any name that is not one word.
+   */
   session: { costUsd: number | null, apiDurationMs: number | null, models: string[] } | null,
 
-  inherited: BriefInherited,
+  inheritedTotals: BriefInheritedTotals,
   costBasis: typeof briefCostBasis,
 
   /** Null when this run's records cannot be told from inherited ones, or the journal was not read. */
@@ -2013,7 +2032,11 @@ export interface BriefJournal {
   path: string,
   sessionId: string,
 
-  /** As the completion recorded it; a continuation's `sourceSha256` binds to this digest. Null without a completion. */
+  /**
+   * As the completion recorded it; null without a completion. It, the path
+   * and the session id describe the journal a continuation would seed from
+   * only while `changedSinceCompletion` is false.
+   */
   atCompletion: { exists: boolean, bytes: number | null, sha256: string | null } | null,
 
   changedSinceCompletion: boolean | null,
@@ -2022,7 +2045,13 @@ export interface BriefJournal {
   boundary: CustodyJournalBoundary['basis'] | null,
 }
 
-/** What {@link briefCustody} makes of a reading. See {@link custodyBriefScope}. */
+/**
+ * What {@link briefCustody} makes of a reading. See {@link custodyBriefScope}.
+ * A native string it carries (terminal and stop reasons, versions, model
+ * names, the result's session id) is null, or left out of a list, both when
+ * it was not recorded and when it is not one word of printable characters,
+ * 128 at most: that keeps native sentences out, and is not redaction.
+ */
 export interface CustodyBrief {
   format: 'bare-claude/custody-brief',
   version: typeof custodyBriefVersion,
@@ -2063,7 +2092,8 @@ export interface CustodyBrief {
 /**
  * A native identifier, code, version or model name as a brief carries it:
  * one word of printable characters, else null. A result is whatever the
- * spawned executable wrote, and no sentence of it reaches a brief.
+ * spawned executable wrote, and no sentence of it reaches a brief; a single
+ * word does, whatever it says.
  */
 function word(value: string | null): string | null {
   return value !== null && /^[^\s\p{C}]{1,128}$/u.test(value) ? value : null;
@@ -2100,7 +2130,7 @@ function briefResult(result: CustodyStdoutResult): BriefResult {
     status: 'read',
     basis: result.basis,
     file: reading.file,
-    reported: reading.status,
+    resultStatus: reading.status,
     terminalReason: word(reading.terminalReason),
     stopReason: word(reading.stopReason),
     numTurns: reading.numTurns,
@@ -2149,7 +2179,7 @@ function lastCallOf(reading: CustodyReading): BriefMeasured['lastCall'] {
  * The last `cost-state` record wholly within the seeded bytes: a line of the
  * whole journal is seeded when the seeded bytes hold its line end.
  */
-function inheritedOf(reading: CustodyReading): BriefInherited {
+function inheritedTotalsOf(reading: CustodyReading): BriefInheritedTotals {
   const whole = reading.journal?.reading ?? null;
   const appended = appendedReadingOf(reading);
   if (whole === null || appended === null) {
@@ -2178,7 +2208,10 @@ function contextLimitOf(reading: CustodyReading): boolean | null {
 }
 
 function seededOf(start: CustodyStart | null): BriefSeeded {
-  const seeded = start?.seededJournal;
+  if (start === null) {
+    return 'no-start';
+  }
+  const seeded = start.seededJournal;
   if (seeded === undefined) {
     return 'unrecorded';
   }
@@ -2211,7 +2244,7 @@ function journalDigests(reading: CustodyReading): { sha256: string, by: LineageM
   return found;
 }
 
-function inheritedFrom(predecessor: CustodyReading, seeded: string): LineageInherited {
+function inheritedCallFrom(predecessor: CustodyReading, seeded: string): LineageInheritedCall {
   const journal = predecessor.journal;
   if (journal === null || journal.file === null || journal.reading === null) {
     return { status: 'journal-not-read' };
@@ -2229,18 +2262,21 @@ type Resolution =
 
 /** A run's predecessor among `predecessors`, by the digest of what it seeded alone, or why there is none. */
 function resolvePredecessor(reading: CustodyReading, predecessors: readonly CustodyReading[] | null): Resolution {
-  const end = (status: LineageEndStatus, candidates: readonly CustodyReading[] = []): Resolution =>
-    ({ kind: 'end', end: { status, candidates: candidates.map(candidate => candidate.directory).sort() } });
+  const directories = (runs: readonly CustodyReading[]) => runs.map(run => run.directory).sort();
+  const end = (status: LineageEndStatus, candidates: readonly CustodyReading[] = [], sameSession: readonly CustodyReading[] = []): Resolution =>
+    ({ kind: 'end', end: { status, candidates: directories(candidates), sameSession: directories(sameSession) } });
 
-  const { kind, sessionId, requiredSha256, seeded } = sessionOfReading(reading);
+  const { kind, sessionId, sourcePath, requiredSha256, seeded } = sessionOfReading(reading);
   if (kind === 'fresh' || (kind === null && seeded === 'nothing')) {
     return typeof seeded === 'string' ? end('fresh') : end('conflict');
   }
+  // Only a start records that the spawn happened: without one, a digest the
+  // invocation required names bytes nobody is known to have seeded.
+  if (seeded === 'no-start' || (kind === null && seeded === 'unrecorded')) {
+    return end('unknown');
+  }
   if (seeded === 'nothing') {
     return end('conflict');
-  }
-  if (kind === null && seeded === 'unrecorded') {
-    return end('unknown');
   }
   const recorded = seeded === 'unrecorded' ? null : seeded.sha256;
   if (recorded !== null && requiredSha256 !== null && recorded !== requiredSha256) {
@@ -2252,7 +2288,7 @@ function resolvePredecessor(reading: CustodyReading, predecessors: readonly Cust
     sessionId !== null && (recordOf(candidate.start)?.sessionId ?? candidate.journal?.sessionId) === sessionId);
   const digest = recorded ?? requiredSha256;
   if (digest === null) {
-    return end('no-digest', sharing);
+    return end('no-digest', [], sharing);
   }
   if (others === null) {
     return end('not-sought');
@@ -2264,7 +2300,8 @@ function resolvePredecessor(reading: CustodyReading, predecessors: readonly Cust
   });
   const [ only, ...more ] = matches;
   if (only === undefined) {
-    return sharing.length > 0 ? end('mismatch', sharing) : end('unresolved');
+    const source = sourcePath === null ? [] : others.filter(candidate => candidate.journal?.path === sourcePath);
+    return source.length > 0 ? end('source-differs', source) : end('unresolved', [], sharing);
   }
   if (more.length > 0) {
     return end('ambiguous', matches.map(match => match.candidate));
@@ -2283,14 +2320,14 @@ function lineageOf(reading: CustodyReading, predecessors: readonly CustodyReadin
     }
     const { predecessor } = next;
     if (seen.has(predecessor.directory)) {
-      return { links, end: { status: 'cycle', candidates: [ predecessor.directory ] } };
+      return { links, end: { status: 'cycle', candidates: [ predecessor.directory ], sameSession: [] } };
     }
     seen.add(predecessor.directory);
     links.push({
       directory: predecessor.directory,
       matchedBy: next.matchedBy,
       state: predecessor.state,
-      inherited: inheritedFrom(predecessor, next.seeded),
+      inheritedCall: inheritedCallFrom(predecessor, next.seeded),
       contextLimit: contextLimitOf(predecessor),
       compactions: briefAppended(predecessor)?.compactions ?? null,
     });
@@ -2308,8 +2345,11 @@ function lineageOf(reading: CustodyReading, predecessors: readonly CustodyReadin
  *
  * What it leaves out is the point of it: the call to action and the result's
  * text, error and API-error text, stderr, `basis` and `problems` text,
- * `extraArgs`, which may hold secrets, and anything of the environment. A
- * caller that receives the run's return reads the stdout the brief names,
+ * `extraArgs`, which may hold secrets, and anything of the environment. That
+ * is all it leaves out: it is not redaction for publication. Absolute paths,
+ * directory names, session ids, model names, native codes and the call to
+ * action's digest, which can confirm a guessed prompt, are carried as
+ * recorded. A caller that receives the run's return reads the stdout the brief names,
  * and can hold those bytes to its digest; that a brief was produced or shown
  * says nothing of that reception.
  *
@@ -2344,7 +2384,7 @@ export function briefCustody(reading: CustodyReading, predecessors: readonly Cus
     problems: reading.problems.length,
     inPlace: reading.writtenIn.sameAsRead,
     run: invocation === null ? null : {
-      keptBy: invocation.package.version,
+      packageVersion: invocation.package.version,
       launcher: invocation.launcher,
       model: invocation.model,
       effortLevel: invocation.effortLevel,
@@ -2378,7 +2418,7 @@ export function briefCustody(reading: CustodyReading, predecessors: readonly Cus
         apiDurationMs: session.apiDurationMs,
         models: words(session.models.map(model => model.model)),
       },
-      inherited: inheritedOf(reading),
+      inheritedTotals: inheritedTotalsOf(reading),
       costBasis: briefCostBasis,
       appended: briefAppended(reading),
     },
