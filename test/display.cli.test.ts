@@ -20,10 +20,15 @@
  * verbatim would make these tests fail on a decoration change that broke
  * nothing.
  */
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, setDefaultTimeout, test } from 'bun:test';
 import path from 'node:path';
 
 import { cliPath } from './helpers.ts';
+
+// These tests start real Bun CLI processes. With Bun 1.3.13 on 16 October
+// 2026, unchanged baseline cases exceeded the default five-second budget.
+// Keep a 20-second hang bound; retain explicit latency assertions where tested.
+setDefaultTimeout(20_000);
 
 const fixturesDir = path.join(import.meta.dir, 'fixtures');
 
