@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { closeSync, fstatSync, ftruncateSync, openSync, writeSync, type BigIntStats } from 'node:fs';
 import fs, { type FileHandle } from 'node:fs/promises';
 import os from 'node:os';
@@ -7,7 +8,7 @@ import { deepmerge } from 'deepmerge-ts';
 
 // Relative, not by package name: the module is not in package.json `exports`,
 // and a self-reference by name resolves through `exports` once installed.
-import { cloneSessionSeed, type PublishedFile } from './session-seed.ts';
+import { cloneSessionSeed, type PublishedFile, type PublishedSeed } from './session-seed.ts';
 import {
   hasCredential, readTokenFile, resolveTokenFile, tokenVariable
 } from '@agladysh/bare-claude/token';
@@ -898,6 +899,13 @@ interface ClaudeSubprocess<
    */
   processGroup: number | null,
   /**
+   * The size and SHA-256 of exactly the bytes this call put in the session
+   * journal before the spawn, from `customSessionData` and anything the CLI
+   * preloaded into it; null when nothing was seeded. Everything after them in
+   * the journal was appended once the spawn had happened.
+   */
+  seededJournal: { bytes: number, sha256: string } | null,
+  /**
    * Removes the ephemeral Claude home directory, but only when spawnClaude
    * created it: a caller-supplied `ephemeralClaudeHomePath` is left alone.
    * Idempotent. Without this every spawn leaks a temporary directory.
@@ -942,7 +950,8 @@ function errorCode(error: unknown): string | null {
  * created the file, before a byte is written, so a failed write can still be
  * taken back.
  */
-async function writeNewJournal(filePath: string, value: string): Promise<PublishedFile> {
+async function writeNewJournal(filePath: string, value: string): Promise<PublishedSeed> {
+  const bytes = Buffer.from(value);
   let handle: FileHandle;
   try {
     handle = await fs.open(filePath, 'wx', 0o600);
@@ -955,14 +964,14 @@ async function writeNewJournal(filePath: string, value: string): Promise<Publish
   const stats = await handle.stat({ bigint: true });
   const published: PublishedFile = { path: filePath, dev: stats.dev, ino: stats.ino };
   try {
-    await handle.writeFile(value);
+    await handle.writeFile(bytes);
   } catch (error) {
     await handle.close();
     await removeIfUnchanged(published);
     throw error;
   }
   await handle.close();
-  return published;
+  return { ...published, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
 }
 
 /**
@@ -1149,7 +1158,7 @@ export async function spawnClaude<
 
   // What this call has published so far, so a failure can take back exactly
   // that and nothing else.
-  let journal: PublishedFile | null = null;
+  let journal: PublishedSeed | null = null;
   let history: HistoryLine | null = null;
 
   let subprocess: Bun.Subprocess<In, Out, Err>;
@@ -1266,6 +1275,7 @@ export async function spawnClaude<
     projectHomePath,
     sessionJsonlPath,
     processGroup,
+    seededJournal: journal === null ? null : { bytes: journal.bytes, sha256: journal.sha256 },
     dispose: async () => {
       if (disposed || !ownsClaudeHome) {
         return;

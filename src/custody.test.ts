@@ -150,8 +150,23 @@ const constructedResult = JSON.stringify({
 
 const readingKeys = [
   'format', 'version', 'scope', 'reader', 'directory', 'read', 'state', 'basis', 'problems', 'entries',
-  'invocation', 'start', 'completion', 'stdout', 'stderr', 'journal', 'join',
+  'writtenIn', 'invocation', 'start', 'completion', 'stdout', 'stderr', 'journal', 'join',
 ];
+
+/** A seed whose history holds an earlier process's context-limit record; every value constructed. */
+const priorSession = 'prior-session';
+const priorJournal = [
+  { type: 'user', sessionId: priorSession, message: { role: 'user', content: 'earlier' } },
+  {
+    type: 'assistant', sessionId: priorSession, isApiErrorMessage: true, error: 'invalid_request',
+    message: { model: '<synthetic>', role: 'assistant', content: [ { type: 'text', text: 'Prompt is too long' } ] },
+  },
+].map(record => JSON.stringify(record)).join('\n') + '\n';
+
+/** Whether any segment of a journal reading holds a context-limit API error. */
+function holdsContextLimit(reading: { segments: { apiErrors: { contextLimit: boolean }[] }[] } | null | undefined): boolean {
+  return (reading?.segments ?? []).some(segment => segment.apiErrors.some(error => error.contextLimit));
+}
 
 const stdoutKeys = [
   'path', 'file', 'why', 'atCompletion', 'changedSinceCompletion', 'writtenBy', 'provenance', 'outputFormat', 'result',
@@ -377,7 +392,11 @@ describe.if(posix)('runInCustody', () => {
       state: 'not-started',
       start: { status: 'absent' },
       journal: null,
-      stdout: { file: { bytes: 0 }, atCompletion: null, changedSinceCompletion: null, result: { file: 'empty' } },
+      stdout: { file: { bytes: 0 }, atCompletion: null, changedSinceCompletion: null, result: { status: 'not-read' } },
+    });
+    // Not "nothing but whitespace was written": nothing was spawned to write.
+    expect(await readJson(path.join(run.directory, custodyFiles.observation))).toMatchObject({
+      stdout: { result: { why: 'the run never started: no process was spawned to write this stdout' } },
     });
   });
 
@@ -640,9 +659,9 @@ describe.if(posix)('readCustody and the observation', () => {
       scope: custodyReadingScope,
       directory: run.directory,
       state: 'exited',
-      problems: [],
-      invocation: { status: 'read', record: { executable: fakeClaude, configuration: null } },
-      start: { status: 'read' },
+      writtenIn: { directory: run.directory, from: 'invocation.directory', sameAsRead: true },
+      invocation: { status: 'read', record: { executable: fakeClaude, directory: run.directory, configuration: null } },
+      start: { status: 'read', record: { seededJournal: null } },
       completion: { status: 'read', record: completion },
       stdout: {
         writtenBy: { launcher: 'claude', executable: fakeClaude },
@@ -652,14 +671,27 @@ describe.if(posix)('readCustody and the observation', () => {
         changedSinceCompletion: false,
         // Verbatim facts of the result, each in its own scope.
         result: {
-          file: 'result', status: 'error', stopReason: 'constructed_stop',
-          contextLimit: { terminalReason: true, text: true }, process: { scope: processScope },
+          status: 'read',
+          basis: 'json-requested',
+          reading: {
+            file: 'result', status: 'error', stopReason: 'constructed_stop',
+            contextLimit: { terminalReason: true, text: true }, process: { scope: processScope },
+          },
         },
       },
-      journal: { namedBy: 'completion.journal', path: completion.journal?.path ?? '', changedSinceCompletion: false, reading: { lines: 2 } },
+      journal: {
+        namedBy: 'completion.journal', path: completion.journal?.path ?? '', changedSinceCompletion: false, reading: { lines: 2 },
+        // Nothing was seeded: the whole journal is this run's.
+        appended: { status: 'read', boundary: { bytes: 0, sha256: null, basis: 'nothing seeded' }, lineOffset: 0, reading: { lines: 2 } },
+      },
       // The constructed result names a session the journal never does.
       join: { kind: 'no-match' },
     });
+    // Not this run's session: said, without changing the state, which rests on custody's records.
+    const [ start ] = startsIn(run.events);
+    expect(observation?.problems).toEqual([
+      `the stdout result names session constructed-session, ${custodyFiles.start} session ${start?.sessionId ?? ''}: it may be another session's result`,
+    ]);
     expect(Object.keys(observation?.stdout ?? {}).sort()).toEqual([ ...stdoutKeys ].sort());
     expect(observation?.entries).not.toContain(custodyFiles.observation);
 
@@ -685,10 +717,40 @@ describe.if(posix)('readCustody and the observation', () => {
 
     expect(observation).toMatchObject({
       state: 'exited',
-      stdout: { writtenBy: { launcher: 'claude', executable: launcher }, provenance: stdoutProvenance, result: { file: 'result' } },
+      stdout: {
+        writtenBy: { launcher: 'claude', executable: launcher }, provenance: stdoutProvenance,
+        result: { status: 'read', basis: 'json-requested', reading: { file: 'result' } },
+      },
     });
     expect(Object.keys(observation?.stdout ?? {}).sort()).toEqual([ ...stdoutKeys ].sort());
     expect(keysIn(observation).filter(key => /native/i.test(key))).toEqual([]);
+
+    // A launcher that asks for JSON itself: no flag in the invocation, a result on stdout.
+    const unasked = await begin({ claudePath: launcher }, { NATIVE_LOOKING: constructedResult, PATH: `${bunDir}:/usr/bin:/bin` });
+    await unasked.completion;
+    expect(observedIn(unasked.events)?.observation).toMatchObject({
+      stdout: { outputFormat: null, result: { status: 'read', basis: 'parsed-as-result', reading: { file: 'result' } } },
+    });
+  }, 20_000);
+
+  test('text, the default format, is not read as a result, broken or otherwise', async () => {
+    for (const written of [ 'raw reply\n', '42\n' ]) {
+      const run = await begin({}, { FAKE_CLAUDE_STDOUT: written });
+      await run.completion;
+      const observation = observedIn(run.events)?.observation ?? null;
+      expect(observation).toMatchObject({
+        state: 'exited',
+        stdout: {
+          outputFormat: null,
+          file: { bytes: Buffer.byteLength(written) },
+          result: {
+            status: 'not-read',
+            why: 'the invocation asked for no --output-format, and claude --print writes text by default; the bytes are not a result',
+          },
+        },
+        join: null,
+      });
+    }
   }, 20_000);
 
   test('output and journal changed since the completion are facts, and nothing in them offers a continuation', async () => {
@@ -708,7 +770,7 @@ describe.if(posix)('readCustody and the observation', () => {
       stdout: { changedSinceCompletion: true, file: { bytes: Buffer.byteLength('first\nlater\n') } },
       journal: { changedSinceCompletion: true, reading: { lines: 3 } },
     });
-    expect(keysIn(changed).filter(key => /continu|seed|resum/i.test(key))).toEqual([]);
+    expect(keysIn(changed).filter(key => /continu|resum/i.test(key))).toEqual([]);
 
     await fs.rm(journal);
     expect((await readCustody(run.directory)).journal).toMatchObject({
@@ -780,7 +842,10 @@ describe.if(posix)('readCustody and the observation', () => {
     const invocationOnly = await readCustody(await variant([ custodyFiles.invocation ]));
     expect(invocationOnly).toMatchObject({
       state: 'invocation-only', journal: null, join: null,
-      stdout: { file: null, why: 'no file at that path', changedSinceCompletion: null, result: null },
+      stdout: {
+        file: null, why: 'no file at that path', changedSinceCompletion: null,
+        result: { status: 'not-read', why: 'no file at that path' },
+      },
     });
     expect(invocationOnly.basis).toContain('spawned just before its runner died');
 
@@ -788,10 +853,113 @@ describe.if(posix)('readCustody and the observation', () => {
     expect(startOnly).toMatchObject({
       state: 'start-only',
       completion: { status: 'absent' },
-      journal: { namedBy: 'start.sessionJsonlPath', atCompletion: null, changedSinceCompletion: null },
+      // A copy: the journal its start names is the original directory's, and is not read as this one's.
+      writtenIn: { sameAsRead: false, from: 'invocation.directory' },
+      journal: { namedBy: 'start.sessionJsonlPath', atCompletion: null, changedSinceCompletion: null, reading: null, appended: { status: 'not-read' } },
       stdout: { atCompletion: null, changedSinceCompletion: null },
     });
     expect(startOnly.basis).toContain('custody did not record an end');
+  }, 20_000);
+
+  test('a moved directory does not read the original\'s journal as its own; an alias of the same one does', async () => {
+    const { run } = await variants();
+    const alias = path.join(await tempDir(), 'alias');
+    await fs.symlink(run.directory, alias);
+    expect(await readCustody(alias)).toMatchObject({
+      state: 'exited', problems: [], writtenIn: { directory: run.directory, sameAsRead: true }, journal: { reading: { lines: 2 } },
+    });
+
+    const moved = path.join(await tempDir(), 'moved');
+    await fs.rename(run.directory, moved);
+    const reading = await readCustody(moved);
+    expect(reading).toMatchObject({
+      state: 'exited',
+      writtenIn: { directory: run.directory, from: 'invocation.directory', sameAsRead: false },
+      stdout: { changedSinceCompletion: false },
+      journal: { file: null, reading: null, changedSinceCompletion: null, appended: { status: 'not-read' } },
+    });
+    expect(reading.journal?.why).toContain('where these records were written');
+    // Said once, not once per output.
+    expect(reading.problems).toHaveLength(1);
+    expect(reading.problems[0]).toContain(`these records were written in ${run.directory}`);
+  }, 20_000);
+
+  test('a continued session\'s inherited records are read apart from what this run appended', async () => {
+    const run = await begin({ customSessionData: { sessionId: priorSession, value: priorJournal } });
+    await run.completion;
+    const observation = observedIn(run.events)?.observation ?? null;
+    const seeded = { bytes: Buffer.byteLength(priorJournal), sha256: sha256(priorJournal) };
+
+    expect(observation).toMatchObject({
+      state: 'exited',
+      problems: [],
+      start: { record: { sessionId: priorSession, seededJournal: seeded } },
+      journal: { appended: { status: 'read', boundary: { ...seeded, basis: 'seeded' }, lineOffset: 2, reading: { lines: 2 } } },
+    });
+    // The earlier process's context limit is in the journal, and not in what this run appended.
+    expect(holdsContextLimit(observation?.journal?.reading)).toBe(true);
+    const appended = observation?.journal?.appended;
+    expect(appended?.status).toBe('read');
+    expect(holdsContextLimit(appended?.status === 'read' ? appended.reading : null)).toBe(false);
+
+    // A journal no longer beginning with what was seeded has no known boundary.
+    const journal = observation?.journal?.path ?? '';
+    const bytes = await Bun.file(journal).text();
+    await fs.writeFile(journal, `x${bytes.slice(1)}`);
+    expect((await readCustody(run.directory)).journal?.appended).toMatchObject({
+      status: 'not-read', why: `its first ${seeded.bytes} bytes are no longer the bytes seeded, so where this run's records begin is not known`,
+    });
+  }, 20_000);
+
+  test('a start from before the seed was recorded: a fresh session has a boundary at 0, a continued one has none', async () => {
+    const fresh = await begin();
+    await fresh.completion;
+    const continued = await begin({ customSessionData: { sessionId: priorSession, value: priorJournal } });
+    await continued.completion;
+    // Rewritten in place, as 0.12.0 wrote them; custody itself never rewrites a record.
+    for (const run of [ fresh, continued ]) {
+      const start = path.join(run.directory, custodyFiles.start);
+      await fs.writeFile(start, edited(await Bun.file(start).text(), record => { delete record.seededJournal; }));
+    }
+
+    expect((await readCustody(fresh.directory)).journal?.appended).toMatchObject({
+      status: 'read', boundary: { bytes: 0, sha256: null, basis: 'fresh session' },
+    });
+    const inherited = (await readCustody(continued.directory)).journal?.appended;
+    expect(inherited).toMatchObject({ status: 'not-read' });
+    expect(inherited?.status === 'not-read' ? inherited.why : '').toContain('inherited records cannot be told from this run\'s');
+  }, 20_000);
+
+  test('a completion naming another journal, or a start and completion with no invocation, are unknown', async () => {
+    const { text, variant } = await variants();
+    const completion = await text(custodyFiles.completion);
+
+    const elsewhere = await readCustody(await variant([ custodyFiles.invocation, custodyFiles.start ], {
+      [custodyFiles.completion]: edited(completion, record => {
+        const journal = record.journal;
+        if (isRecordValue(journal)) {
+          journal.path = '/elsewhere/another-run.jsonl';
+        }
+      }),
+    }));
+    expect(elsewhere.state).toBe('unknown');
+    expect(elsewhere.basis).toContain(`${custodyFiles.completion} /elsewhere/another-run.jsonl`);
+
+    const noInvocation = await readCustody(await variant([ custodyFiles.start, custodyFiles.completion ]));
+    expect(noInvocation.state).toBe('unknown');
+    expect(noInvocation.basis).toContain(`there is no ${custodyFiles.invocation}`);
+  }, 20_000);
+
+  test('a signal name another platform reports is read; one no platform names is not', async () => {
+    const { run } = await variants();
+    const completion = path.join(run.directory, custodyFiles.completion);
+    const original = await Bun.file(completion).text();
+
+    await fs.writeFile(completion, edited(original, record => { record.exitCode = null; record.signalCode = 'SIGPWR'; }));
+    expect(await readCustody(run.directory)).toMatchObject({ state: 'exited', completion: { status: 'read' } });
+
+    await fs.writeFile(completion, edited(original, record => { record.exitCode = null; record.signalCode = 'SIGNOTONE'; }));
+    expect(await readCustody(run.directory)).toMatchObject({ state: 'unreadable', completion: { status: 'unreadable' } });
   }, 20_000);
 
   test('a record that is cut short, of another version or format, or not as its version writes it, is unreadable', async () => {
@@ -828,11 +996,21 @@ describe.if(posix)('readCustody and the observation', () => {
     expect(noStart.state).toBe('unknown');
     expect(noStart.basis).toContain(`there is no ${custodyFiles.start}`);
 
-    const before = await readCustody(await variant([ custodyFiles.start, custodyFiles.stdout, custodyFiles.stderr ], {
-      [custodyFiles.invocation]: edited(await text(custodyFiles.invocation), record => { delete record.configuration; }),
+    // Without the fields 0.13 added; the directory it was written in is then told by the completion's outputs.
+    const before = await readCustody(await variant([ custodyFiles.stdout, custodyFiles.stderr ], {
+      [custodyFiles.invocation]: edited(await text(custodyFiles.invocation), record => {
+        delete record.configuration;
+        delete record.directory;
+      }),
+      [custodyFiles.start]: edited(start, record => { delete record.seededJournal; }),
       [custodyFiles.completion]: completion,
     }));
-    expect(before).toMatchObject({ state: 'exited', invocation: { status: 'read' } });
+    expect(before).toMatchObject({
+      state: 'exited',
+      invocation: { status: 'read' },
+      start: { status: 'read' },
+      writtenIn: { from: 'completion outputs', sameAsRead: false },
+    });
     expect(before.invocation.status === 'read' ? before.invocation.record.configuration : null).toBeUndefined();
   }, 20_000);
 

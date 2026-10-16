@@ -57,7 +57,6 @@
 import { createHash } from 'node:crypto';
 import { closeSync, openSync } from 'node:fs';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 
 import {
@@ -96,7 +95,7 @@ export const custodyFiles = {
 } as const;
 
 /** What a recorded configuration says, and the limit of it. */
-export const configurationScope = 'the configuration files as runInCustody\'s caller stated them, not read by custody; the bare-claude CLI states the bytes its configuration reader read once, digested and parsed before this record was written. No file is read again or compared afterwards, and no content is recorded';
+export const configurationScope = 'the configuration as runInCustody\'s caller stated it; custody read none of these files, nothing reads them again or compares them afterwards, and no content is recorded';
 
 /**
  * Which configuration declared a run, as {@link runInCustody}'s caller states
@@ -208,6 +207,12 @@ export interface CustodyInvocation {
   /** The package that kept the run. */
   package: { name: string, version: string },
 
+  /**
+   * The custody directory, absolute, as custody made it, so a reader can tell
+   * a directory moved or copied since. Absent from records written by 0.12.0.
+   */
+  directory?: string,
+
   launcher: Launcher,
 
   /** What is spawned: `claudePath`, or `ollama`. Not necessarily native Claude Code. */
@@ -277,6 +282,15 @@ export interface CustodyStart {
 
   /** What `identify` read, or null when the caller gave none. */
   identity: CustodyIdentity | null,
+
+  /**
+   * The size and SHA-256 of exactly the bytes `spawnClaude` put in the
+   * journal before the spawn: the seed, and anything preloaded with it. Null
+   * when nothing was seeded. Absent from records written by 0.12.0. What
+   * follows those bytes was appended after the spawn; they are the boundary
+   * between a continued session's inherited records and this run's.
+   */
+  seededJournal?: { bytes: number, sha256: string } | null,
 }
 
 /** One of the spawned process's outputs, as far as it had been written when it was read. */
@@ -549,6 +563,7 @@ export async function runInCustody(launchOptions: LaunchOptions, options: Custod
     version: custodyVersion,
     recorded: new Date().toISOString(),
     package: { name: pkg.name, version: pkg.version },
+    directory,
     launcher: config.launcher,
     // As buildArgv names argv[0]: the ollama launcher never takes claudePath.
     executable: config.launcher === 'ollama' ? 'ollama' : config.claudePath,
@@ -743,6 +758,7 @@ export async function runInCustody(launchOptions: LaunchOptions, options: Custod
       sessionJsonlPath: claude.sessionJsonlPath,
       claudeHome: claude.ephemeralClaudeHomePath,
       identity,
+      seededJournal: claude.seededJournal,
     };
     await writeRecord(file(custodyFiles.start), start);
     emit({ kind: 'started', directory, start });
@@ -909,8 +925,63 @@ export interface CustodyStdoutReading extends CustodyOutputReading {
    */
   outputFormat: string | null,
 
-  /** The bytes read, read as a `--output-format json` result; null when nothing was read. See `ResultReading.file`. */
-  result: ResultReading | null,
+  result: CustodyStdoutResult,
+}
+
+/**
+ * Whether stdout was read as a `--output-format json` result, and why.
+ * `read` when the invocation asked for that format (`json-requested`), and
+ * then whatever the bytes are, since an empty or cut-short result is itself
+ * a finding (see `ResultReading.file`); or when the bytes are a result though
+ * it did not ask, as a launcher that adds the flag itself would make them
+ * (`parsed-as-result`). `not-read` otherwise, with why: a run that never
+ * started, nothing there to read, or text, which `claude --print` writes by
+ * default. Text is not misread as a broken result.
+ */
+export type CustodyStdoutResult =
+  | { status: 'read', basis: 'json-requested' | 'parsed-as-result', reading: ResultReading }
+  | { status: 'not-read', why: string };
+
+/**
+ * Where the seeded bytes of the journal end, and how that is known:
+ * `seeded`, the size and digest `start.json` recorded; `nothing seeded`,
+ * which `start.json` recorded; or `fresh session`, for a start written before
+ * the seed was recorded (0.12.0) of an invocation that seeded nothing.
+ */
+export interface CustodyJournalBoundary {
+  bytes: number,
+
+  /** The seeded bytes' digest; null when nothing was seeded. */
+  sha256: string | null,
+
+  basis: 'seeded' | 'nothing seeded' | 'fresh session',
+}
+
+/**
+ * The journal's records after its seeded bytes: those appended once the run
+ * was spawned, by whatever appended them. A continued session's journal
+ * begins with its whole earlier history, and a context-limit or API-error
+ * record there is an earlier process's; here it is not counted. Line numbers
+ * in `reading` count from the boundary; `lineOffset` is how many line ends
+ * the seeded bytes held. `not-read` when the boundary is not known, or the
+ * journal no longer begins with the bytes seeded.
+ */
+export type CustodyAppendedJournal =
+  | { status: 'read', boundary: CustodyJournalBoundary, lineOffset: number, reading: JournalReading }
+  | { status: 'not-read', why: string };
+
+/**
+ * Where custody wrote a directory's records, and whether that is the
+ * directory read. `from` is `invocation.directory`, or, in records written
+ * before that was recorded, the directory of the outputs the completion
+ * names; null `directory` when no record says. `sameAsRead` is false for a
+ * directory moved or copied since it was written: a journal under the
+ * original directory is then not read, since it would be the original's.
+ */
+export interface CustodyWrittenIn {
+  directory: string | null,
+  from: 'invocation.directory' | 'completion outputs' | null,
+  sameAsRead: boolean | null,
 }
 
 /** The session journal as read, against what the completion recorded of it. */
@@ -935,7 +1006,10 @@ export interface CustodyJournalReading {
    */
   changedSinceCompletion: boolean | null,
 
+  /** The whole journal, inherited records included; see `appended` for this run's alone. */
   reading: JournalReading | null,
+
+  appended: CustodyAppendedJournal,
 }
 
 /** What {@link readCustody} read of one custody directory. See {@link custodyReadingScope}. */
@@ -963,6 +1037,8 @@ export interface CustodyReading {
   /** The directory's entries, sorted, anyone else's files included; null when it could not be listed. */
   entries: string[] | null,
 
+  writtenIn: CustodyWrittenIn,
+
   invocation: CustodyRecordReading<CustodyInvocation>,
   start: CustodyRecordReading<CustodyStart>,
   completion: CustodyRecordReading<CustodyCompletion>,
@@ -975,10 +1051,10 @@ export interface CustodyReading {
 
   /**
    * `joinResult` from `@agladysh/bare-claude/outcome` over the stdout result
-   * and the journal, when both were read. It correlates the result with one
+   * and the whole journal, when both were read. It correlates the result with one
    * journal segment's recorded figures; it is not process identity, and the
    * segment's records — a context-limit record among them — may be another
-   * process's. `stdout.result.process` stays the figures of the process that
+   * process's. `stdout.result.reading.process` stays the figures of the process that
    * wrote the result, joined or not.
    */
   join: ResultJournalJoin | null,
@@ -1037,11 +1113,29 @@ const isBoolean = (value: unknown): value is boolean => typeof value === 'boolea
 const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 const isCount = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const isLauncher = (value: unknown): value is Launcher => typeof value === 'string' && Object.hasOwn(Launchers, value);
-const isSignalName = (value: unknown): value is NodeJS.Signals => typeof value === 'string' && Object.hasOwn(os.constants.signals, value);
+/**
+ * Every signal name a record may hold, whatever host wrote it: the whole of
+ * `NodeJS.Signals`, not the reading host's `os.constants.signals`, so a
+ * completion written on Linux with `SIGPWR` reads on macOS too.
+ */
+const signalNames = [
+  'SIGABRT', 'SIGALRM', 'SIGBUS', 'SIGCHLD', 'SIGCONT', 'SIGFPE', 'SIGHUP', 'SIGILL', 'SIGINT', 'SIGIO',
+  'SIGIOT', 'SIGKILL', 'SIGPIPE', 'SIGPOLL', 'SIGPROF', 'SIGPWR', 'SIGQUIT', 'SIGSEGV', 'SIGSTKFLT',
+  'SIGSTOP', 'SIGSYS', 'SIGTERM', 'SIGTRAP', 'SIGTSTP', 'SIGTTIN', 'SIGTTOU', 'SIGUNUSED', 'SIGURG',
+  'SIGUSR1', 'SIGUSR2', 'SIGVTALRM', 'SIGWINCH', 'SIGXCPU', 'SIGXFSZ', 'SIGBREAK', 'SIGLOST', 'SIGINFO',
+] as const satisfies readonly NodeJS.Signals[];
+
+/** Compile-time: `T` must be `never`. */
+type AssertNever<T extends never> = T;
+
+/** Fails to compile when `NodeJS.Signals` gains a name {@link signalNames} lacks. */
+type _EverySignalIsNamed = AssertNever<Exclude<NodeJS.Signals, typeof signalNames[number]>>;
+
+const isSignalName = (value: unknown): value is NodeJS.Signals => signalNames.some(known => known === value);
 const isStopSignal = (value: unknown): value is StopSignal => stopSignals.some(known => known === value);
 const isSignalCode = either(isFiniteNumber, isSignalName);
 
-const isFileRecord = shape<ConfigFileRecord>({ path: isString, realPath: isString, bytes: isCount, sha256: isString });
+const isFileRecord = shape<ConfigFileRecord>({ path: isString, realPath: nullable(isString), bytes: isCount, sha256: isString });
 
 const isRecordedConfiguration = shape<RecordedConfiguration>({
   scope: literal(configurationScope),
@@ -1066,6 +1160,7 @@ const isCustodyInvocation = shape<CustodyInvocation>({
   version: literal(custodyVersion),
   recorded: isString,
   package: shape<CustodyInvocation['package']>({ name: isString, version: isString }),
+  directory: optional(isString),
   launcher: isLauncher,
   executable: isString,
   model: nullable(isString),
@@ -1103,6 +1198,7 @@ const isCustodyStart = shape<CustodyStart>({
   sessionJsonlPath: isString,
   claudeHome: isString,
   identity: nullable(isCustodyIdentity),
+  seededJournal: optional(nullable(shape<{ bytes: number, sha256: string }>({ bytes: isCount, sha256: isString }))),
 });
 
 const isGroupState: Guard<ProcessGroupState> = literal('empty', 'occupied', 'not-permitted');
@@ -1205,9 +1301,14 @@ function whyNot(got: WholeRead): string | null {
   }
 }
 
-/** One output in the directory, read whole, against what the completion recorded of it. */
+/**
+ * One output in the directory, read whole, against what the completion
+ * recorded of it. `expected` is where the completion should name it: in the
+ * directory the records were written in, which a moved or copied one is not.
+ */
 async function readOutput(
   file: string,
+  expected: string,
   atCompletion: CustodyOutput | null,
   problems: string[],
 ): Promise<{ reading: CustodyOutputReading, bytes: Uint8Array | null }> {
@@ -1215,8 +1316,8 @@ async function readOutput(
   if (got.kind === 'failed') {
     problems.push(`${file}: ${got.why}`);
   }
-  if (atCompletion !== null && atCompletion.file !== file) {
-    problems.push(`${custodyFiles.completion} recorded this output at ${atCompletion.file}; this reading read ${file}`);
+  if (atCompletion !== null && atCompletion.file !== expected) {
+    problems.push(`${custodyFiles.completion} recorded this output at ${atCompletion.file}, not in the directory its records were written in`);
   }
   const recorded = atCompletion === null ? null : { bytes: atCompletion.bytes, sha256: atCompletion.sha256 };
   const now = got.kind === 'read' ? got.file : null;
@@ -1247,10 +1348,96 @@ function outputFormatIn(args: readonly string[]): string | null {
   return format;
 }
 
-/** The journal the completion names, or else the start, read whole, against what the completion recorded. */
+/** Whether `file` lies inside `directory`, by their paths alone. */
+function isWithin(directory: string, file: string): boolean {
+  const relative = path.relative(directory, file);
+  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+/** Whether two paths resolve to one directory now; false when either cannot be resolved. */
+async function samePhysical(a: string, b: string): Promise<boolean> {
+  try {
+    return await fs.realpath(a) === await fs.realpath(b);
+  } catch {
+    return false;
+  }
+}
+
+/** Where the records say they were written, and whether that is the directory read; see {@link CustodyWrittenIn}. */
+async function writtenInOf(
+  read: string,
+  invocation: CustodyInvocation | null,
+  completion: CustodyCompletion | null,
+): Promise<CustodyWrittenIn> {
+  const output = completion?.stdout ?? completion?.stderr ?? null;
+  let directory: string;
+  let from: CustodyWrittenIn['from'];
+  if (invocation?.directory !== undefined) {
+    directory = invocation.directory;
+    from = 'invocation.directory';
+  } else if (output !== null) {
+    directory = path.dirname(output.file);
+    from = 'completion outputs';
+  } else {
+    return { directory: null, from: null, sameAsRead: null };
+  }
+  return { directory, from, sameAsRead: directory === read || await samePhysical(directory, read) };
+}
+
+/**
+ * Where the journal's seeded bytes end, from `start.json`, or, for a start
+ * written before that was recorded, from a fresh invocation; or why the
+ * boundary is not known.
+ */
+function boundaryOf(invocation: CustodyInvocation | null, start: CustodyStart | null): CustodyJournalBoundary | string {
+  if (start === null) {
+    return `there is no readable ${custodyFiles.start} to say what was seeded before the spawn`;
+  }
+  const seeded = start.seededJournal;
+  if (seeded === null) {
+    return { bytes: 0, sha256: null, basis: 'nothing seeded' };
+  }
+  if (seeded !== undefined) {
+    return { bytes: seeded.bytes, sha256: seeded.sha256, basis: 'seeded' };
+  }
+  if (invocation !== null && invocation.session.kind === 'fresh') {
+    return { bytes: 0, sha256: null, basis: 'fresh session' };
+  }
+  return `${custodyFiles.start} records no seeded bytes (written before 0.13), and the invocation `
+    + `${invocation === null ? 'could not be read' : 'continued a session'}: inherited records cannot be told from this run's`;
+}
+
+/** The journal's bytes after `boundary`, when they still begin with what was seeded. */
+function appendedOf(bytes: Uint8Array, boundary: CustodyJournalBoundary | string): CustodyAppendedJournal {
+  if (typeof boundary === 'string') {
+    return { status: 'not-read', why: boundary };
+  }
+  if (bytes.length < boundary.bytes) {
+    return { status: 'not-read', why: `the journal holds ${bytes.length} bytes, fewer than the ${boundary.bytes} seeded: it is not the journal as seeded` };
+  }
+  const seeded = bytes.subarray(0, boundary.bytes);
+  if (boundary.sha256 !== null && digestOf(seeded) !== boundary.sha256) {
+    return { status: 'not-read', why: `its first ${boundary.bytes} bytes are no longer the bytes seeded, so where this run's records begin is not known` };
+  }
+  return {
+    status: 'read',
+    boundary,
+    lineOffset: seeded.reduce((lines, byte) => byte === 0x0a ? lines + 1 : lines, 0),
+    reading: readJournal(bytes.subarray(boundary.bytes)),
+  };
+}
+
+/**
+ * The journal the completion names, or else the start, read whole, against
+ * what the completion recorded, with the records appended after its seeded
+ * bytes read apart. One under the original directory of a moved or copied
+ * directory is not read: it would be the original's.
+ */
 async function readSessionJournal(
+  invocation: CustodyInvocation | null,
   start: CustodyStart | null,
   completion: CustodyCompletion | null,
+  writtenIn: CustodyWrittenIn,
   problems: string[],
 ): Promise<CustodyJournalReading | null> {
   const recorded = completion?.journal ?? null;
@@ -1261,6 +1448,17 @@ async function readSessionJournal(
     named = { path: start.sessionJsonlPath, sessionId: start.sessionId, namedBy: 'start.sessionJsonlPath' };
   } else {
     return null;
+  }
+  const atCompletion = recorded === null ? null : { exists: recorded.exists, bytes: recorded.bytes, sha256: recorded.sha256 };
+
+  if (writtenIn.sameAsRead === false && writtenIn.directory !== null && isWithin(writtenIn.directory, named.path)) {
+    const why = `the journal is under ${writtenIn.directory}, where these records were written, not under the directory read; `
+      + 'read there, it would be that directory\'s journal, not this one\'s';
+    return { ...named, file: null, why, atCompletion, changedSinceCompletion: null, reading: null, appended: { status: 'not-read', why } };
+  }
+  if (writtenIn.directory === null) {
+    problems.push('the records do not say which directory they were written in (no invocation.directory, and no outputs in a completion); '
+      + 'the journal is read where they name it');
   }
 
   const got = await readWhole(named.path);
@@ -1277,21 +1475,60 @@ async function readSessionJournal(
     ...named,
     file: got.kind === 'read' ? got.file : null,
     why: whyNot(got),
-    atCompletion: recorded === null ? null : { exists: recorded.exists, bytes: recorded.bytes, sha256: recorded.sha256 },
+    atCompletion,
     changedSinceCompletion: changed,
     reading: got.kind === 'read' ? readJournal(got.bytes) : null,
+    appended: got.kind === 'read'
+      ? appendedOf(got.bytes, boundaryOf(invocation, start))
+      : { status: 'not-read', why: whyNot(got) ?? 'the journal was not read' },
   };
 }
 
-/** Where readable records name the session or home differently, as one run's records never do. */
+/**
+ * Whether stdout is read as a result; see {@link CustodyStdoutResult}. A run
+ * that never started wrote nothing, so its stdout is never read as one.
+ */
+function stdoutResultOf(
+  bytes: Uint8Array | null,
+  unread: string | null,
+  outputFormat: string | null,
+  completion: CustodyCompletion | null,
+): CustodyStdoutResult {
+  if (completion !== null && completion.outcome === 'not-started') {
+    return { status: 'not-read', why: 'the run never started: no process was spawned to write this stdout' };
+  }
+  if (bytes === null) {
+    return { status: 'not-read', why: unread ?? 'nothing was read' };
+  }
+  if (outputFormat === 'json') {
+    return { status: 'read', basis: 'json-requested', reading: readResult(bytes) };
+  }
+  const reading = readResult(bytes);
+  if (reading.file === 'result') {
+    return { status: 'read', basis: 'parsed-as-result', reading };
+  }
+  return {
+    status: 'not-read',
+    why: outputFormat === null
+      ? 'the invocation asked for no --output-format, and claude --print writes text by default; the bytes are not a result'
+      : `the invocation asked for --output-format ${outputFormat}, not json, and the bytes are not one result`,
+  };
+}
+
+/** Where readable records name the session, journal or home differently, as one run's records never do. */
 function disagreements(
   invocation: CustodyInvocation | null,
   start: CustodyStart | null,
   completion: CustodyCompletion | null,
 ): string[] {
   const found: string[] = [];
-  if (start !== null && completion !== null && completion.journal !== null && completion.journal.sessionId !== start.sessionId) {
-    found.push(`${custodyFiles.start} names session ${start.sessionId}, ${custodyFiles.completion} session ${completion.journal.sessionId}`);
+  if (start !== null && completion !== null && completion.journal !== null) {
+    if (completion.journal.sessionId !== start.sessionId) {
+      found.push(`${custodyFiles.start} names session ${start.sessionId}, ${custodyFiles.completion} session ${completion.journal.sessionId}`);
+    }
+    if (completion.journal.path !== start.sessionJsonlPath) {
+      found.push(`${custodyFiles.start} names the journal ${start.sessionJsonlPath}, ${custodyFiles.completion} ${completion.journal.path}`);
+    }
   }
   if (invocation !== null && start !== null) {
     if (invocation.session.kind !== 'fresh' && invocation.session.sessionId !== start.sessionId) {
@@ -1364,6 +1601,16 @@ function stateOf(
     if (start.status === 'unreadable') {
       return unreadable(custodyFiles.start);
     }
+    // As for a start with no completion: custody writes the invocation before it spawns.
+    if (invocation.status === 'absent') {
+      return {
+        state: 'unknown',
+        basis: `the completion says the spawned process ${done.outcome}, but there is no ${custodyFiles.invocation}, which custody writes before it spawns`,
+      };
+    }
+    if (invocation.status === 'unreadable') {
+      return unreadable(custodyFiles.invocation);
+    }
     return done.outcome === 'exited'
       ? { state: 'exited', basis: `the completion says the spawned process was seen to end without custody stopping it: ${endOf(done)}` }
       : { state: 'stopped', basis: `the completion says custody stopped it (${done.stop?.cause ?? 'no cause was recorded'}); it ${endOf(done)}` };
@@ -1404,8 +1651,9 @@ function stateOf(
  * Reads one custody directory as {@link runInCustody} keeps it: its records,
  * the spawned process's stdout and stderr, and the session journal they
  * name, each file read whole and once, every digest of the bytes read. The
- * stdout is read as a result with `readResult`, the journal with
- * `readJournal`, and the two joined with `joinResult`, all from
+ * stdout is read as a result with `readResult` when that is honest (see
+ * {@link CustodyStdoutResult}), the journal with `readJournal`, whole and
+ * after its seeded bytes, and the two joined with `joinResult`, all from
  * `@agladysh/bare-claude/outcome`. Nothing is written, spawned or signalled,
  * and no PID is looked up: a start-only directory stays unknown here however
  * long ago it was written.
@@ -1447,18 +1695,41 @@ export async function readCustody(directory: string): Promise<CustodyReading> {
   const done = completion.status === 'read' ? completion.record : null;
   problems.push(...disagreements(invoked, started, done));
 
-  const out = await readOutput(at(custodyFiles.stdout), done?.stdout ?? null, problems);
+  const writtenIn = await writtenInOf(absolute, invoked, done);
+  if (writtenIn.sameAsRead === false) {
+    problems.push(`these records were written in ${writtenIn.directory ?? 'another directory'}, not the directory read: `
+      + 'it was moved or copied, and paths under the original are not read as this one\'s');
+  }
+  // Where the completion should name an output: in the directory its records were written in.
+  const recordedAt = (name: string) => writtenIn.directory === null ? at(name) : path.join(writtenIn.directory, name);
+
+  const out = await readOutput(at(custodyFiles.stdout), recordedAt(custodyFiles.stdout), done?.stdout ?? null, problems);
+  const outputFormat = invoked === null ? null : outputFormatIn(invoked.extraArgs);
   const stdout: CustodyStdoutReading = {
     ...out.reading,
     writtenBy: invoked === null ? null : { launcher: invoked.launcher, executable: invoked.executable },
     provenance: stdoutProvenance,
-    outputFormat: invoked === null ? null : outputFormatIn(invoked.extraArgs),
-    result: out.bytes === null ? null : readResult(out.bytes),
+    outputFormat,
+    result: stdoutResultOf(out.bytes, out.reading.why, outputFormat, done),
   };
-  const stderr = (await readOutput(at(custodyFiles.stderr), done?.stderr ?? null, problems)).reading;
-  const journal = await readSessionJournal(started, done, problems);
-  const join = stdout.result !== null && journal !== null && journal.reading !== null
-    ? joinResult(stdout.result, journal.reading)
+  const stderr = (await readOutput(at(custodyFiles.stderr), recordedAt(custodyFiles.stderr), done?.stderr ?? null, problems)).reading;
+  const journal = await readSessionJournal(invoked, started, done, writtenIn, problems);
+
+  // Bindings to this run's session that the state does not rest on: stdout
+  // and the journal's contents are not custody's records.
+  const resultSession = stdout.result.status === 'read' ? stdout.result.reading.sessionId : null;
+  if (started !== null && resultSession !== null && resultSession !== started.sessionId) {
+    problems.push(`the stdout result names session ${resultSession}, ${custodyFiles.start} session ${started.sessionId}: it may be another session's result`);
+  }
+  if (started !== null && journal !== null && journal.appended.status === 'read') {
+    const named = journal.appended.reading.sessionIds;
+    if (named.length > 0 && !named.includes(started.sessionId)) {
+      problems.push(`the records appended to the journal name sessions ${named.join(', ')}, not ${started.sessionId} as ${custodyFiles.start} does`);
+    }
+  }
+
+  const join = stdout.result.status === 'read' && journal !== null && journal.reading !== null
+    ? joinResult(stdout.result.reading, journal.reading)
     : null;
 
   const unlistable: StateBasis = { state: 'unreadable', basis: `the directory could not be listed: ${unlisted}` };
@@ -1475,6 +1746,7 @@ export async function readCustody(directory: string): Promise<CustodyReading> {
     basis,
     problems,
     entries,
+    writtenIn,
     invocation,
     start,
     completion,

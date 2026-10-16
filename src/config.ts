@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
 import fs, { type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -267,8 +268,12 @@ export interface ConfigFileRecord {
   /** As named, made absolute against the process cwd; symbolic links kept. */
   path: string,
 
-  /** `path` with every symbolic link resolved, resolved just after the bytes were read. */
-  realPath: string,
+  /**
+   * `path` with every symbolic link resolved, just after the bytes were read,
+   * and only when what it resolved to is the file read, by device and inode.
+   * Null when the name led elsewhere by then, or could not be resolved.
+   */
+  realPath: string | null,
 
   bytes: number,
   sha256: string,
@@ -307,16 +312,32 @@ interface FileRead {
 }
 
 /**
+ * `file` with every symbolic link resolved, when it is still the file of
+ * `identity`; null when it now names another, or cannot be resolved.
+ */
+async function realPathOf(file: string, identity: string): Promise<string | null> {
+  try {
+    const resolved = await fs.realpath(file);
+    const stat = await fs.stat(resolved);
+    return `${stat.dev}:${stat.ino}` === identity ? resolved : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Opens `configPath` once and reads it whole through that handle; the digest
  * and the parse are both of those bytes. There is no second read to drift
  * from the first: no existence check before it, and nothing read again after.
+ * Opened without blocking, so a FIFO is refused as not a regular file rather
+ * than waited on for a writer; the flag changes nothing for a regular file.
  * @returns The reading, or null when nothing exists at that path
  */
 async function readOnce(configPath: string): Promise<FileRead | null> {
   const absolute = path.resolve(configPath);
   let handle: FileHandle;
   try {
-    handle = await fs.open(absolute, 'r');
+    handle = await fs.open(absolute, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
   } catch (error) {
     if (errorCode(error) === 'ENOENT') {
       return null;
@@ -330,15 +351,16 @@ async function readOnce(configPath: string): Promise<FileRead | null> {
     }
     const bytes = await handle.readFile();
     const config = parseConfig(new TextDecoder().decode(bytes), configPath);
+    const identity = `${stat.dev}:${stat.ino}`;
     return {
       config,
       record: {
         path: absolute,
-        realPath: await fs.realpath(absolute),
+        realPath: await realPathOf(absolute, identity),
         bytes: bytes.length,
         sha256: createHash('sha256').update(bytes).digest('hex'),
       },
-      identity: `${stat.dev}:${stat.ino}`,
+      identity,
     };
   } finally {
     await handle.close();

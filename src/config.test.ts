@@ -405,6 +405,20 @@ describe('configuration provenance', () => {
       await expect(readConfig({ kind: 'file', path: dir })).rejects.toThrow('is not a regular file');
     });
   });
+
+  test.if(process.platform === 'darwin' || process.platform === 'linux')(
+    'a FIFO is refused at once, not waited on for a writer that never comes',
+    async () => {
+      await scratch(async dir => {
+        const fifo = path.join(dir, 'profile.yaml');
+        const made = Bun.spawn({ cmd: [ 'mkfifo', fifo ], stdout: 'ignore', stderr: 'ignore' });
+        expect(await made.exited).toBe(0);
+        // A blocking open would hang here until the test's timeout.
+        await expect(readConfigFiles([ fifo ])).rejects.toThrow('is not a regular file');
+      });
+    },
+    5_000,
+  );
 });
 
 describe('locateConfig', () => {

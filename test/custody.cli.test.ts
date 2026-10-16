@@ -147,7 +147,20 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('--cu
     expect(events.at(1)).toEqual({
       kind: 'completed', directory, completion: await readJson(path.join(directory, 'completion.json')),
     });
-    expect(events.at(2)).toMatchObject({ observation: await readJson(path.join(directory, 'observation.json')) });
+    // The stream carries the observation's state, basis and problems; the whole reading stays in the directory.
+    const observation = await readJson(path.join(directory, 'observation.json'));
+    expect(observation).toMatchObject({ stdout: { result: { status: 'not-read' } } });
+    const summary = typeof observation === 'object' && observation !== null
+      && 'format' in observation && 'version' in observation && 'state' in observation
+      && 'basis' in observation && 'problems' in observation
+      ? {
+        format: observation.format, version: observation.version, state: observation.state,
+        basis: observation.basis, problems: observation.problems,
+      }
+      : null;
+    expect(events.at(2)).toEqual({
+      kind: 'observed', directory, file: path.join(directory, 'observation.json'), error: null, observation: summary,
+    });
     // Neither the child's own output nor a rendered transcript reaches stdout.
     expect(result.stdout).not.toContain('raw reply');
     expect(result.stdout).not.toContain('Done.');
@@ -343,7 +356,8 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('--cu
       'presets:', '  worker:', '    auth: caller', '    extraEnv:', '      PROFILE_SECRET: provenance-profile-sentinel', '',
     ].join('\n');
     const declarationText = [
-      'use: worker', 'callToAction: "# provenance"', 'custody:', `  directory: ${JSON.stringify(directory)}`, '',
+      'use: worker', 'callToAction: "# provenance"', 'extraArgs: [--provenance-arg-sentinel]',
+      'custody:', `  directory: ${JSON.stringify(directory)}`, '',
     ].join('\n');
     await fs.writeFile(profile, profileText);
     await fs.symlink(profile, alias);
@@ -371,6 +385,10 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('--cu
     ]) {
       expect(text).not.toContain('provenance-profile-sentinel');
     }
+    // extraArgs are recorded as given, in the 0600 records, and not passed on to whatever reads the stream.
+    expect(await Bun.file(path.join(directory, 'invocation.json')).text()).toContain('--provenance-arg-sentinel');
+    expect(await Bun.file(path.join(directory, 'observation.json')).text()).toContain('--provenance-arg-sentinel');
+    expect(result.stdout).not.toContain('--provenance-arg-sentinel');
 
     // A profile replaced after the run changes nothing that was recorded,
     // and nothing compares the record with the file as it is now.
@@ -426,6 +444,7 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('--ou
       { id: 'again', line: 2, error: null, reading: { state: 'exited' } },
       { id: null, line: 3, reading: null },
       { id: 'missing', line: 4, error: null, reading: { state: 'unreadable', entries: null } },
+      // Named as a result by the caller, so read as one: text is then the reader's finding.
       { id: 'file', line: 5, error: null, reading: { result: { file: 'unreadable' } } },
     ]);
     // One reading for both lines: the same read, at the same moment.
