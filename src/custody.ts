@@ -70,8 +70,9 @@ import {
   type SignalSource, type StopReport, type StopSignal, type SupervisorEvent,
 } from '@agladysh/bare-claude/lifecycle';
 import {
-  joinResult, readJournal, readResult,
-  type JournalReading, type ResultJournalJoin, type ResultReading,
+  isMeasuredPrompt, joinResult, readJournal, readResult,
+  type ContextLimitEvidence, type JoinKind, type JournalReading, type ResultFile, type ResultJournalJoin,
+  type ResultReading, type ResultStatus, type TokenSums,
 } from '@agladysh/bare-claude/outcome';
 
 import pkg from '../package.json';
@@ -1780,5 +1781,619 @@ export async function readCustody(directory: string): Promise<CustodyReading> {
     stderr,
     journal,
     join,
+  };
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Briefing a custody reading
+
+/** Version of the briefs {@link briefCustody} returns. It changes when what they mean changes. */
+export const custodyBriefVersion = 1;
+
+/** What a brief reports, and the limit of it. */
+export const custodyBriefScope = 'a projection of one custody reading to classifications, counts, digests and recorded figures, each in its own scope: no prompt, result, error, stderr or problem text, no extraArgs and no environment. Producing, printing or showing it is not anyone\'s reception of the run\'s return, which is read from the run\'s stdout; and it does not say whether the task was done, delivered, received or accepted';
+
+/** What every `costUsd` in a brief is. */
+export const briefCostBasis = 'Claude Code\'s own dollar figure as it recorded it, a list-price estimate: not a bill, and not subscription usage';
+
+/** How a run's custody ended, as its completion records it: classifications and numbers only. */
+export interface BriefEnd {
+  outcome: CustodyOutcome,
+  exitCode: number | null,
+  signalCode: number | NodeJS.Signals | null,
+
+  /** What started custody's stop of the run; null when custody stopped nothing. */
+  stopCause: CustodyStopCause | null,
+
+  /** Whether custody recorded a failure of its own. What it was stays in the completion. */
+  custodyError: boolean,
+}
+
+/** What the invocation chose, of what a brief carries. */
+export interface BriefRun {
+  /** The version of the package that kept the run. */
+  keptBy: string,
+
+  launcher: Launcher,
+  model: string | null,
+  effortLevel: string,
+
+  /** Its size and digest; never its text. */
+  callToAction: RecordedDigest,
+}
+
+/**
+ * What `spawnClaude` put in the journal before the spawn, as `start.json`
+ * recorded it: the size and digest of those bytes; `nothing`; or
+ * `unrecorded`, with no readable start or one written before the seed was
+ * recorded (0.12).
+ */
+export type BriefSeeded = RecordedDigest | 'nothing' | 'unrecorded';
+
+/**
+ * How the run's session began. `requiredSha256` is the digest a file seed's
+ * caller required of its source, which the spawn refuses to seed without;
+ * `seeded` the digest of the bytes seeded, which the spawn measured. Lineage
+ * rests on these digests alone. A session id is not lineage: a session can be
+ * continued from any of its journals, or from bytes no custody kept.
+ */
+export interface BriefSession {
+  /** As the invocation records it; null when the invocation could not be read. */
+  kind: CustodySession['kind'] | null,
+
+  /** The start's session, or else the one the invocation continued. */
+  sessionId: string | null,
+
+  /** A file seed's source, as the invocation records it. */
+  sourcePath: string | null,
+
+  requiredSha256: string | null,
+  seeded: BriefSeeded,
+}
+
+/**
+ * Which digest of a predecessor's journal is the digest of the bytes a run
+ * seeded: the one its completion recorded, or that of its journal as read.
+ */
+export type LineageMatch = 'completion.journal' | 'journal as read';
+
+/**
+ * Why no predecessor is named for a run, the last in a chain included:
+ *
+ * - `fresh`: it continued nothing. A chain ending here is whole.
+ * - `not-sought`: no predecessors were given to look among.
+ * - `no-digest`: it continued a session, but no record holds a digest of the
+ *   bytes it seeded: records written by 0.12, a memory seed among them, or a
+ *   file seed whose caller required none. `candidates` share its session id,
+ *   which does not make any of them its predecessor.
+ * - `conflict`: its records disagree about what was seeded: a start's digest
+ *   other than the one its invocation required, or a continued session with
+ *   nothing seeded.
+ * - `ambiguous`: the journals of all the `candidates` have the digest seeded.
+ *   None is chosen.
+ * - `mismatch`: no journal has it, though the `candidates` share the session
+ *   id: by digest, none of them is what was seeded. A run's own successors
+ *   share it too.
+ * - `unresolved`: no journal has it, and none shares the session id. Bytes
+ *   preloaded into a seed make it so, as they change the digest.
+ * - `unknown`: the records do not say how the session began.
+ * - `cycle`: the next predecessor, the one candidate, is already in the chain.
+ *   Runs that appended nothing to what they seeded can make one.
+ */
+export type LineageEndStatus =
+  | 'fresh'
+  | 'not-sought'
+  | 'no-digest'
+  | 'conflict'
+  | 'ambiguous'
+  | 'mismatch'
+  | 'unresolved'
+  | 'unknown'
+  | 'cycle';
+
+/** Where a lineage stops, and the directories its status names, sorted; never a choice among them. */
+export interface LineageEnd {
+  status: LineageEndStatus,
+  candidates: string[],
+}
+
+/**
+ * What a run inherited from its predecessor, as the predecessor's journal
+ * says when it is, as read, exactly the bytes seeded: its last measured
+ * call, whose prompt is what Claude Code reads back as the context size on
+ * resume. Otherwise why that is not known.
+ */
+export type LineageInherited =
+  | { status: 'read', prompt: number | null, output: number | null }
+  | { status: 'no-measured-call' | 'journal-differs' | 'journal-not-read' };
+
+/** One predecessor: a run whose journal is, by digest, the bytes the run after it seeded. */
+export interface LineageLink {
+  directory: string,
+
+  /** Every digest of its journal that matched. */
+  matchedBy: LineageMatch[],
+
+  state: CustodyState,
+  inherited: LineageInherited,
+
+  /** Whether its result or its appended records show a context limit; null when it has neither. */
+  contextLimit: boolean | null,
+
+  /** Compactions in its appended records; null when they were not read. */
+  compactions: number | null,
+}
+
+/** A run's predecessors, nearest first, each established by digest, and where the chain stops. */
+export interface BriefLineage {
+  links: LineageLink[],
+  end: LineageEnd,
+}
+
+/** The stdout result as a brief carries it: classifications, never its text or error text. */
+export type BriefResult =
+  | { status: 'not-read' }
+  | {
+    status: 'read',
+    basis: 'json-requested' | 'parsed-as-result',
+    file: ResultFile,
+
+    /** What the result says about itself, from `is_error` alone. */
+    reported: ResultStatus,
+
+    terminalReason: string | null,
+    stopReason: string | null,
+    numTurns: number | null,
+    apiErrorStatus: number | null,
+    contextLimit: ContextLimitEvidence | null,
+    sessionId: string | null,
+  };
+
+/** This run's appended journal records, counted; never an inherited one. */
+export interface BriefAppended {
+  segments: number,
+  openTail: boolean,
+  versions: string[],
+  unmeasuredCalls: number,
+  apiErrors: number,
+
+  /** API-error records saying the prompt no longer fit. */
+  contextLimitErrors: number,
+
+  compactions: number,
+
+  /** Each compaction's `compactMetadata.preTokens`, in order; null where it was not recorded. */
+  preTokens: (number | null)[],
+}
+
+/**
+ * Where a continued session's cumulative totals stood before this run, as
+ * the last `cost-state` record in the seeded bytes states them. Whether
+ * Claude Code resumes its totals from that record is not established here.
+ */
+export type BriefInherited =
+  | { status: 'read', costUsd: number | null, apiDurationMs: number | null }
+  | { status: 'nothing-seeded' | 'no-cost-state' | 'unknown' };
+
+/** This run's figures, each in its own scope. No figure is compared with any limit. */
+export interface BriefMeasured {
+  /**
+   * This run's last measured API call: the result's last `usage.iterations`
+   * entry, or else the last measured call appended to the journal. Its
+   * prompt is that one call's.
+   */
+  lastCall: { prompt: number | null, output: number | null, from: 'result' | 'appended journal' } | null,
+
+  /** The one context window the result reports for every model it names; null when none or several. */
+  contextWindow: number | null,
+
+  /** The result's sums over this process's calls: no context size. */
+  process: { tokens: TokenSums, durationMs: number | null } | null,
+
+  /** The result's session totals, earlier processes of a resumed session included. */
+  session: { costUsd: number | null, apiDurationMs: number | null, models: string[] } | null,
+
+  inherited: BriefInherited,
+  costBasis: typeof briefCostBasis,
+
+  /** Null when this run's records cannot be told from inherited ones, or the journal was not read. */
+  appended: BriefAppended | null,
+}
+
+/** An output by size and digest. Its bytes, the run's return among them, are read from `path`. */
+export interface BriefOutput {
+  path: string,
+  bytes: number | null,
+  sha256: string | null,
+  changedSinceCompletion: boolean | null,
+}
+
+/** The session journal, by what was recorded of it. */
+export interface BriefJournal {
+  path: string,
+  sessionId: string,
+
+  /** As the completion recorded it; a continuation's `sourceSha256` binds to this digest. Null without a completion. */
+  atCompletion: { exists: boolean, bytes: number | null, sha256: string | null } | null,
+
+  changedSinceCompletion: boolean | null,
+
+  /** How the end of the seeded bytes is known; null when it is not. */
+  boundary: CustodyJournalBoundary['basis'] | null,
+}
+
+/** What {@link briefCustody} makes of a reading. See {@link custodyBriefScope}. */
+export interface CustodyBrief {
+  format: 'bare-claude/custody-brief',
+  version: typeof custodyBriefVersion,
+  scope: typeof custodyBriefScope,
+
+  /** The package that read the directory. */
+  reader: { name: string, version: string },
+
+  directory: string,
+
+  /** When the reading began. */
+  read: string,
+
+  state: CustodyState,
+
+  /** How many problems the reading lists. Their text stays in the reading. */
+  problems: number,
+
+  /** Whether the directory read is the one its records were written in; null when no record says. */
+  inPlace: boolean | null,
+
+  /** Null when the invocation could not be read. */
+  run: BriefRun | null,
+
+  /** Null without a readable completion. */
+  end: BriefEnd | null,
+
+  session: BriefSession,
+  lineage: BriefLineage,
+  result: BriefResult,
+  join: { kind: JoinKind, over: CustodyJoin['over'] } | null,
+  measured: BriefMeasured,
+  stdout: BriefOutput,
+  stderr: BriefOutput,
+  journal: BriefJournal | null,
+}
+
+/**
+ * A native identifier, code, version or model name as a brief carries it:
+ * one word of printable characters, else null. A result is whatever the
+ * spawned executable wrote, and no sentence of it reaches a brief.
+ */
+function word(value: string | null): string | null {
+  return value !== null && /^[^\s\p{C}]{1,128}$/u.test(value) ? value : null;
+}
+
+function words(values: readonly string[]): string[] {
+  return values.flatMap(value => word(value) ?? []);
+}
+
+function recordOf<T>(reading: CustodyRecordReading<T>): T | null {
+  return reading.status === 'read' ? reading.record : null;
+}
+
+function resultOf(reading: CustodyReading): ResultReading | null {
+  return reading.stdout.result.status === 'read' ? reading.stdout.result.reading : null;
+}
+
+function briefOutput(output: CustodyOutputReading): BriefOutput {
+  return {
+    path: output.path,
+    bytes: output.file?.bytes ?? null,
+    sha256: output.file?.sha256 ?? null,
+    changedSinceCompletion: output.changedSinceCompletion,
+  };
+}
+
+function briefResult(result: CustodyStdoutResult): BriefResult {
+  if (result.status === 'not-read') {
+    return { status: 'not-read' };
+  }
+  const { reading } = result;
+  const limit = reading.contextLimit;
+  return {
+    status: 'read',
+    basis: result.basis,
+    file: reading.file,
+    reported: reading.status,
+    terminalReason: word(reading.terminalReason),
+    stopReason: word(reading.stopReason),
+    numTurns: reading.numTurns,
+    apiErrorStatus: reading.apiErrorStatus,
+    contextLimit: limit === null ? null : { terminalReason: limit.terminalReason, text: limit.text },
+    sessionId: word(reading.sessionId),
+  };
+}
+
+/** This run's appended records, when they were read apart from the seeded ones. */
+function appendedReadingOf(reading: CustodyReading): Extract<CustodyAppendedJournal, { status: 'read' }> | null {
+  const appended = reading.journal === null ? null : reading.journal.appended;
+  return appended !== null && appended.status === 'read' ? appended : null;
+}
+
+function briefAppended(reading: CustodyReading): BriefAppended | null {
+  const appended = appendedReadingOf(reading);
+  if (appended === null) {
+    return null;
+  }
+  const { segments, openTail, versions } = appended.reading;
+  const errors = segments.flatMap(segment => segment.apiErrors);
+  const compactions = segments.flatMap(segment => segment.compactions);
+  return {
+    segments: segments.length,
+    openTail,
+    versions: words(versions),
+    unmeasuredCalls: segments.reduce((calls, segment) => calls + segment.unmeasuredCalls, 0),
+    apiErrors: errors.length,
+    contextLimitErrors: errors.filter(error => error.contextLimit).length,
+    compactions: compactions.length,
+    preTokens: compactions.map(compaction => compaction.preTokens),
+  };
+}
+
+function lastCallOf(reading: CustodyReading): BriefMeasured['lastCall'] {
+  const tokens = resultOf(reading)?.lastCall?.tokens ?? null;
+  if (tokens !== null && isMeasuredPrompt(tokens)) {
+    return { prompt: tokens.prompt, output: tokens.output, from: 'result' };
+  }
+  const call = appendedReadingOf(reading)?.reading.lastCall ?? null;
+  return call === null ? null : { prompt: call.tokens.prompt, output: call.tokens.output, from: 'appended journal' };
+}
+
+/**
+ * The last `cost-state` record wholly within the seeded bytes: a line of the
+ * whole journal is seeded when the seeded bytes hold its line end.
+ */
+function inheritedOf(reading: CustodyReading): BriefInherited {
+  const whole = reading.journal?.reading ?? null;
+  const appended = appendedReadingOf(reading);
+  if (whole === null || appended === null) {
+    return { status: 'unknown' };
+  }
+  if (appended.boundary.bytes === 0) {
+    return { status: 'nothing-seeded' };
+  }
+  const closed = whole.segments.flatMap(segment =>
+    segment.closedBy !== null && segment.closedBy.line <= appended.lineOffset ? [ segment.closedBy ] : []);
+  const last = closed.at(-1);
+  return last === undefined
+    ? { status: 'no-cost-state' }
+    : { status: 'read', costUsd: last.costUsd, apiDurationMs: last.apiDurationMs };
+}
+
+/** Whether a run's result or appended records show a context limit; null when it has neither to show. */
+function contextLimitOf(reading: CustodyReading): boolean | null {
+  const result = resultOf(reading);
+  const said = result !== null && result.file === 'result' ? result.contextLimit !== null : null;
+  const appended = briefAppended(reading);
+  if (said === null && appended === null) {
+    return null;
+  }
+  return said === true || (appended?.contextLimitErrors ?? 0) > 0;
+}
+
+function seededOf(start: CustodyStart | null): BriefSeeded {
+  const seeded = start?.seededJournal;
+  if (seeded === undefined) {
+    return 'unrecorded';
+  }
+  return seeded === null ? 'nothing' : { bytes: seeded.bytes, sha256: seeded.sha256 };
+}
+
+function sessionOfReading(reading: CustodyReading): BriefSession {
+  const session = recordOf(reading.invocation)?.session ?? null;
+  const start = recordOf(reading.start);
+  return {
+    kind: session?.kind ?? null,
+    sessionId: start?.sessionId ?? (session === null || session.kind === 'fresh' ? null : session.sessionId),
+    sourcePath: session?.kind === 'file' ? session.sourcePath : null,
+    requiredSha256: session?.kind === 'file' ? session.sourceSha256 : null,
+    seeded: seededOf(start),
+  };
+}
+
+/** Every recorded digest of a run's journal, with what recorded it. */
+function journalDigests(reading: CustodyReading): { sha256: string, by: LineageMatch }[] {
+  const recorded = reading.journal?.atCompletion ?? null;
+  const read = reading.journal?.file ?? null;
+  const found: { sha256: string, by: LineageMatch }[] = [];
+  if (recorded !== null && recorded.exists && recorded.sha256 !== null) {
+    found.push({ sha256: recorded.sha256, by: 'completion.journal' });
+  }
+  if (read !== null) {
+    found.push({ sha256: read.sha256, by: 'journal as read' });
+  }
+  return found;
+}
+
+function inheritedFrom(predecessor: CustodyReading, seeded: string): LineageInherited {
+  const journal = predecessor.journal;
+  if (journal === null || journal.file === null || journal.reading === null) {
+    return { status: 'journal-not-read' };
+  }
+  if (journal.file.sha256 !== seeded) {
+    return { status: 'journal-differs' };
+  }
+  const call = journal.reading.lastCall;
+  return call === null ? { status: 'no-measured-call' } : { status: 'read', prompt: call.tokens.prompt, output: call.tokens.output };
+}
+
+type Resolution =
+  | { kind: 'established', predecessor: CustodyReading, seeded: string, matchedBy: LineageMatch[] }
+  | { kind: 'end', end: LineageEnd };
+
+/** A run's predecessor among `predecessors`, by the digest of what it seeded alone, or why there is none. */
+function resolvePredecessor(reading: CustodyReading, predecessors: readonly CustodyReading[] | null): Resolution {
+  const end = (status: LineageEndStatus, candidates: readonly CustodyReading[] = []): Resolution =>
+    ({ kind: 'end', end: { status, candidates: candidates.map(candidate => candidate.directory).sort() } });
+
+  const { kind, sessionId, requiredSha256, seeded } = sessionOfReading(reading);
+  if (kind === 'fresh' || (kind === null && seeded === 'nothing')) {
+    return typeof seeded === 'string' ? end('fresh') : end('conflict');
+  }
+  if (seeded === 'nothing') {
+    return end('conflict');
+  }
+  if (kind === null && seeded === 'unrecorded') {
+    return end('unknown');
+  }
+  const recorded = seeded === 'unrecorded' ? null : seeded.sha256;
+  if (recorded !== null && requiredSha256 !== null && recorded !== requiredSha256) {
+    return end('conflict');
+  }
+
+  const others = predecessors?.filter(candidate => candidate.directory !== reading.directory) ?? null;
+  const sharing = (others ?? []).filter(candidate =>
+    sessionId !== null && (recordOf(candidate.start)?.sessionId ?? candidate.journal?.sessionId) === sessionId);
+  const digest = recorded ?? requiredSha256;
+  if (digest === null) {
+    return end('no-digest', sharing);
+  }
+  if (others === null) {
+    return end('not-sought');
+  }
+
+  const matches = others.flatMap(candidate => {
+    const matchedBy = journalDigests(candidate).filter(found => found.sha256 === digest).map(found => found.by);
+    return matchedBy.length === 0 ? [] : [ { candidate, matchedBy } ];
+  });
+  const [ only, ...more ] = matches;
+  if (only === undefined) {
+    return sharing.length > 0 ? end('mismatch', sharing) : end('unresolved');
+  }
+  if (more.length > 0) {
+    return end('ambiguous', matches.map(match => match.candidate));
+  }
+  return { kind: 'established', predecessor: only.candidate, seeded: digest, matchedBy: only.matchedBy };
+}
+
+function lineageOf(reading: CustodyReading, predecessors: readonly CustodyReading[] | null): BriefLineage {
+  const links: LineageLink[] = [];
+  const seen = new Set([ reading.directory ]);
+  let current = reading;
+  while (true) {
+    const next = resolvePredecessor(current, predecessors);
+    if (next.kind === 'end') {
+      return { links, end: next.end };
+    }
+    const { predecessor } = next;
+    if (seen.has(predecessor.directory)) {
+      return { links, end: { status: 'cycle', candidates: [ predecessor.directory ] } };
+    }
+    seen.add(predecessor.directory);
+    links.push({
+      directory: predecessor.directory,
+      matchedBy: next.matchedBy,
+      state: predecessor.state,
+      inherited: inheritedFrom(predecessor, next.seeded),
+      contextLimit: contextLimitOf(predecessor),
+      compactions: briefAppended(predecessor)?.compactions ?? null,
+    });
+    current = predecessor;
+  }
+}
+
+/**
+ * A compact projection of a custody reading: its state, how its custody
+ * ended, how its session began, its measured figures each in its own scope,
+ * and the size and digest of each output, the return among them. Pure: it
+ * reads nothing but `reading` and `predecessors`, which {@link readCustody}
+ * produces. Every field is copied by name, so nothing else attached to a
+ * reading passes through.
+ *
+ * What it leaves out is the point of it: the call to action and the result's
+ * text, error and API-error text, stderr, `basis` and `problems` text,
+ * `extraArgs`, which may hold secrets, and anything of the environment. A
+ * caller that receives the run's return reads the stdout the brief names,
+ * and can hold those bytes to its digest; that a brief was produced or shown
+ * says nothing of that reception.
+ *
+ * Lineage is sought only among `predecessors`, never on disk: a predecessor
+ * is a run whose journal, as its completion recorded it or as read, has the
+ * digest of the bytes this run seeded, and each link is followed the same
+ * way. A session id never makes one (see {@link LineageEndStatus}).
+ * @param reading - One custody directory as `readCustody` read it
+ * @param predecessors - Readings to look for its lineage among; itself, by
+ *   directory, is skipped. Without them, lineage is `not-sought`
+ * @returns The brief, versioned by {@link custodyBriefVersion}
+ */
+export function briefCustody(reading: CustodyReading, predecessors: readonly CustodyReading[] | null = null): CustodyBrief {
+  const invocation = recordOf(reading.invocation);
+  const completion = recordOf(reading.completion);
+  const result = resultOf(reading);
+  const journal = reading.journal;
+  const distinct = predecessors === null
+    ? null
+    : [ ...new Map(predecessors.map((candidate): [ string, CustodyReading ] => [ candidate.directory, candidate ])).values() ];
+  const sums = result?.process ?? null;
+  const session = result?.session ?? null;
+
+  return {
+    format: 'bare-claude/custody-brief',
+    version: custodyBriefVersion,
+    scope: custodyBriefScope,
+    reader: { name: reading.reader.name, version: reading.reader.version },
+    directory: reading.directory,
+    read: reading.read,
+    state: reading.state,
+    problems: reading.problems.length,
+    inPlace: reading.writtenIn.sameAsRead,
+    run: invocation === null ? null : {
+      keptBy: invocation.package.version,
+      launcher: invocation.launcher,
+      model: invocation.model,
+      effortLevel: invocation.effortLevel,
+      callToAction: { bytes: invocation.callToAction.bytes, sha256: invocation.callToAction.sha256 },
+    },
+    end: completion === null ? null : {
+      outcome: completion.outcome,
+      exitCode: completion.exitCode,
+      signalCode: completion.signalCode,
+      stopCause: completion.stop?.cause ?? null,
+      custodyError: completion.custodyError !== null,
+    },
+    session: sessionOfReading(reading),
+    lineage: lineageOf(reading, distinct),
+    result: briefResult(reading.stdout.result),
+    join: reading.join === null ? null : { kind: reading.join.kind, over: reading.join.over },
+    measured: {
+      lastCall: lastCallOf(reading),
+      contextWindow: session?.contextWindow ?? null,
+      process: sums === null ? null : {
+        tokens: {
+          input: sums.tokens.input,
+          cacheCreation: sums.tokens.cacheCreation,
+          cacheRead: sums.tokens.cacheRead,
+          output: sums.tokens.output,
+        },
+        durationMs: sums.durationMs,
+      },
+      session: session === null ? null : {
+        costUsd: session.costUsd,
+        apiDurationMs: session.apiDurationMs,
+        models: words(session.models.map(model => model.model)),
+      },
+      inherited: inheritedOf(reading),
+      costBasis: briefCostBasis,
+      appended: briefAppended(reading),
+    },
+    stdout: briefOutput(reading.stdout),
+    stderr: briefOutput(reading.stderr),
+    journal: journal === null ? null : {
+      path: journal.path,
+      sessionId: journal.sessionId,
+      atCompletion: journal.atCompletion === null ? null : {
+        exists: journal.atCompletion.exists,
+        bytes: journal.atCompletion.bytes,
+        sha256: journal.atCompletion.sha256,
+      },
+      changedSinceCompletion: journal.changedSinceCompletion,
+      boundary: journal.appended.status === 'read' ? journal.appended.boundary.basis : null,
+    },
   };
 }
