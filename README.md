@@ -920,7 +920,7 @@ the spawned process alone; once it has exited, the same signal once to what it l
 group; SIGKILL to the whole group when `options.graceMs` runs out or `options.escalate` (an
 `AbortSignal`) is aborted. Without a process group, the spawned process alone is signalled at
 each step. Resolves with a `StopReport`: `signal`, `escalated`, the spawned process's `exitCode`
-and `signalCode`, `processGroup`, and `groupState` — `empty`, `occupied` (something outlived
+and `signalCode` (a signal name or number, as Bun reports it), `processGroup`, and `groupState` — `empty`, `occupied` (something outlived
 SIGKILL within two seconds), `not-permitted`, or `null` without a group.
 
 It signals only the process Bun spawned, through Bun's handle, and only a group whose id is that
