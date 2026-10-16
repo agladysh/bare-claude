@@ -156,6 +156,9 @@ Options:
   [Git pathspec patterns](https://git-scm.com/docs/gitglossary#Documentation/gitglossary.txt-pathspec)
 
 - `--usage`: report subscription usage as JSON and exit (see [Usage Introspection](#usage-introspection))
+- `--outcome [file]`, `--journal [file]`: read a finished run's result and session journal as JSON
+  and exit (see [Reading a finished run](#reading-a-finished-run))
+- `--outcome-batch [file|-]`: read many result/journal requests in one process, one JSON line each
 - `--doctor`: report what a run needs and exit 1 when something required is missing
   (see [Doctor](#doctor))
 - `--effort [level]`: `low`, `medium`, `high` (default), `xhigh` or `max`
@@ -737,6 +740,112 @@ Code's own usage cache, then reads the structured payload that command leaves in
 It deliberately does not call Anthropic's usage endpoint directly.
 
 Available programmatically as `readUsage()` from `@agladysh/bare-claude/usage`.
+
+## Reading a finished run
+
+What a run's files say, without spawning anything.
+
+The offline readers ignore launch configuration and launch flags, including `--custody`;
+they create no run directory.
+
+```bash
+bare-claude --outcome run/result.json --journal run/home/projects/<key>/<session>.jsonl
+```
+
+This prints one JSON object: `reader` (this package's name and version), `result`, `journal` and
+`join`. Either flag may be given alone. Exit status 1 means only that a named file could not be
+read; it never says how the run ended.
+
+For many files, read them in one process:
+
+```bash
+bare-claude --outcome-batch requests.jsonl     # or `-` for stdin
+```
+
+- **Input.** Each non-empty line is `{"id"?: string, "result"?: path, "journal"?: path}`.
+  Relative paths resolve against the current directory.
+- **Output.** One JSON line per input line, in order, with `line`, `id`, `reading` and `error`.
+  A bad line, or a file that cannot be read, is that line's `error`; the others are still read.
+- **Each file is read once.** Each distinct path is read once per batch, so every line naming a
+  file refers to the same bytes. Exit 1 only when the requests themselves cannot be read.
+
+**What a reading says, and what it does not.** Nothing here decides whether a process has ended,
+whether the work was done, or whether anything was delivered. `status: "no-error"` means only that
+Claude Code's result reported no error: a run can end that way having done part of its task.
+Results, observed on Claude Code 2.1.292, carry three scopes under similar names, kept apart here:
+
+- **`result.lastCall`** is the last entry of `usage.iterations`, the last API call of that
+  process. Its `prompt` is the input plus both cache counts that call sent.
+- **`result.process`** is the rest of `usage` and `duration_ms`, summed over that process's
+  calls. It has no `prompt`. A sum of cache reads over many calls is not a context size.
+- **`result.session`** is `total_cost_usd`, `duration_api_ms` and `modelUsage`. They are
+  cumulative over the whole session, earlier processes of a resumed session included.
+  Its costs are Claude Code's own figures: not a bill, and not subscription usage, which
+  `--usage` reports.
+
+**Other result fields:**
+
+- `subtype` was `"success"` on every error result observed. It is reported verbatim and never
+  read as an outcome; `status` comes from `is_error` alone.
+- `terminalReason`, `stopReason` and `safetyStops` are reported verbatim. `stopReason` and
+  `safetyStops` are not interpreted.
+- `contextLimit` is set only on an error result. It says whether `terminal_reason` was
+  `blocking_limit`, whether the error text was exactly "Prompt is too long", or both. A result
+  without error that quotes those words is not a context limit.
+- A token count that was not recorded is `null`, never `0`. A `prompt` is `null` unless all three
+  input counts were recorded.
+- `file` is `result`, `empty`, `unreadable` (possibly cut short) or `not-a-result`, with the SHA-256 of the bytes read (null for an empty result file).
+
+**The journal is read by cost-state segment.** Claude Code writes a `cost-state` record carrying
+the session's cumulative totals. Not every process end writes one, and a process that spent
+nothing can write one repeating the previous totals. A journal copy seeded from an earlier
+copy holds none of the processes on other branches of the session.
+
+- **Segments are not processes.** A segment is the records up to and including one `cost-state`
+  record. A process that writes none, for example one that crashed or was killed, is merged with
+  the next. `openTail` means records follow the last `cost-state` record: still running, stopped
+  or crashed, which the journal cannot tell.
+- **Per segment:** its closing record (line, session, totals), record count, sessions, native
+  `versions` from the records' envelopes, first and last timestamps, API-error records and
+  `compact_boundary` records.
+- **Its last measured call.** Skipped: synthetic records, and usage that is incomplete or has a
+  zero prompt, as Claude Code itself skips them when it reads usage back on resume. The skipped
+  calls are counted in `unmeasuredCalls`.
+- **Compaction records.** The fields of a `compact_boundary` record are not established: only its
+  keys are listed, and `compactMetadata.preTokens` is read when present.
+- **Versions come from the journal.** The result and `cost-state` records carry no version.
+
+**`join` correlates a result with a cost-state segment.** It requires the session, exact totals
+and a measured last call on both sides. These records carry no invocation identifier, so a
+join is a correlation on those fields, not proof of process identity. Its `kind` is one of:
+
+- `joined`: exactly one `cost-state` record names the result's session and states its
+  `total_cost_usd` and `duration_api_ms`, and both measured last-call prompt token totals agree.
+- `ambiguous`: several such records state the same totals. Every candidate is listed and none is
+  chosen.
+- `disagrees`: the cumulative totals match, but the measured last-call prompt token totals differ.
+- `no-match`: the journal never names the result's session, or no `cost-state` record of that
+  session states its totals.
+- `not-comparable`: the result holds no session or totals, or either side has no measured last call.
+
+`lastCallPromptTokensAgree` is `true` on a join, `false` on `disagrees`, and `null` when no
+comparison was made. It compares token counts, not prompt contents or call identity.
+On a join, `contextLimitRecord` is the uuid of that segment's "Prompt is too long" record, and
+`versions` are the segment's native versions. A segment can span processes: that error record
+alone cannot attribute a context-limit ending to the result's process.
+
+**Programmatically**, from `@agladysh/bare-claude/outcome`:
+
+- `readResult(bytes)`, `readJournal(bytes)` and `joinResult(result, journal)`: pure, and they
+  never throw.
+- `readOutcome(result, journal)`: puts two readings together.
+- `readOutcomeFiles(requests, readFile)`: the batch reader, with your own file reader.
+- `parseOutcomeRequest(line)`: reads one batch line.
+- `callTokens(usage)` and `isMeasuredPrompt(tokens)`.
+- Constants: `contextLimitText`, `contextLimitTerminalReason`, `processScope` and `sessionScope`.
+- Types: `TokenSums`, `ResultReading`, `JournalReading`, `JournalSegment`, `ResultJournalJoin`, `JoinKind`,
+  `OutcomeRequest` and `OutcomeEntry`, with their parts.
+
 
 ## Doctor
 

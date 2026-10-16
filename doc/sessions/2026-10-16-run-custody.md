@@ -7,7 +7,7 @@ shell, no `claude`, no model. Root then added `cancellationRequested`: TypeScrip
 with Bun 1.3.13 on 16 October 2026, the typecheck and 57 focused tests (251 assertions) passed;
 the full suite passed 447 tests, with one conditional skip and 1568 assertions. Independent
 reception added two discriminating tests; the focused suite then passed 59 tests, 259 assertions.
-The work is under `[Unreleased]` and needs its own release; 0.10.0 is untouched.
+Root froze it as `b34dcf9`; it ships as 0.12.0, after the outcome reader (below).
 
 Sources: an earlier custody candidate (not applied), a seven-defect correction of it (not
 applied), and a causal inquiry into copied launch recipes. This is the first materialization.
@@ -92,6 +92,36 @@ re-derived three times, each derivation dropping something different (`USER`, a 
   is absent and its parent present.
 - A held signal followed by a refused custody directory is dropped with the refusal, as for a
   failed spawn.
+
+## Integration with the outcome reader
+
+Custody `b34dcf9` (on `0fa4f8a`) merged with the published outcome reader `fa4889a` (v0.11.0,
+also on `0fa4f8a`). Conflicts in `CHANGELOG.md` and `bin/bare-claude.ts` only; the merge was
+resolved by Opus 5.5 with file tools only, no shell.
+
+- **The offline readers come before any configuration is chosen**, as in 0.11.0. `--outcome`,
+  `--journal` and `--outcome-batch` return before `configChoice`, so composed `--config` files,
+  `--config` with `--no-config`, and `--custody` neither refuse nor change them. The rejected
+  alternative, choosing configuration first, would have made `--outcome F --config a --no-config`
+  an error where 0.11.0 read `F`.
+- **Launch flags given with a reader are ignored, not refused**, `--custody` included: no
+  directory is made. `--usage` and `--display` already behaved this way. Refusing them would be a
+  new CLI rule, and it was not made here.
+- **Release.** The custody entry became `[v0.12.0] - 2026-10-16` above the v0.11.0 entry, which is
+  unchanged, with one sentence added to the `--config` item saying the readers read no
+  configuration. `package.json` is 0.12.0.
+- **Tests.** Before the merge, custody: the full suite passed 447 tests, with one skip and 1568
+  assertions, and the received focused suite passed 59 tests with 259 assertions. The outcome
+  reader: 449 passed, with one skip and 1500 assertions, then 30 focused release tests. At the integration worker's return, no test covered a reader given with several `--config`
+  files, and the combined check had not run. Root's subsequent checks are recorded below.
+- The integration commission used an ambiguous project abbreviation for the two reception
+  returns. The worker attempted nonexistent source paths, then returned without reading them.
+  Those refusals do not establish a permission defect. Root had read both complete returns
+  and applied the required corrections before this integration.
+- Root subsequently ran the combined typecheck and full suite: 479 pass, one conditional skip,
+  1688 assertions on Bun 1.3.13, macOS, 16 October 2026. Root then added the discriminating
+  offline-reader/composed-config regression the integration worker proposed; its focused
+  verification passed: typecheck and seven offline-reader CLI tests, 23 assertions.
 
 ## What this is not
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [v0.12.0] - 2026-10-16
 
 ### Added
 
@@ -24,12 +24,34 @@
   compose the files in order: named presets pooled, root presets merged as presets merge. A preset
   name two files define, a root `use` in two files, and a file named twice are refused. One shared
   profile and one run's own declaration no longer have to be copied into one file. `--doctor`
-  still checks one named file, and refuses several.
+  still checks one named file, and refuses several. `--outcome`, `--journal` and
+  `--outcome-batch` read no configuration, so no `--config`, once or several times, changes them.
 
 ### Changed
 
 - The README's single-file invocation example declares `quiet` and `print` in the file rather than
   on the command line, as a whole declaration should.
+
+## [v0.11.0] - 2026-10-16
+
+### Added
+
+- `--outcome FILE`, `--journal FILE` and `--outcome-batch FILE|-`, and `@agladysh/bare-claude/outcome`
+  (`readResult`, `readJournal`, `joinResult`, `readOutcome`, `readOutcomeFiles`,
+  `parseOutcomeRequest`, `callTokens`, `isMeasuredPrompt`). They read what a finished run left,
+  its `--output-format json` result and its session journal, spawning nothing; a batch reads
+  many in one process.
+  - **Scopes.** Each figure says its scope: the last call's prompt, the process's sums, or the
+    session's cumulative totals. A count that was not recorded is `null`, not `0`.
+  - **Result fields.** An error result reads as an error whatever its `subtype` says.
+    `stop_reason` and `safety_stops` are carried verbatim, not interpreted. `no-error` is not
+    completion or delivery.
+  - **Journal.** It is split into cost-state segments, which are not processes. Each segment has
+    its native versions, last measured call, API-error records and `compact_boundary` records.
+  - **Joins.** A result joins a segment only on its own session, exact totals and a measured
+    last call on both sides. Repeated totals are `ambiguous`, with every candidate listed; a
+    different last-call prompt token total is `disagrees`. `lastCallPromptTokensAgree` compares
+    counts, not prompts.
 
 ## [v0.10.0] - 2026-10-16
 
