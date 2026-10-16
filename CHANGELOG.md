@@ -1,5 +1,49 @@
 # Changelog
 
+## [Unreleased]
+
+A 0.13.0 candidate. `package.json` stays 0.12.0 until it is received and released.
+
+### Added
+
+- **Configuration provenance in custody.** `invocation.json` gains `configuration`: the route that
+  chose the configuration, every file read in the order composed (its path as named, the physical
+  path, and the size and SHA-256 of exactly the bytes parsed), the presets selected at the root,
+  and whether `--use` or the configuration selected them. No file's contents are recorded. The CLI
+  states what it read; a library caller passes `configuration` to `runInCustody`, and `scope` in
+  the record says that custody read none of it. Nothing reads those files again later. The field
+  is additive, so `custodyVersion` stays 1, and a record without it was written by 0.12.0.
+- `readConfig()` and `readConfigFiles()` from `@agladysh/bare-claude/config` return the
+  configuration with its `ConfigProvenance`. `loadConfig()` and `loadConfigFiles()` return the
+  configuration alone, as before.
+- **Reading a custody directory**: `--outcome-custody DIR`, a `{"id"?, "custody": DIR}` line in
+  `--outcome-batch`, and `readCustody()` from `@agladysh/bare-claude/custody`. The reading is
+  versioned (`custodyReadingVersion` 1). It gives a `state` (`invocation-only`, `start-only`,
+  `not-started`, `exited`, `stopped`, `custody-error`, `unknown` or `unreadable`), with its
+  `basis` and `problems`. Each record is typed only when its format, version and every field are
+  as custody writes them. The stdout is read as a result and labelled as written by
+  `invocation.executable`, and nothing reads it as native Claude Code's. The journal is read and
+  joined by the existing outcome reader. Changes to the stdout, stderr and journal since the
+  completion are reported as facts, and no continuation is offered. Nothing is spawned or
+  signalled, and no PID is looked up.
+- **Every custody run is observed at its end.** Once the completion is written, or has failed to
+  be, custody reads the directory with `readCustody`, writes `observation.json` and emits an
+  `observed` event after `completed`, and the CLI prints `Claude run observed: STATE`. An
+  observation that cannot be read or written is that event's `error` and a stderr line. It changes
+  neither the completion, nor what `runInCustody` resolves with, nor the CLI's exit status. It is a
+  reading, not a receipt.
+
+### Changed
+
+- **A configuration file is read once**, through one handle, and parsed from the bytes it digests.
+  Before, a named file was checked for existence and then read separately. A path that names no
+  regular file is refused.
+- **One configuration file named twice is refused, whatever the names**: a symbolic link to it, or
+  a path through a linked directory. Before, only the same resolved path was refused, so two names
+  for one root-only file composed it twice and repeated its arrays.
+- `parseOutcomeRequest()` returns `OutcomeRequest | CustodyRequest | string`.
+- Under custody, `Claude run custody at DIR` is printed after the observation line, still last.
+
 ## [v0.12.0] - 2026-10-16
 
 ### Added

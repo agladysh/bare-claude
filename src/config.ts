@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import fs, { type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 
 import { scope, type } from 'arktype';
@@ -255,20 +257,121 @@ export type ConfigSource =
   | { kind: 'none' };
 
 /**
- * Reads the configuration a {@link ConfigSource} selects.
+ * One configuration file as it was read: the name it was read by, the file
+ * that name led to, and the size and SHA-256 of exactly the bytes that were
+ * parsed. Never what they say: a configuration file can hold a credential,
+ * in `extraEnv` for one. A digest is not the content, but anyone holding a
+ * candidate file can confirm it against one.
+ */
+export interface ConfigFileRecord {
+  /** As named, made absolute against the process cwd; symbolic links kept. */
+  path: string,
+
+  /** `path` with every symbolic link resolved, resolved just after the bytes were read. */
+  realPath: string,
+
+  bytes: number,
+  sha256: string,
+}
+
+/** Where a configuration was read from: by which route, and which files, in the order composed. */
+export interface ConfigProvenance {
+  /**
+   * The route: a {@link ConfigSource} kind, or `files` for
+   * {@link readConfigFiles}, which is what the CLI reads any `--config` by.
+   */
+  source: ConfigSource['kind'] | 'files',
+
+  /** Every file read, least significant first. Empty when none was, a located file that does not exist included. */
+  files: ConfigFileRecord[],
+}
+
+/** A validated configuration and where it was read from. */
+export interface ConfigReading {
+  config: Config,
+  provenance: ConfigProvenance,
+}
+
+/** Narrows a thrown value to the errno `code` a Node system error carries. */
+function errorCode(error: unknown): string | null {
+  return error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : null;
+}
+
+/** One file read once, through one handle, and parsed from those same bytes. */
+interface FileRead {
+  config: Config,
+  record: ConfigFileRecord,
+
+  /** Device and inode of the file read, so two names for one file are one file. */
+  identity: string,
+}
+
+/**
+ * Opens `configPath` once and reads it whole through that handle; the digest
+ * and the parse are both of those bytes. There is no second read to drift
+ * from the first: no existence check before it, and nothing read again after.
+ * @returns The reading, or null when nothing exists at that path
+ */
+async function readOnce(configPath: string): Promise<FileRead | null> {
+  const absolute = path.resolve(configPath);
+  let handle: FileHandle;
+  try {
+    handle = await fs.open(absolute, 'r');
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) {
+      throw new Error(`configuration file ${configPath} is not a regular file`);
+    }
+    const bytes = await handle.readFile();
+    const config = parseConfig(new TextDecoder().decode(bytes), configPath);
+    return {
+      config,
+      record: {
+        path: absolute,
+        realPath: await fs.realpath(absolute),
+        bytes: bytes.length,
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+      },
+      identity: `${stat.dev}:${stat.ino}`,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+/** A named configuration file, which must exist, read once and validated. */
+async function readNamedFile(configPath: string): Promise<FileRead> {
+  const read = await readOnce(configPath);
+  if (read === null) {
+    throw new Error(`configuration file ${configPath} does not exist`);
+  }
+  return read;
+}
+
+/**
+ * Reads the configuration a {@link ConfigSource} selects, and says which file
+ * it was read from.
  * @param source - Which configuration to read
  * @param cwd - Directory a `located` configuration is resolved from
- * @returns The validated configuration
+ * @returns The validated configuration and its provenance
  * @throws When a `located` configuration is asked for outside a Git working
  *   copy, a named file does not exist, or the file is invalid
  */
-export async function loadConfig(source: ConfigSource, cwd: string = process.cwd()): Promise<Config> {
+export async function readConfig(source: ConfigSource, cwd: string = process.cwd()): Promise<ConfigReading> {
   switch (source.kind) {
     case 'none':
-      return emptyConfig();
+      return { config: emptyConfig(), provenance: { source: 'none', files: [] } };
 
-    case 'file':
-      return readConfigFile(source.path);
+    case 'file': {
+      const { config, record } = await readNamedFile(source.path);
+      return { config, provenance: { source: 'file', files: [ record ] } };
+    }
 
     case 'located': {
       const configPath = await locateConfig(cwd);
@@ -278,50 +381,71 @@ export async function loadConfig(source: ConfigSource, cwd: string = process.cwd
           + 'name a file with --config, or read none with --no-config'
         );
       }
-      const file = Bun.file(configPath);
-      if (!await file.exists()) {
-        return emptyConfig();
-      }
-      return parseConfig(await file.text(), configPath);
+      const read = await readOnce(configPath);
+      return read === null
+        ? { config: emptyConfig(), provenance: { source: 'located', files: [] } }
+        : { config: read.config, provenance: { source: 'located', files: [ read.record ] } };
     }
   }
 }
 
-/** A named configuration file, which must exist, validated. */
-async function readConfigFile(configPath: string): Promise<Config> {
-  const file = Bun.file(configPath);
-  if (!await file.exists()) {
-    throw new Error(`configuration file ${configPath} does not exist`);
-  }
-  return parseConfig(await file.text(), configPath);
+/**
+ * Reads the configuration a {@link ConfigSource} selects.
+ * @param source - Which configuration to read
+ * @param cwd - Directory a `located` configuration is resolved from
+ * @returns The validated configuration
+ * @throws As {@link readConfig}
+ */
+export async function loadConfig(source: ConfigSource, cwd: string = process.cwd()): Promise<Config> {
+  return (await readConfig(source, cwd)).config;
 }
 
 /**
- * Reads named configuration files, each of which must exist, validates each
- * on its own, and composes them in order with `composeConfigs` from
- * `@agladysh/bare-claude/preset`: later files over earlier ones, named
- * presets pooled. One canonical profile and one run's own declaration, say,
- * neither copied into the other. No Git working copy is needed.
+ * Reads named configuration files, each of which must exist, each once,
+ * validates each on its own, and composes them in order with
+ * `composeConfigs` from `@agladysh/bare-claude/preset`: later files over
+ * earlier ones, named presets pooled. One canonical profile and one run's own
+ * declaration, say, neither copied into the other. No Git working copy is
+ * needed. One file is refused the second time it is named, by the same name
+ * or another: a symbolic link to it, a path through a linked directory.
  * @param paths - The files, least significant first
- * @returns The composed configuration
+ * @returns The composed configuration, and every file read with the digest
+ *   of the bytes parsed, in order
  * @throws When no file, or one file twice, is named; when a file does not
  *   exist or is invalid; when the files do not compose
  */
-export async function loadConfigFiles(paths: readonly string[]): Promise<Config> {
+export async function readConfigFiles(paths: readonly string[]): Promise<ConfigReading> {
   if (paths.length === 0) {
     throw new Error('no configuration file is named');
   }
   const named = new Set<string>();
+  const read = new Map<string, string>();
   const layers: ConfigLayer[] = [];
+  const files: ConfigFileRecord[] = [];
   for (const configPath of paths) {
     const resolved = path.resolve(configPath);
     if (named.has(resolved)) {
       throw new Error(`configuration file ${configPath} is named twice`);
     }
     named.add(resolved);
-    layers.push({ source: configPath, config: await readConfigFile(configPath) });
+    const { config, record, identity } = await readNamedFile(configPath);
+    const earlier = read.get(identity);
+    if (earlier !== undefined) {
+      throw new Error(`configuration file ${configPath} is named twice: it is the file ${earlier} names`);
+    }
+    read.set(identity, configPath);
+    layers.push({ source: configPath, config });
+    files.push(record);
   }
-  return composeConfigs(layers);
+  return { config: composeConfigs(layers), provenance: { source: 'files', files } };
+}
+
+/**
+ * {@link readConfigFiles}, the composed configuration alone.
+ * @throws As {@link readConfigFiles}
+ */
+export async function loadConfigFiles(paths: readonly string[]): Promise<Config> {
+  return (await readConfigFiles(paths)).config;
 }
 
 /** A YAML mapping, the only shape a configuration file may have at its root. */

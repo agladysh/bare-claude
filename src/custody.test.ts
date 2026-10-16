@@ -8,11 +8,13 @@ import path from 'node:path';
 
 import { cloneBranch, cloneRequired, eventually, processGone } from '../test/helpers.ts';
 import {
-  completionScope, custodyFiles, custodyVersion, runInCustody,
-  type CustodyEvent, type CustodyOptions, type CustodyStart,
+  completionScope, configurationScope, custodyFiles, custodyReadingScope, custodyReadingVersion, custodyVersion,
+  readCustody, runInCustody, stdoutProvenance,
+  type CustodyConfiguration, type CustodyEvent, type CustodyOptions, type CustodyReading, type CustodyStart,
 } from './custody.ts';
 import type { LaunchOptions } from './index.ts';
 import { processGroupState, type SignalSource, type StopSignal } from './lifecycle.ts';
+import { processScope } from './outcome.ts';
 
 /**
  * Custody of real processes: the fake `claude` under test/, run with
@@ -105,6 +107,56 @@ function startsIn(events: CustodyEvent[]): CustodyStart[] {
   return events.flatMap(event => event.kind === 'started' ? [ event.start ] : []);
 }
 
+type Observed = Extract<CustodyEvent, { kind: 'observed' }>;
+
+function observedIn(events: CustodyEvent[]): Observed | null {
+  const found = events.flatMap(event => event.kind === 'observed' ? [ event ] : []);
+  expect(found).toHaveLength(1);
+  return found[0] ?? null;
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Every object key anywhere in `value`. */
+function keysIn(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.flatMap(keysIn);
+  }
+  return isRecordValue(value) ? Object.entries(value).flatMap(([ key, inner ]) => [ key, ...keysIn(inner) ]) : [];
+}
+
+/** A record's JSON text with `change` made to it. */
+function edited(text: string, change: (record: Record<string, unknown>) => void): string {
+  const parsed: unknown = JSON.parse(text);
+  if (!isRecordValue(parsed)) {
+    throw new Error('not a JSON object');
+  }
+  change(parsed);
+  return JSON.stringify(parsed);
+}
+
+/** A result in the shape `--output-format json` writes, every value constructed. */
+const constructedResult = JSON.stringify({
+  type: 'result', subtype: 'success', is_error: true, terminal_reason: 'blocking_limit', result: 'Prompt is too long',
+  stop_reason: 'constructed_stop', session_id: 'constructed-session', total_cost_usd: 1.5, duration_api_ms: 100,
+  duration_ms: 50,
+  usage: {
+    input_tokens: 1, cache_creation_input_tokens: 2, cache_read_input_tokens: 3, output_tokens: 4,
+    iterations: [ { input_tokens: 1, cache_creation_input_tokens: 2, cache_read_input_tokens: 3, output_tokens: 4 } ],
+  },
+});
+
+const readingKeys = [
+  'format', 'version', 'scope', 'reader', 'directory', 'read', 'state', 'basis', 'problems', 'entries',
+  'invocation', 'start', 'completion', 'stdout', 'stderr', 'journal', 'join',
+];
+
+const stdoutKeys = [
+  'path', 'file', 'why', 'atCompletion', 'changedSinceCompletion', 'writtenBy', 'provenance', 'outputFormat', 'result',
+];
+
 /** A run in custody under a temporary root, its events collected, not yet awaited. */
 async function begin(
   launch: Partial<LaunchOptions> = {},
@@ -150,7 +202,7 @@ describe.if(posix)('runInCustody', () => {
     const at = (name: string) => path.join(run.directory, name);
 
     expect((await fs.readdir(run.directory)).sort()).toEqual([
-      custodyFiles.completion, custodyFiles.home, custodyFiles.invocation,
+      custodyFiles.completion, custodyFiles.home, custodyFiles.invocation, custodyFiles.observation,
       custodyFiles.start, custodyFiles.stderr, custodyFiles.stdout,
     ].sort());
     expect((await fs.stat(run.directory)).mode & 0o777).toBe(0o700);
@@ -209,8 +261,8 @@ describe.if(posix)('runInCustody', () => {
     });
 
     expect(await readJson(at(custodyFiles.completion))).toEqual(completion);
-    expect(run.events.map(event => event.kind)).toEqual([ 'started', 'completed' ]);
-    expect(run.events.at(-1)).toEqual({ kind: 'completed', directory: run.directory, completion });
+    expect(run.events.map(event => event.kind)).toEqual([ 'started', 'completed', 'observed' ]);
+    expect(run.events.at(1)).toEqual({ kind: 'completed', directory: run.directory, completion });
     expect(run.signals.listening).toBe(0);
   }, 20_000);
 
@@ -257,7 +309,7 @@ describe.if(posix)('runInCustody', () => {
     expect(completion.stdout).toMatchObject({ bytes: 8, sha256: sha256('partial\n') });
     expect(run.events.at(0)?.kind).toBe('started');
     expect(run.events.map(event => event.kind)).toContain('supervisor');
-    expect(run.events.at(-1)?.kind).toBe('completed');
+    expect(run.events.slice(-2).map(event => event.kind)).toEqual([ 'completed', 'observed' ]);
     const [ start ] = startsIn(run.events);
     expect(await eventually(() => processGone(start?.pid ?? 0), 5_000)).toBe(true);
   }, 30_000);
@@ -318,8 +370,15 @@ describe.if(posix)('runInCustody', () => {
     expect(await exists(path.join(run.directory, custodyFiles.invocation))).toBe(true);
     expect(await exists(path.join(run.directory, custodyFiles.start))).toBe(false);
     expect(await readJson(path.join(run.directory, custodyFiles.completion))).toEqual(completion);
-    expect(run.events.map(event => event.kind)).toEqual([ 'completed' ]);
+    expect(run.events.map(event => event.kind)).toEqual([ 'completed', 'observed' ]);
     expect(run.signals.listening).toBe(0);
+    // The descriptors were opened before the spawn failed: an empty stdout, read as such.
+    expect(await readJson(path.join(run.directory, custodyFiles.observation))).toMatchObject({
+      state: 'not-started',
+      start: { status: 'absent' },
+      journal: null,
+      stdout: { file: { bytes: 0 }, atCompletion: null, changedSinceCompletion: null, result: { file: 'empty' } },
+    });
   });
 
   test('custody\'s records hold no environment, settings, token or call to action; extraArgs as given; the home holds what a home holds', async () => {
@@ -345,7 +404,8 @@ describe.if(posix)('runInCustody', () => {
     expect(completion.outcome).toBe('exited');
 
     for (const name of [
-      custodyFiles.invocation, custodyFiles.start, custodyFiles.completion, custodyFiles.stdout, custodyFiles.stderr,
+      custodyFiles.invocation, custodyFiles.start, custodyFiles.completion, custodyFiles.observation,
+      custodyFiles.stdout, custodyFiles.stderr,
     ]) {
       const text = await Bun.file(path.join(run.directory, name)).text();
       for (const secret of [ token, envValue, settingValue, callToAction ]) {
@@ -421,6 +481,7 @@ describe.if(posix)('runInCustody', () => {
 
     expect(completion.outcome).toBe('exited');
     expect(await readJson(path.join(run.directory, custodyFiles.completion))).toEqual(completion);
+    expect(await readJson(path.join(run.directory, custodyFiles.observation))).toMatchObject({ state: 'exited' });
   }, 20_000);
 
   test('a launcher that leaves a process behind: custody does not wait for it, and says its group is occupied', async () => {
@@ -550,6 +611,242 @@ describe.if(posix)('runInCustody', () => {
     expect(completion.stop?.report).toMatchObject({ signal: 'SIGTERM' });
     expect(completion.custodyError).toContain(`${custodyFiles.start} was not written`);
     expect(await readJson(path.join(directory, custodyFiles.completion))).toEqual(completion);
+
+    // The empty start.json is someone else's, and unreadable as a start; the
+    // state rests on the completion, which says custody failed.
+    const reading = await readCustody(directory);
+    expect(reading).toMatchObject({ state: 'custody-error', start: { status: 'unreadable', file: { bytes: 0 } } });
+    expect(reading.basis).toContain(`${custodyFiles.start} was not written`);
+    expect(reading.problems.some(problem => problem.startsWith(path.join(directory, custodyFiles.start)))).toBe(true);
+    expect(await readJson(path.join(directory, custodyFiles.observation))).toMatchObject({ state: 'custody-error' });
   }, 30_000);
 
+});
+
+describe.if(posix)('readCustody and the observation', () => {
+  test('the observation is the directory as readCustody read it at the end, and a later reading agrees', async () => {
+    const run = await begin({ extraArgs: [ '--output-format', 'json' ] }, { FAKE_CLAUDE_STDOUT: constructedResult });
+    const completion = await run.completion;
+    const at = (name: string) => path.join(run.directory, name);
+    const observed = observedIn(run.events);
+    const observation = observed?.observation ?? null;
+
+    expect(observed).toMatchObject({ directory: run.directory, file: at(custodyFiles.observation), error: null });
+    expect(await readJson(at(custodyFiles.observation))).toEqual(observation);
+    expect(Object.keys(observation ?? {}).sort()).toEqual([ ...readingKeys ].sort());
+    expect(observation).toMatchObject({
+      format: 'bare-claude/custody-reading',
+      version: custodyReadingVersion,
+      scope: custodyReadingScope,
+      directory: run.directory,
+      state: 'exited',
+      problems: [],
+      invocation: { status: 'read', record: { executable: fakeClaude, configuration: null } },
+      start: { status: 'read' },
+      completion: { status: 'read', record: completion },
+      stdout: {
+        writtenBy: { launcher: 'claude', executable: fakeClaude },
+        provenance: stdoutProvenance,
+        outputFormat: 'json',
+        atCompletion: { bytes: Buffer.byteLength(constructedResult), sha256: sha256(constructedResult) },
+        changedSinceCompletion: false,
+        // Verbatim facts of the result, each in its own scope.
+        result: {
+          file: 'result', status: 'error', stopReason: 'constructed_stop',
+          contextLimit: { terminalReason: true, text: true }, process: { scope: processScope },
+        },
+      },
+      journal: { namedBy: 'completion.journal', path: completion.journal?.path ?? '', changedSinceCompletion: false, reading: { lines: 2 } },
+      // The constructed result names a session the journal never does.
+      join: { kind: 'no-match' },
+    });
+    expect(Object.keys(observation?.stdout ?? {}).sort()).toEqual([ ...stdoutKeys ].sort());
+    expect(observation?.entries).not.toContain(custodyFiles.observation);
+
+    const later = await readCustody(run.directory);
+    expect(later.entries).toContain(custodyFiles.observation);
+    expect(later).toMatchObject({
+      state: 'exited',
+      stdout: { file: { sha256: sha256(constructedResult) }, changedSinceCompletion: false },
+      journal: { changedSinceCompletion: false },
+    });
+  }, 20_000);
+
+  test('a launcher\'s stdout is the launcher\'s: a result that looks native says nothing of who wrote it', async () => {
+    const launcher = path.join(await tempDir(), 'claude');
+    // Named `claude`, writing a native-looking result, and not Claude Code.
+    await fs.writeFile(launcher, [ '#!/bin/sh', 'printf \'%s\' "$NATIVE_LOOKING"', 'exit 0', '' ].join('\n'), { mode: 0o755 });
+    await fs.chmod(launcher, 0o755);
+    const run = await begin({ claudePath: launcher, extraArgs: [ '--output-format', 'json' ] }, {
+      NATIVE_LOOKING: constructedResult, PATH: `${bunDir}:/usr/bin:/bin`,
+    });
+    await run.completion;
+    const observation = observedIn(run.events)?.observation ?? null;
+
+    expect(observation).toMatchObject({
+      state: 'exited',
+      stdout: { writtenBy: { launcher: 'claude', executable: launcher }, provenance: stdoutProvenance, result: { file: 'result' } },
+    });
+    expect(Object.keys(observation?.stdout ?? {}).sort()).toEqual([ ...stdoutKeys ].sort());
+    expect(keysIn(observation).filter(key => /native/i.test(key))).toEqual([]);
+  }, 20_000);
+
+  test('output and journal changed since the completion are facts, and nothing in them offers a continuation', async () => {
+    const run = await begin({}, { FAKE_CLAUDE_STDOUT: 'first\n' });
+    await run.completion;
+    const observation = observedIn(run.events)?.observation ?? null;
+    expect(observation?.stdout.changedSinceCompletion).toBe(false);
+    expect(observation?.journal?.changedSinceCompletion).toBe(false);
+    const journal = observation?.journal?.path ?? '';
+
+    // Whoever writes after the completion, the reading sees bytes, not writers.
+    await fs.appendFile(path.join(run.directory, custodyFiles.stdout), 'later\n');
+    await fs.appendFile(journal, `${JSON.stringify({ type: 'progress' })}\n`);
+    const changed = await readCustody(run.directory);
+    expect(changed).toMatchObject({
+      state: 'exited',
+      stdout: { changedSinceCompletion: true, file: { bytes: Buffer.byteLength('first\nlater\n') } },
+      journal: { changedSinceCompletion: true, reading: { lines: 3 } },
+    });
+    expect(keysIn(changed).filter(key => /continu|seed|resum/i.test(key))).toEqual([]);
+
+    await fs.rm(journal);
+    expect((await readCustody(run.directory)).journal).toMatchObject({
+      changedSinceCompletion: true, file: null, why: 'no file at that path', reading: null,
+    });
+  }, 20_000);
+
+  test('an observation that cannot be written is the event\'s error, and changes nothing of the run', async () => {
+    const seen: CustodyEvent[] = [];
+    const run = await begin({}, {}, {
+      onEvent: event => {
+        seen.push(event);
+        // Someone else's file where the observation would go.
+        if (event.kind === 'completed') {
+          writeFileSync(path.join(event.directory, custodyFiles.observation), 'theirs');
+        }
+      },
+    });
+    const completion = await run.completion;
+    const observed = observedIn(seen);
+
+    expect(completion).toMatchObject({ outcome: 'exited', exitCode: 0, custodyError: null });
+    expect(await readJson(path.join(run.directory, custodyFiles.completion))).toEqual(completion);
+    expect(observed?.file).toBeNull();
+    expect(observed?.error).toContain(`${custodyFiles.observation} was not written`);
+    expect(observed?.observation?.state).toBe('exited');
+    expect(await Bun.file(path.join(run.directory, custodyFiles.observation)).text()).toBe('theirs');
+  }, 20_000);
+
+  test('the stated configuration is recorded field by field, with its scope; none stated is null', async () => {
+    const stated: CustodyConfiguration = {
+      source: 'files',
+      files: [ { path: '/profiles/worker.yaml', realPath: '/profiles/worker.yaml', bytes: 10, sha256: 'a'.repeat(64) } ],
+      use: [ 'worker' ],
+      useFrom: 'configuration',
+    };
+    // An untyped caller's extra fields stay out of the record.
+    const withExtra = { ...stated, contents: 'stated-configuration-sentinel' };
+    const run = await begin({}, {}, { configuration: withExtra });
+    await run.completion;
+    const text = await Bun.file(path.join(run.directory, custodyFiles.invocation)).text();
+
+    expect(JSON.parse(text)).toMatchObject({ configuration: { ...stated, scope: configurationScope } });
+    expect(text).not.toContain('stated-configuration-sentinel');
+  }, 20_000);
+
+  /** A finished run's directory, and variants of it made by copying some of its files and writing others. */
+  async function variants() {
+    const run = await begin({}, { FAKE_CLAUDE_STDOUT: 'out\n' });
+    await run.completion;
+    const text = async (name: string) => Bun.file(path.join(run.directory, name)).text();
+    const variant = async (copy: string[], write: Record<string, string> = {}): Promise<string> => {
+      const directory = path.join(await tempDir(), 'variant');
+      await fs.mkdir(directory);
+      for (const name of copy) {
+        await fs.copyFile(path.join(run.directory, name), path.join(directory, name));
+      }
+      for (const [ name, written ] of Object.entries(write)) {
+        await fs.writeFile(path.join(directory, name), written);
+      }
+      return directory;
+    };
+    return { run, text, variant };
+  }
+
+  test('a directory whose end was not recorded is unknown by what it holds, never read as an end', async () => {
+    const { variant } = await variants();
+
+    const invocationOnly = await readCustody(await variant([ custodyFiles.invocation ]));
+    expect(invocationOnly).toMatchObject({
+      state: 'invocation-only', journal: null, join: null,
+      stdout: { file: null, why: 'no file at that path', changedSinceCompletion: null, result: null },
+    });
+    expect(invocationOnly.basis).toContain('spawned just before its runner died');
+
+    const startOnly = await readCustody(await variant([ custodyFiles.invocation, custodyFiles.start, custodyFiles.stdout ]));
+    expect(startOnly).toMatchObject({
+      state: 'start-only',
+      completion: { status: 'absent' },
+      journal: { namedBy: 'start.sessionJsonlPath', atCompletion: null, changedSinceCompletion: null },
+      stdout: { atCompletion: null, changedSinceCompletion: null },
+    });
+    expect(startOnly.basis).toContain('custody did not record an end');
+  }, 20_000);
+
+  test('a record that is cut short, of another version or format, or not as its version writes it, is unreadable', async () => {
+    const { text, variant } = await variants();
+    const kept = [ custodyFiles.invocation, custodyFiles.start ];
+    const completion = await text(custodyFiles.completion);
+    const cases: [ string, string ][] = [
+      [ completion.slice(0, 40), 'possibly cut short' ],
+      [ edited(completion, record => { record.version = 2; }), 'version 2; this reader knows version 1' ],
+      [ edited(completion, record => { record.exitCode = '0'; }), 'fields are not as that version writes them' ],
+      [ await text(custodyFiles.invocation), 'not a bare-claude/run-completion record' ],
+    ];
+    for (const [ written, why ] of cases) {
+      const directory = await variant(kept, { [custodyFiles.completion]: written });
+      const reading = await readCustody(directory);
+      expect(reading).toMatchObject({ state: 'unreadable', completion: { status: 'unreadable', file: { bytes: Buffer.byteLength(written) } } });
+      expect(reading.completion.status === 'unreadable' ? reading.completion.why : '').toContain(why);
+      expect(reading.problems.some(problem => problem.startsWith(path.join(directory, custodyFiles.completion)))).toBe(true);
+    }
+  }, 20_000);
+
+  test('records custody never writes together, or that disagree, are unknown; a 0.12 invocation is read as it was', async () => {
+    const { text, variant } = await variants();
+    const start = await text(custodyFiles.start);
+    const completion = await text(custodyFiles.completion);
+
+    const disagreeing = await readCustody(await variant([ custodyFiles.invocation, custodyFiles.completion ], {
+      [custodyFiles.start]: edited(start, record => { record.sessionId = 'another-session'; }),
+    }));
+    expect(disagreeing.state).toBe('unknown');
+    expect(disagreeing.basis).toContain('the records disagree');
+
+    const noStart = await readCustody(await variant([ custodyFiles.invocation, custodyFiles.completion ]));
+    expect(noStart.state).toBe('unknown');
+    expect(noStart.basis).toContain(`there is no ${custodyFiles.start}`);
+
+    const before = await readCustody(await variant([ custodyFiles.start, custodyFiles.stdout, custodyFiles.stderr ], {
+      [custodyFiles.invocation]: edited(await text(custodyFiles.invocation), record => { delete record.configuration; }),
+      [custodyFiles.completion]: completion,
+    }));
+    expect(before).toMatchObject({ state: 'exited', invocation: { status: 'read' } });
+    expect(before.invocation.status === 'read' ? before.invocation.record.configuration : null).toBeUndefined();
+  }, 20_000);
+
+  test('an empty directory, someone else\'s files, and no directory at all', async () => {
+    const root = await tempDir();
+    const empty = path.join(root, 'empty');
+    await fs.mkdir(empty);
+    expect(await readCustody(empty)).toMatchObject({ state: 'unknown', entries: [], journal: null });
+
+    await fs.writeFile(path.join(empty, 'notes.txt'), 'theirs');
+    expect(await readCustody(empty)).toMatchObject({ state: 'unknown', entries: [ 'notes.txt' ] });
+
+    const missing: CustodyReading = await readCustody(path.join(root, 'missing'));
+    expect(missing).toMatchObject({ state: 'unreadable', entries: null, invocation: { status: 'absent' } });
+    expect(missing.basis).toContain('could not be listed');
+  });
 });

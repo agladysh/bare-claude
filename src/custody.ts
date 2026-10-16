@@ -27,6 +27,10 @@
  *   custody stopped it, how its process group read, and the size and digest
  *   of each output and of the journal. Otherwise custody waits for the
  *   spawned process's exit without a bound, as an ordinary run does.
+ * - `observation.json`, once the completion is written or has failed to be:
+ *   what {@link readCustody} read of the directory then — the same reading any
+ *   later reader gets, as of that moment. It is a reading, not a receipt:
+ *   whoever acts on the run still has to read it.
  * - `home/`, the Claude home, unless the caller names another. It holds what
  *   any kept home holds: `settings.json`, with `extraSettings` merged in and
  *   its `env` block included; the session journal, which holds the call to
@@ -36,7 +40,7 @@
  *
  * The directory is therefore not free of sensitive material, and custody does
  * not make it so. Files anyone else puts there are theirs; custody neither
- * reads nor removes them.
+ * removes them nor reads them as its own, and a reading only lists their names.
  *
  * Everything recorded is about processes. The spawned process is whatever
  * `claudePath` names — a launcher, perhaps, not native Claude Code — and how
@@ -53,16 +57,23 @@
 import { createHash } from 'node:crypto';
 import { closeSync, openSync } from 'node:fs';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 
 import {
-  assertSafeCallToAction, LaunchConfig, physicalCwd, spawnClaude,
+  assertSafeCallToAction, LaunchConfig, Launchers, physicalCwd, spawnClaude,
   type AuthMode, type Launcher, type LaunchOptions, type SessionSeed,
 } from '@agladysh/bare-claude';
+import type { ConfigFileRecord, ConfigProvenance } from '@agladysh/bare-claude/config';
 import {
-  readProcessGroup, superviseSignals,
-  type ProcessGroupReading, type SignalSource, type StopReport, type StopSignal, type SupervisorEvent,
+  readProcessGroup, stopSignals, superviseSignals,
+  type ProcessGroupObservation, type ProcessGroupReading, type ProcessGroupState,
+  type SignalSource, type StopReport, type StopSignal, type SupervisorEvent,
 } from '@agladysh/bare-claude/lifecycle';
+import {
+  joinResult, readJournal, readResult,
+  type JournalReading, type ResultJournalJoin, type ResultReading,
+} from '@agladysh/bare-claude/outcome';
 
 import pkg from '../package.json';
 
@@ -80,8 +91,32 @@ export const custodyFiles = {
   stderr: 'stderr',
   start: 'start.json',
   completion: 'completion.json',
+  observation: 'observation.json',
   home: 'home',
 } as const;
+
+/** What a recorded configuration says, and the limit of it. */
+export const configurationScope = 'the configuration files as runInCustody\'s caller stated them, not read by custody; the bare-claude CLI states the bytes its configuration reader read once, digested and parsed before this record was written. No file is read again or compared afterwards, and no content is recorded';
+
+/**
+ * Which configuration declared a run, as {@link runInCustody}'s caller states
+ * it: the files read, in the order composed, each by path and the size and
+ * digest of the bytes parsed (see `readConfigFiles` in
+ * `@agladysh/bare-claude/config`, which produces the provenance); and the
+ * presets the invocation selected at its root.
+ */
+export interface CustodyConfiguration extends ConfigProvenance {
+  /** The presets selected at the root, in order: `--use`, else the root's own `use`; null when none. */
+  use: string[] | null,
+
+  /** Where `use` came from; null when nothing was selected. */
+  useFrom: 'command-line' | 'configuration' | null,
+}
+
+/** A {@link CustodyConfiguration} as `invocation.json` records it, with its {@link configurationScope}. */
+export interface RecordedConfiguration extends CustodyConfiguration {
+  scope: typeof configurationScope,
+}
 
 /** Custody as a preset declares it. */
 export interface CustodyDeclaration {
@@ -147,6 +182,13 @@ export interface CustodyOptions extends CustodyDeclaration {
    * Without it, custody records the PID and no identity.
    */
   identify?: (pid: number) => ProcessIdentity,
+
+  /**
+   * The configuration that declared the run, recorded in `invocation.json`
+   * as stated, with {@link configurationScope}: custody reads none of it.
+   * Without it, the record says none was stated.
+   */
+  configuration?: CustodyConfiguration,
 }
 
 /** How the run's session begins: fresh, or continued from a journal in memory or in a file. */
@@ -201,6 +243,13 @@ export interface CustodyInvocation {
 
   /** Its length in bytes and digest; `kept` names its text's file when the caller asked for it. */
   callToAction: { bytes: number, sha256: string, kept: string | null },
+
+  /**
+   * The configuration as the caller stated it; null when it stated none.
+   * Absent from records written before this field existed (0.12.0), which
+   * say nothing about configuration either way.
+   */
+  configuration?: RecordedConfiguration | null,
 }
 
 /** `start.json`: the spawned process, as soon as custody could record it. */
@@ -324,11 +373,18 @@ export interface CustodyCompletion {
   journal: CustodyJournal | null,
 }
 
-/** Something custody observed, in the order it did. */
+/**
+ * Something custody observed, in the order it did. `observed` comes last,
+ * after `completed`: the directory as {@link readCustody} read it then, and
+ * the path it was written to as `observation.json`, or why it was not.
+ * `observation` is null only if the reading itself failed, which `error`
+ * then says. Neither changes the completion or the exit status.
+ */
 export type CustodyEvent =
   | { kind: 'started', directory: string, start: CustodyStart }
   | { kind: 'supervisor', event: SupervisorEvent }
-  | { kind: 'completed', directory: string, completion: CustodyCompletion };
+  | { kind: 'completed', directory: string, completion: CustodyCompletion }
+  | { kind: 'observed', directory: string, observation: CustodyReading | null, file: string | null, error: string | null };
 
 /** Narrows a thrown value to the errno `code` a Node system error carries. */
 function errorCode(error: unknown): string | null {
@@ -420,6 +476,23 @@ function identityOf(identify: (pid: number) => unknown, pid: number): CustodyIde
   }
 }
 
+/**
+ * The stated configuration as `invocation.json` records it: the named fields
+ * only, copied, so nothing else an untyped caller attached is recorded.
+ */
+function recordedConfiguration(stated: CustodyConfiguration | undefined): RecordedConfiguration | null {
+  if (stated === undefined) {
+    return null;
+  }
+  return {
+    scope: configurationScope,
+    source: stated.source,
+    files: stated.files.map(({ path: named, realPath, bytes, sha256: digested }) => ({ path: named, realPath, bytes, sha256: digested })),
+    use: stated.use === null ? null : [ ...stated.use ],
+    useFrom: stated.useFrom,
+  };
+}
+
 /** Reads the signal's current state, including changes during asynchronous preparation. */
 function cancellationRequested(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
@@ -437,6 +510,11 @@ function cancellationRequested(signal: AbortSignal | undefined): boolean {
  * is made, a failure to spawn is the run's outcome, not an exception.
  * `ephemeralClaudeHomePath` defaults to the directory's own `home/`, kept
  * like everything else there; nothing in the directory is ever removed.
+ *
+ * Once the completion is written, or has failed to be, the directory is read
+ * by {@link readCustody}, the reading kept as `observation.json` and passed on
+ * as the `observed` event. A reading or write that fails is the event's
+ * `error`, and changes neither the completion nor anything resolved here.
  * @param launchOptions - As for `spawnClaude`
  * @param options - See {@link CustodyOptions}
  * @returns How the run ended, as written to `completion.json` — unless that
@@ -495,6 +573,7 @@ export async function runInCustody(launchOptions: LaunchOptions, options: Custod
       sha256: sha256(config.callToAction),
       kept: keepCallToAction ? file(custodyFiles.callToAction) : null,
     },
+    configuration: recordedConfiguration(options.configuration),
   };
 
   const emit = (event: CustodyEvent) => {
@@ -545,6 +624,25 @@ export async function runInCustody(launchOptions: LaunchOptions, options: Custod
       const note = `${custodyFiles.completion} was not written: ${messageOf(error)}`;
       return { ...completion, custodyError: completion.custodyError === null ? note : `${completion.custodyError}; ${note}` };
     }
+  };
+
+  // After the completion, on every route that writes one: the directory read
+  // as any later reader reads it, kept as observation.json and passed on.
+  // Nothing here changes the completion or what the caller makes of it.
+  const conclude = async (completion: CustodyCompletion): Promise<CustodyCompletion> => {
+    emit({ kind: 'completed', directory, completion });
+    let observation: CustodyReading | null = null;
+    let error: string | null = null;
+    try {
+      observation = await readCustody(directory);
+      await writeRecord(file(custodyFiles.observation), observation);
+    } catch (failure) {
+      error = observation === null
+        ? `the directory could not be read: ${messageOf(failure)}`
+        : `${custodyFiles.observation} was not written: ${messageOf(failure)}`;
+    }
+    emit({ kind: 'observed', directory, observation, file: error === null ? file(custodyFiles.observation) : null, error });
+    return completion;
   };
 
   const completionOf = (
@@ -609,8 +707,7 @@ export async function runInCustody(launchOptions: LaunchOptions, options: Custod
       stderr: null,
       journal: null,
     }));
-    emit({ kind: 'completed', directory, completion });
-    return completion;
+    return conclude(completion);
   }
 
   const { claude } = spawned;
@@ -705,6 +802,685 @@ export async function runInCustody(launchOptions: LaunchOptions, options: Custod
     stderr,
     journal,
   }));
-  emit({ kind: 'completed', directory, completion });
-  return completion;
+  return conclude(completion);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Reading a custody directory
+
+/** Version of the readings {@link readCustody} returns. It changes when what they mean changes. */
+export const custodyReadingVersion = 1;
+
+/** What a custody reading reports, and the limit of it. */
+export const custodyReadingScope = 'what one custody directory\'s files held when they were read; not whether anything is still running, how anything the run started ended, nor whether the task was done, delivered, received or accepted';
+
+/** Who a reading says wrote the spawned process's stdout. */
+export const stdoutProvenance = 'written by invocation.executable through its own descriptor; native Claude Code\'s output only where that executable is native Claude Code, which no record here establishes';
+
+/**
+ * What a custody directory's records say, by the combinations custody
+ * writes. Each is about records, never about a live process: nothing is
+ * signalled or looked up to read one.
+ *
+ * - `invocation-only`: `invocation.json` and no start or completion. The run
+ *   may have been spawned just before its runner died, since the start is
+ *   recorded after the spawn. Unknown, not failed and not done.
+ * - `start-only`: a start and no completion. Custody did not record an end;
+ *   its runner may have died before or after the spawned process ended.
+ *   Unknown, not failed and not done.
+ * - `not-started`: the completion says the run never started.
+ * - `exited`: the completion says the spawned process was seen to end without
+ *   custody stopping it.
+ * - `stopped`: the completion says custody stopped it, by a signal or the
+ *   caller's abort.
+ * - `custody-error`: the completion says custody failed at something of its
+ *   own, or stopped the run because it could not record its start. The
+ *   completion still says how the process ended, as far as it was seen.
+ * - `unknown`: the records that could be read are not a combination custody
+ *   writes, or disagree with each other: no custody record at all, say, or a
+ *   start and a completion naming different sessions.
+ * - `unreadable`: the directory could not be listed, or the record the state
+ *   rests on is there but could not be read as one this reader knows.
+ */
+export type CustodyState =
+  | 'invocation-only'
+  | 'start-only'
+  | 'not-started'
+  | 'exited'
+  | 'stopped'
+  | 'custody-error'
+  | 'unknown'
+  | 'unreadable';
+
+/** One file as a reading read it: whole, once, with when the read began and the digest of those bytes. */
+export interface CustodyFileRead {
+  path: string,
+  readAt: string,
+  bytes: number,
+  sha256: string,
+}
+
+/**
+ * One of custody's records: `absent`; `read`, a record of the format and
+ * version custody writes, with every field as that version writes it; or
+ * `unreadable`, with why, and what was read when something was.
+ */
+export type CustodyRecordReading<T> =
+  | { status: 'absent', path: string }
+  | { status: 'read', file: CustodyFileRead, record: T }
+  | { status: 'unreadable', path: string, file: CustodyFileRead | null, why: string };
+
+/** Size and digest, as a completion recorded them for a file. */
+export interface RecordedDigest {
+  bytes: number,
+  sha256: string,
+}
+
+/** One of the spawned process's outputs as read, against what the completion recorded of it. */
+export interface CustodyOutputReading {
+  path: string,
+
+  /** What was there when read; null when nothing was, or it could not be read (`why`). */
+  file: CustodyFileRead | null,
+  why: string | null,
+
+  /** What `completion.json` recorded of it; null without a completion, or when it recorded none. */
+  atCompletion: RecordedDigest | null,
+
+  /**
+   * Whether it now differs from `atCompletion`, gone included; null when
+   * there is nothing to compare or it could not be read. A fact about bytes:
+   * it does not say who wrote them, or that anything is still writing.
+   */
+  changedSinceCompletion: boolean | null,
+}
+
+/** The spawned process's stdout as read, with who wrote it and what it says as a result. */
+export interface CustodyStdoutReading extends CustodyOutputReading {
+  /** The launcher and executable `invocation.json` names; null when that record could not be read. */
+  writtenBy: { launcher: Launcher, executable: string } | null,
+
+  provenance: typeof stdoutProvenance,
+
+  /**
+   * The value of the last `--output-format` in the invocation's `extraArgs`,
+   * or null when they hold none; bare-claude passes none of its own. What
+   * was asked for, not what was written.
+   */
+  outputFormat: string | null,
+
+  /** The bytes read, read as a `--output-format json` result; null when nothing was read. See `ResultReading.file`. */
+  result: ResultReading | null,
+}
+
+/** The session journal as read, against what the completion recorded of it. */
+export interface CustodyJournalReading {
+  path: string,
+  sessionId: string,
+
+  /** Which record named it: the completion's journal, or, without one, the start. */
+  namedBy: 'completion.journal' | 'start.sessionJsonlPath',
+
+  file: CustodyFileRead | null,
+  why: string | null,
+
+  /** What `completion.json` recorded of it; null without a completion or a journal in it. */
+  atCompletion: { exists: boolean, bytes: number | null, sha256: string | null } | null,
+
+  /**
+   * Whether it now differs from `atCompletion`: written since, created
+   * since, or gone. Null when there is nothing to compare or it could not be
+   * read. Neither value says whether anything still writes it, nor that the
+   * session may be continued.
+   */
+  changedSinceCompletion: boolean | null,
+
+  reading: JournalReading | null,
+}
+
+/** What {@link readCustody} read of one custody directory. See {@link custodyReadingScope}. */
+export interface CustodyReading {
+  format: 'bare-claude/custody-reading',
+  version: typeof custodyReadingVersion,
+  scope: typeof custodyReadingScope,
+
+  /** The package that read it. */
+  reader: { name: string, version: string },
+
+  directory: string,
+
+  /** When the reading began. */
+  read: string,
+
+  state: CustodyState,
+
+  /** Why the state is what it is. */
+  basis: string,
+
+  /** Everything that could not be read or did not agree, in the order found. */
+  problems: string[],
+
+  /** The directory's entries, sorted, anyone else's files included; null when it could not be listed. */
+  entries: string[] | null,
+
+  invocation: CustodyRecordReading<CustodyInvocation>,
+  start: CustodyRecordReading<CustodyStart>,
+  completion: CustodyRecordReading<CustodyCompletion>,
+
+  stdout: CustodyStdoutReading,
+  stderr: CustodyOutputReading,
+
+  /** Null when no readable record names a journal. */
+  journal: CustodyJournalReading | null,
+
+  /**
+   * `joinResult` from `@agladysh/bare-claude/outcome` over the stdout result
+   * and the journal, when both were read. It correlates the result with one
+   * journal segment's recorded figures; it is not process identity, and the
+   * segment's records — a context-limit record among them — may be another
+   * process's. `stdout.result.process` stays the figures of the process that
+   * wrote the result, joined or not.
+   */
+  join: ResultJournalJoin | null,
+}
+
+type Guard<T> = (value: unknown) => value is T;
+
+/**
+ * A guard for each property of `T`, optional ones included, each guarding
+ * `undefined` too: mapped over `Required<T>`, not with `-?`, which would take
+ * `undefined` out of an optional property's type.
+ */
+type Shape<T> = { [K in keyof Required<T>]: Guard<T[K & keyof T]> };
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** An object whose every named property passes its guard; properties it does not name are allowed. */
+function shape<T extends object>(fields: Shape<T>): Guard<T> {
+  return (value: unknown): value is T => {
+    if (!isObject(value)) {
+      return false;
+    }
+    for (const key in fields) {
+      if (!fields[key](value[key])) {
+        return false;
+      }
+    }
+    return true;
+  };
+}
+
+function literal<const T extends string | number>(...values: T[]): Guard<T> {
+  return (value: unknown): value is T => values.some(known => known === value);
+}
+
+function nullable<T>(guard: Guard<T>): Guard<T | null> {
+  return (value: unknown): value is T | null => value === null || guard(value);
+}
+
+function optional<T>(guard: Guard<T>): Guard<T | undefined> {
+  return (value: unknown): value is T | undefined => value === undefined || guard(value);
+}
+
+function either<A, B>(a: Guard<A>, b: Guard<B>): Guard<A | B> {
+  return (value: unknown): value is A | B => a(value) || b(value);
+}
+
+function listOf<T>(guard: Guard<T>): Guard<T[]> {
+  return (value: unknown): value is T[] => Array.isArray(value) && value.every(item => guard(item));
+}
+
+const isString = (value: unknown): value is string => typeof value === 'string';
+const isBoolean = (value: unknown): value is boolean => typeof value === 'boolean';
+const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+const isCount = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+const isLauncher = (value: unknown): value is Launcher => typeof value === 'string' && Object.hasOwn(Launchers, value);
+const isSignalName = (value: unknown): value is NodeJS.Signals => typeof value === 'string' && Object.hasOwn(os.constants.signals, value);
+const isStopSignal = (value: unknown): value is StopSignal => stopSignals.some(known => known === value);
+const isSignalCode = either(isFiniteNumber, isSignalName);
+
+const isFileRecord = shape<ConfigFileRecord>({ path: isString, realPath: isString, bytes: isCount, sha256: isString });
+
+const isRecordedConfiguration = shape<RecordedConfiguration>({
+  scope: literal(configurationScope),
+  source: literal('located', 'file', 'files', 'none'),
+  files: listOf(isFileRecord),
+  use: nullable(listOf(isString)),
+  useFrom: nullable(literal('command-line', 'configuration')),
+});
+
+const isSession: Guard<CustodySession> = either(
+  shape<Extract<CustodySession, { kind: 'fresh' }>>({ kind: literal('fresh') }),
+  either(
+    shape<Extract<CustodySession, { kind: 'memory' }>>({ kind: literal('memory'), sessionId: isString }),
+    shape<Extract<CustodySession, { kind: 'file' }>>({
+      kind: literal('file'), sessionId: isString, sourcePath: isString, sourceSha256: nullable(isString),
+    }),
+  ),
+);
+
+const isCustodyInvocation = shape<CustodyInvocation>({
+  format: literal('bare-claude/run-invocation'),
+  version: literal(custodyVersion),
+  recorded: isString,
+  package: shape<CustodyInvocation['package']>({ name: isString, version: isString }),
+  launcher: isLauncher,
+  executable: isString,
+  model: nullable(isString),
+  effortLevel: isString,
+  permissionMode: isString,
+  tools: nullable(listOf(isString)),
+  disallowedTools: nullable(listOf(isString)),
+  addDirs: listOf(isString),
+  maxBudgetUsd: nullable(isFiniteNumber),
+  maxTokens: nullable(isFiniteNumber),
+  maxOutputLength: nullable(isFiniteNumber),
+  auth: literal('fallback', 'caller'),
+  linkAuth: isBoolean,
+  noProcessEnv: isBoolean,
+  extraArgs: listOf(isString),
+  cwd: isString,
+  claudeHome: isString,
+  session: isSession,
+  callToAction: shape<CustodyInvocation['callToAction']>({ bytes: isCount, sha256: isString, kept: nullable(isString) }),
+  configuration: optional(nullable(isRecordedConfiguration)),
+});
+
+const isCustodyIdentity: Guard<CustodyIdentity> = either(
+  shape<{ observed: ProcessIdentity }>({ observed: isProcessIdentity }),
+  shape<{ failed: string }>({ failed: isString }),
+);
+
+const isCustodyStart = shape<CustodyStart>({
+  format: literal('bare-claude/run-start'),
+  version: literal(custodyVersion),
+  recorded: isString,
+  pid: isCount,
+  processGroup: nullable(isCount),
+  sessionId: isString,
+  sessionJsonlPath: isString,
+  claudeHome: isString,
+  identity: nullable(isCustodyIdentity),
+});
+
+const isGroupState: Guard<ProcessGroupState> = literal('empty', 'occupied', 'not-permitted');
+const isGroupObservation = shape<ProcessGroupObservation>({ elapsedMs: isFiniteNumber, state: isGroupState });
+
+const isStopReport = shape<StopReport>({
+  signal: isSignalName,
+  escalated: isBoolean,
+  exitCode: nullable(isFiniteNumber),
+  signalCode: nullable(isSignalCode),
+  processGroup: nullable(isCount),
+  groupState: nullable(isGroupState),
+  groupObservations: listOf(isGroupObservation),
+});
+
+const isOutput = shape<CustodyOutput>({ file: isString, bytes: isCount, sha256: isString });
+
+const isCustodyCompletion = shape<CustodyCompletion>({
+  format: literal('bare-claude/run-completion'),
+  version: literal(custodyVersion),
+  scope: literal(completionScope),
+  ended: isString,
+  outcome: literal('not-started', 'exited', 'stopped'),
+  notStarted: nullable(isString),
+  exitStatus: nullable(isFiniteNumber),
+  exitCode: nullable(isFiniteNumber),
+  signalCode: nullable(isSignalCode),
+  stoppedBy: nullable(isStopSignal),
+  stop: nullable(shape<NonNullable<CustodyCompletion['stop']>>({
+    cause: either(isStopSignal, literal('cancelled', 'custody-error')),
+    report: nullable(isStopReport),
+  })),
+  processGroupAfter: nullable(shape<ProcessGroupReading>({ state: isGroupState, observations: listOf(isGroupObservation) })),
+  custodyError: nullable(isString),
+  stdout: nullable(isOutput),
+  stderr: nullable(isOutput),
+  journal: nullable(shape<CustodyJournal>({
+    path: isString, sessionId: isString, exists: isBoolean, bytes: nullable(isCount), sha256: nullable(isString),
+  })),
+});
+
+function digestOf(bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+/** One whole read of a file, or why there was none. */
+type WholeRead =
+  | { kind: 'read', file: CustodyFileRead, bytes: Uint8Array }
+  | { kind: 'absent' }
+  | { kind: 'failed', why: string };
+
+/** Reads `file` whole, once; the digest and anything read from it are of those bytes. */
+async function readWhole(file: string): Promise<WholeRead> {
+  const readAt = new Date().toISOString();
+  try {
+    const bytes = new Uint8Array(await fs.readFile(file));
+    return { kind: 'read', bytes, file: { path: file, readAt, bytes: bytes.length, sha256: digestOf(bytes) } };
+  } catch (error) {
+    return errorCode(error) === 'ENOENT' ? { kind: 'absent' } : { kind: 'failed', why: messageOf(error) };
+  }
+}
+
+async function readRecord<T>(file: string, format: string, guard: Guard<T>): Promise<CustodyRecordReading<T>> {
+  const got = await readWhole(file);
+  switch (got.kind) {
+    case 'absent':
+      return { status: 'absent', path: file };
+    case 'failed':
+      return { status: 'unreadable', path: file, file: null, why: got.why };
+    case 'read': {
+      const unreadable = (why: string): CustodyRecordReading<T> => ({ status: 'unreadable', path: file, file: got.file, why });
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(got.bytes));
+      } catch {
+        return unreadable('not one JSON document; possibly cut short');
+      }
+      if (!isObject(parsed) || parsed.format !== format) {
+        return unreadable(`not a ${format} record`);
+      }
+      if (parsed.version !== custodyVersion) {
+        return unreadable(`version ${JSON.stringify(parsed.version)}; this reader knows version ${custodyVersion}`);
+      }
+      if (!guard(parsed)) {
+        return unreadable(`a version ${custodyVersion} ${format} record whose fields are not as that version writes them`);
+      }
+      return { status: 'read', file: got.file, record: parsed };
+    }
+  }
+}
+
+function whyNot(got: WholeRead): string | null {
+  switch (got.kind) {
+    case 'read':
+      return null;
+    case 'absent':
+      return 'no file at that path';
+    case 'failed':
+      return got.why;
+  }
+}
+
+/** One output in the directory, read whole, against what the completion recorded of it. */
+async function readOutput(
+  file: string,
+  atCompletion: CustodyOutput | null,
+  problems: string[],
+): Promise<{ reading: CustodyOutputReading, bytes: Uint8Array | null }> {
+  const got = await readWhole(file);
+  if (got.kind === 'failed') {
+    problems.push(`${file}: ${got.why}`);
+  }
+  if (atCompletion !== null && atCompletion.file !== file) {
+    problems.push(`${custodyFiles.completion} recorded this output at ${atCompletion.file}; this reading read ${file}`);
+  }
+  const recorded = atCompletion === null ? null : { bytes: atCompletion.bytes, sha256: atCompletion.sha256 };
+  const now = got.kind === 'read' ? got.file : null;
+  return {
+    reading: {
+      path: file,
+      file: now,
+      why: whyNot(got),
+      atCompletion: recorded,
+      changedSinceCompletion: recorded === null || got.kind === 'failed'
+        ? null
+        : now === null || now.bytes !== recorded.bytes || now.sha256 !== recorded.sha256,
+    },
+    bytes: got.kind === 'read' ? got.bytes : null,
+  };
+}
+
+/** The value of the last `--output-format` in `args`, in either of its spellings. */
+function outputFormatIn(args: readonly string[]): string | null {
+  let format: string | null = null;
+  for (const [ index, arg ] of args.entries()) {
+    if (arg === '--output-format') {
+      format = args[index + 1] ?? null;
+    } else if (arg.startsWith('--output-format=')) {
+      format = arg.slice('--output-format='.length);
+    }
+  }
+  return format;
+}
+
+/** The journal the completion names, or else the start, read whole, against what the completion recorded. */
+async function readSessionJournal(
+  start: CustodyStart | null,
+  completion: CustodyCompletion | null,
+  problems: string[],
+): Promise<CustodyJournalReading | null> {
+  const recorded = completion?.journal ?? null;
+  let named: Pick<CustodyJournalReading, 'path' | 'sessionId' | 'namedBy'>;
+  if (recorded !== null) {
+    named = { path: recorded.path, sessionId: recorded.sessionId, namedBy: 'completion.journal' };
+  } else if (start !== null) {
+    named = { path: start.sessionJsonlPath, sessionId: start.sessionId, namedBy: 'start.sessionJsonlPath' };
+  } else {
+    return null;
+  }
+
+  const got = await readWhole(named.path);
+  if (got.kind === 'failed') {
+    problems.push(`${named.path}: ${got.why}`);
+  }
+  let changed: boolean | null = null;
+  if (recorded !== null && got.kind !== 'failed') {
+    changed = got.kind === 'read'
+      ? !recorded.exists || got.file.bytes !== recorded.bytes || got.file.sha256 !== recorded.sha256
+      : recorded.exists;
+  }
+  return {
+    ...named,
+    file: got.kind === 'read' ? got.file : null,
+    why: whyNot(got),
+    atCompletion: recorded === null ? null : { exists: recorded.exists, bytes: recorded.bytes, sha256: recorded.sha256 },
+    changedSinceCompletion: changed,
+    reading: got.kind === 'read' ? readJournal(got.bytes) : null,
+  };
+}
+
+/** Where readable records name the session or home differently, as one run's records never do. */
+function disagreements(
+  invocation: CustodyInvocation | null,
+  start: CustodyStart | null,
+  completion: CustodyCompletion | null,
+): string[] {
+  const found: string[] = [];
+  if (start !== null && completion !== null && completion.journal !== null && completion.journal.sessionId !== start.sessionId) {
+    found.push(`${custodyFiles.start} names session ${start.sessionId}, ${custodyFiles.completion} session ${completion.journal.sessionId}`);
+  }
+  if (invocation !== null && start !== null) {
+    if (invocation.session.kind !== 'fresh' && invocation.session.sessionId !== start.sessionId) {
+      found.push(`${custodyFiles.invocation} continues session ${invocation.session.sessionId}, ${custodyFiles.start} names session ${start.sessionId}`);
+    }
+    if (invocation.claudeHome !== start.claudeHome) {
+      found.push(`${custodyFiles.invocation} names the Claude home ${invocation.claudeHome}, ${custodyFiles.start} ${start.claudeHome}`);
+    }
+  }
+  return found;
+}
+
+/** How the spawned process ended, as a completion says. */
+function endOf(completion: CustodyCompletion): string {
+  if (completion.signalCode !== null) {
+    return `signal ${completion.signalCode}`;
+  }
+  return completion.exitCode === null ? 'had not been seen to end' : `exit code ${completion.exitCode}`;
+}
+
+/** A state and why. */
+interface StateBasis {
+  state: CustodyState,
+  basis: string,
+}
+
+/** The state the records rest on, and why; see {@link CustodyState}. */
+function stateOf(
+  invocation: CustodyRecordReading<CustodyInvocation>,
+  start: CustodyRecordReading<CustodyStart>,
+  completion: CustodyRecordReading<CustodyCompletion>,
+): StateBasis {
+  const unreadable = (what: string): StateBasis => ({
+    state: 'unreadable',
+    basis: `${what} is there but could not be read as a record this reader knows`,
+  });
+
+  const disagree = disagreements(
+    invocation.status === 'read' ? invocation.record : null,
+    start.status === 'read' ? start.record : null,
+    completion.status === 'read' ? completion.record : null,
+  );
+  if (disagree.length > 0) {
+    return { state: 'unknown', basis: `the records disagree, as one run's never do: ${disagree.join('; ')}` };
+  }
+
+  if (completion.status === 'unreadable') {
+    return unreadable(custodyFiles.completion);
+  }
+  if (completion.status === 'read') {
+    const done = completion.record;
+    if (done.custodyError !== null || done.stop?.cause === 'custody-error') {
+      return {
+        state: 'custody-error',
+        basis: `custody recorded a failure of its own (${done.custodyError ?? 'it stopped the run because it could not record its start'}); `
+          + `its completion says ${done.outcome}${done.outcome === 'not-started' ? '' : `, ${endOf(done)}`}`,
+      };
+    }
+    if (done.outcome === 'not-started') {
+      return start.status === 'absent'
+        ? { state: 'not-started', basis: `the completion says the run never started: ${done.notStarted ?? 'no reason was recorded'}` }
+        : { state: 'unknown', basis: `the completion says the run never started, but ${custodyFiles.start} is there` };
+    }
+    if (start.status === 'absent') {
+      return {
+        state: 'unknown',
+        basis: `the completion says the spawned process ${done.outcome}, but there is no ${custodyFiles.start}, which custody writes before it waits for an end`,
+      };
+    }
+    if (start.status === 'unreadable') {
+      return unreadable(custodyFiles.start);
+    }
+    return done.outcome === 'exited'
+      ? { state: 'exited', basis: `the completion says the spawned process was seen to end without custody stopping it: ${endOf(done)}` }
+      : { state: 'stopped', basis: `the completion says custody stopped it (${done.stop?.cause ?? 'no cause was recorded'}); it ${endOf(done)}` };
+  }
+
+  if (start.status === 'unreadable') {
+    return unreadable(custodyFiles.start);
+  }
+  if (start.status === 'read') {
+    if (invocation.status === 'unreadable') {
+      return unreadable(custodyFiles.invocation);
+    }
+    return invocation.status === 'absent'
+      ? { state: 'unknown', basis: `a start with no ${custodyFiles.invocation}, which custody writes before it spawns` }
+      : {
+        state: 'start-only',
+        basis: `a start and no completion: custody did not record an end. Its runner may have died before or after the spawned process ended, and nothing here says which`,
+      };
+  }
+
+  switch (invocation.status) {
+    case 'unreadable':
+      return unreadable(custodyFiles.invocation);
+    case 'read':
+      return {
+        state: 'invocation-only',
+        basis: 'an invocation and nothing after it: the run may have been spawned just before its runner died, since the start is recorded after the spawn',
+      };
+    case 'absent':
+      return {
+        state: 'unknown',
+        basis: `no ${custodyFiles.invocation}, start or completion: not a custody directory, or one whose runner ended before writing its invocation`,
+      };
+  }
+}
+
+/**
+ * Reads one custody directory as {@link runInCustody} keeps it: its records,
+ * the spawned process's stdout and stderr, and the session journal they
+ * name, each file read whole and once, every digest of the bytes read. The
+ * stdout is read as a result with `readResult`, the journal with
+ * `readJournal`, and the two joined with `joinResult`, all from
+ * `@agladysh/bare-claude/outcome`. Nothing is written, spawned or signalled,
+ * and no PID is looked up: a start-only directory stays unknown here however
+ * long ago it was written.
+ *
+ * Never throws: a directory that cannot be listed, or a record that cannot be
+ * read, is itself the finding, in `state`, `basis` and `problems`. What the
+ * stdout says is what `invocation.executable` wrote (see
+ * {@link stdoutProvenance}); whether that was native Claude Code is not
+ * established here, whatever its path or its output look like. The
+ * configuration files an invocation names are not read again: what the
+ * record says of them is what was stated when it was written.
+ * @param directory - The custody directory; relative to the process cwd
+ * @returns The reading, versioned by {@link custodyReadingVersion}
+ */
+export async function readCustody(directory: string): Promise<CustodyReading> {
+  const read = new Date().toISOString();
+  const absolute = path.resolve(directory);
+  const at = (name: string) => path.join(absolute, name);
+  const problems: string[] = [];
+
+  let entries: string[] | null = null;
+  let unlisted: string | null = null;
+  try {
+    entries = (await fs.readdir(absolute)).sort();
+  } catch (error) {
+    unlisted = messageOf(error);
+  }
+
+  const invocation = await readRecord(at(custodyFiles.invocation), 'bare-claude/run-invocation', isCustodyInvocation);
+  const start = await readRecord(at(custodyFiles.start), 'bare-claude/run-start', isCustodyStart);
+  const completion = await readRecord(at(custodyFiles.completion), 'bare-claude/run-completion', isCustodyCompletion);
+  for (const record of [ invocation, start, completion ]) {
+    if (record.status === 'unreadable') {
+      problems.push(`${record.path}: ${record.why}`);
+    }
+  }
+  const invoked = invocation.status === 'read' ? invocation.record : null;
+  const started = start.status === 'read' ? start.record : null;
+  const done = completion.status === 'read' ? completion.record : null;
+  problems.push(...disagreements(invoked, started, done));
+
+  const out = await readOutput(at(custodyFiles.stdout), done?.stdout ?? null, problems);
+  const stdout: CustodyStdoutReading = {
+    ...out.reading,
+    writtenBy: invoked === null ? null : { launcher: invoked.launcher, executable: invoked.executable },
+    provenance: stdoutProvenance,
+    outputFormat: invoked === null ? null : outputFormatIn(invoked.extraArgs),
+    result: out.bytes === null ? null : readResult(out.bytes),
+  };
+  const stderr = (await readOutput(at(custodyFiles.stderr), done?.stderr ?? null, problems)).reading;
+  const journal = await readSessionJournal(started, done, problems);
+  const join = stdout.result !== null && journal !== null && journal.reading !== null
+    ? joinResult(stdout.result, journal.reading)
+    : null;
+
+  const unlistable: StateBasis = { state: 'unreadable', basis: `the directory could not be listed: ${unlisted}` };
+  const { state, basis } = unlisted === null ? stateOf(invocation, start, completion) : unlistable;
+
+  return {
+    format: 'bare-claude/custody-reading',
+    version: custodyReadingVersion,
+    scope: custodyReadingScope,
+    reader: { name: pkg.name, version: pkg.version },
+    directory: absolute,
+    read,
+    state,
+    basis,
+    problems,
+    entries,
+    invocation,
+    start,
+    completion,
+    stdout,
+    stderr,
+    journal,
+    join,
+  };
 }
