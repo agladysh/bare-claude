@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **Waiting, stopping and cleaning up.** Documentation, TSDoc and `--help` text only; no behaviour
+  or API changes.
+  - A new README section keeps four things apart for a caller writing a supervisor. Waiting is the
+    caller's. Execution is never ended by Bare Claude on elapsed time or a count; it stops a run
+    itself only when its own supervision fails. A stop is an intervention, recorded differently by
+    route: a signal to the CLI, a library `StopReport`, a custody abort (`cancelled`) or custody's
+    own `custody-error`. Cleanup reached while the run is still going is a stop. The section also
+    says what a stop on a chosen duration amounts to for a task whose length is not known in
+    advance.
+  - *Ending a wait without stopping the run* describes what the library and CLI actually support.
+    There is no detach. The process holding the supervisor keeps the run and returns a handle. Its
+    example returns the handle only once custody has admitted the run, so it never reads an earlier
+    run's directory, and it promises a completion record only where custody has written one. For
+    the CLI, it separates the `bare-claude` process that supervises the run from the program that
+    started it, and a stdout reader that went away (tested) from an open pipe nobody reads (not
+    examined).
+  - *Limits Claude Code applies* says what `maxBudgetUsd`, `maxTokens`, `maxOutputLength` and a
+    forwarded `--max-turns` make Bare Claude pass or set, and why they are not completion
+    conditions. They remain ordinary options.
+  - **Withdrawn: unmeasured effects of those limits.** "Errors the turn rather than truncating it",
+    said of `maxTokens` in the README, the `LaunchOptions` TSDoc and `--help`, and "stop the run once
+    it has spent this much", said of `--max-budget-usd` in `--help` and as a "hard spend ceiling" in
+    TSDoc, were never measured here. Each place now says what Bare Claude passes or sets, and that
+    Claude Code's behaviour at the limit is unmeasured.
+  - *Stopping a run*: the supervisor passage now concerns a supervisor that has decided to stop. Its
+    `timeout -k 20 60` worked case is replaced by a stop on decision, with the same allowance of
+    `--stop-grace-ms` plus 6 seconds, 16 seconds with the default grace.
+  - `spawnClaude`'s supervision example now says that its `finish()` is cleanup after the exit and a
+    stop before it.
+
 ## [v0.14.0] - 2026-10-16
 
 ### Added

@@ -183,9 +183,11 @@ Options:
 - `--tools [list]`: comma-separated tools to allow; the empty string allows none
 - `--disallowed-tools [list]`: comma-separated tools to deny; `*` denies all
 - `--add-dir [dir]`: allow reads outside the working directory, may be included several times
-- `--max-budget-usd [n]`: end the run once it has spent this much
-- `--max-tokens [n]`: cap model output. Note this *errors* the turn rather than truncating it
-- `--max-output-length [n]`: cap tool output going into context
+- `--max-budget-usd [n]`: passed to `claude` as its own `--max-budget-usd` (see
+  [Limits Claude Code applies](#limits-claude-code-applies))
+- `--max-tokens [n]`: sets `CLAUDE_CODE_MAX_OUTPUT_TOKENS` for the run
+- `--max-output-length [n]`: sets `BASH_MAX_OUTPUT_LENGTH`, `TASK_MAX_OUTPUT_LENGTH` and
+  `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS` for the run
 - `--claude-path [path]`: Claude Code executable to run (default: `claude` on `PATH`)
 - `--token-file [path]`: file holding the OAuth token, read when the environment has none
   (default: `$BARE_CLAUDE_TOKEN_FILE`, then `~/.config/bare-claude/oauth`; see
@@ -229,7 +231,187 @@ a completed one. See [Stopping a run](#stopping-a-run).
 A refusal made before `claude` is spawned — an invalid configuration, a contradictory option, a
 session seed that cannot be published — exits 1 with a one-line `bare-claude:` message on stderr.
 
+### Waiting, stopping and cleaning up
+
+A supervisor deals with four different things, and Bare Claude keeps them apart:
+
+- **Waiting** is the caller's: blocking on `bare-claude`'s exit, on `subprocess.exited`, or on the
+  promise `runInCustody` returns. A caller can stop waiting without touching the run (see
+  [Ending a wait without stopping the run](#ending-a-wait-without-stopping-the-run)).
+- **Execution** goes on until the run ends or is stopped. It is supervised while the process that
+  holds its supervisor is alive: under the CLI that is the `bare-claude` process, not whatever
+  started it; in the library, the caller's own process. Bare Claude starts no timer and counts no
+  turns, tokens, spend or output, so nothing in it ends a run on elapsed time or on a count. It
+  stops a run itself only when its own supervision fails: custody that cannot record a run's start
+  stops it (`custody-error`), and cleanup reached after an error stops a run still going. Its
+  bounded waits — `--stop-grace-ms`, the waits after SIGKILL, the EPERM recheck, the wait for the
+  child's last output — all begin only once a stop has begun or the run has ended. Limits Claude
+  Code itself applies, when a caller passes them, are [described below](#limits-claude-code-applies).
+- **A stop** is an intervention, carried out as [Stopping a run](#stopping-a-run) describes. What
+  records it depends on the route:
+  - SIGTERM, SIGINT or SIGHUP to the CLI: a `Claude stop:` line, and exit 128+n; under custody also
+    a completion `stopped` whose cause is the signal.
+  - In the library, the same signals to a process holding a supervisor with the default `signals`
+    and `source`, or `finish()` while the run is going: the `StopReport` `finish()` resolves with,
+    and `stoppedBy`, which names a signal and is `null` for a `finish()` stop. What is kept of
+    either is the caller's to record.
+  - An abort of `runInCustody`'s `signal`: a completion `stopped`, cause `cancelled`.
+  - Custody's own `custody-error` stop: a completion saying so.
+
+  A stop's reason belongs to whoever started it. Except for `custody-error`, where it is custody's
+  own, no record here holds the reason: custody records the signal or `cancelled`, not why.
+- **Cleanup** comes after the run has been seen to end: `finish()` with nothing left to stop, then
+  `dispose()`, which removes a temporary home; under custody, the completion and observation
+  written. Cleanup reached while the run is still going is a stop. The CLI and the library examples
+  do that on purpose, so that a failure in the supervisor never leaves a detached run with nobody to
+  stop it. The CLI then exits 1 with the error, not 128+n.
+
+Reading a run's records while it goes on — `--outcome-custody`, its journal, the figures a brief
+reports — is observation. It changes nothing, and a figure there is not by itself a reason to stop.
+
+A stop because a chosen duration has passed makes that duration the reason: `timeout D bare-claude
+…` does that, and so does a wait with a timeout followed by a stop. How long a model's task needs is
+not known before it is done, so a duration picked as a forecast of it ends a run that may have been
+about to finish. What the turn in flight had not yet written is lost; the record says the run was
+stopped, and nothing in it says how near the work was to done. A deadline someone actually has, or
+a constraint outside the run, is a different reason, and the caller's to weigh.
+
+#### Ending a wait without stopping the run
+
+There is no detach: no daemon takes a run over, and a supervised run cannot be handed to another
+process (`release()` is refused once a run is attached). What can end without the run is the wait.
+A caller that needs its attention back keeps the process holding the supervisor alive and returns a
+handle to the run. While that process lives, custody records the run's end when it sees it, unless
+that write fails. A living holder is not evidence that the run is alive or making progress.
+
+In the library, the holder is the process that called `runInCustody`. The example below returns a
+handle only once custody has admitted the run, so the handle never reads a directory left by an
+earlier run: `runInCustody` refuses an existing directory, and a reading taken before that refusal
+would show the earlier run's records.
+
+```typescript
+import { readCustody, runInCustody, type CustodyCompletion } from '@agladysh/bare-claude/custody';
+
+interface HeldRun {
+  directory: string,
+  /**
+   * Settles once custody has recorded the run's end, or failed to and says so in `custodyError`,
+   * and has written its observation. A run that never started settles it as `not-started`.
+   */
+  completion: Promise<CustodyCompletion>,
+  /** An intervention: stops the run, recorded as `cancelled`. Record why yourself. */
+  stop(): void,
+}
+
+/** Resolves once the run is admitted; rejects, with no handle, when it is refused. */
+async function hold(directory: string, callToAction: string): Promise<HeldRun> {
+  const controller = new AbortController();
+  const started = Promise.withResolvers<void>();
+  const completion = runInCustody({ callToAction }, {
+    directory,
+    graceMs: 10_000,
+    signal: controller.signal,
+    onEvent: event => {
+      if (event.kind === 'started') {
+        started.resolve();
+      }
+    },
+  });
+  // A refusal, an existing directory among them, rejects here. A run that never started, or whose
+  // start custody could not record, settles `completion` instead of emitting `started`.
+  await Promise.race([ started.promise, completion ]);
+  return { directory, completion, stop: () => controller.abort() };
+}
+
+const run = await hold('/work/runs/0042', 'Review the change described in NOTES.md');
+// The holder goes on with other work, and the run goes on with it.
+const reading = await readCustody(run.directory); // `start-only` until the completion is written
+// …
+const completion = await run.completion;          // waiting again, when the holder chooses to
+```
+
+Read in order, a custody directory goes from `unreadable` (not made yet) to `unknown` (made, no
+records), `invocation-only`, `start-only` and then its end state. Only a reading taken before
+admission sees the first three.
+
+What holding asks of the holder:
+
+- **It stays alive until `completion` settles.** It exits first through `process.exit()`, an
+  uncaught error, a crash or SIGKILL. Then nothing records the run's end: the directory reads
+  `start-only`, or `invocation-only` or `unknown` if it went earlier, and the run, in a process group
+  of its own, may go on with nobody supervising it. Bare Claude does nothing to keep a holder alive
+  against these, or to say what becomes of the run after it.
+- **Signals to it are stops.** With the default `signals` and `source`, each run in custody installs
+  a supervisor's SIGTERM, SIGINT and SIGHUP handlers in the holder, so one such signal stops every
+  run it holds. While a run is held, those signals do not end the holder; it must end itself.
+  SIGKILL ends the holder at once, with the consequences [listed below](#stopping-a-run) for
+  `bare-claude` itself.
+- **`stop()` is the intervention.** An abort while custody is still preparing still spawns the run,
+  and then stops it at once, recorded as `cancelled`. `AbortSignal.timeout(ms)` passed as `signal`
+  is a stop on elapsed time, as above.
+
+`spawnClaude` under `superviseSignals` works the same way: the handle is the returned run with its
+supervisor, and `subprocess.exited` is the wait. The example under [API](#api) calls `finish()` in a
+`finally`, so leaving that scope while the run goes on stops it. A caller that has to stop waiting
+keeps both in the holding process, and calls `finish()` and `dispose()` once `exited` has settled,
+or to stop the run.
+
+From a program driving the CLI, supervision lives in the `bare-claude --custody DIR` process the
+program spawned, not in the program. The program's handle is that child as it spawned it: the
+runtime's process object, not a PID written down for later.
+
+- **The run stays supervised for as long as `bare-claude` lives**, whether or not the program waits
+  on it. Ending the wait means not waiting on the child, and not signalling it.
+- **The program keeps the child object for as long as it wants the exit status, or to stop the run
+  through it.** A program that goes loses both. The run's end is then known only from
+  `completion.json`. `start.json` names the spawned `claude`'s PID and group, not `bare-claude`'s,
+  so a later stop is a signal to that group, recorded as `exited` by someone else's signal, not as
+  `stopped`.
+- **Its departure must not signal `bare-claude`.** SIGHUP, SIGINT or SIGTERM reaching it stop the
+  run, and `bare-claude` is in the program's process group unless spawned otherwise: a hangup or a
+  signal to that group, such as a terminal closing or a Ctrl-C, reaches it. A command merely put in
+  a shell's background is no different; whether a hangup reaches it is the shell's business.
+- **Its output.** When stdout's reader goes away, closing the pipe, the event stream ends and the
+  run goes on. That case is tested; an open pipe nobody reads, and SIGPIPE at its default
+  disposition, are not. stderr has no such handling, so give it a file.
+- **Observation.** `bare-claude --outcome-custody DIR --brief` shows what the records say at any
+  time: `start-only` while no completion is written. That is a reading of the records, not of a
+  live process.
+- **To stop the run**, signal that child as [Stopping a run](#stopping-a-run) describes. When it
+  ends, `completion.json` records how, unless custody says it could not write it.
+
+#### Limits Claude Code applies
+
+Bare Claude passes these to Claude Code when a caller sets them, and sets none by default. They are
+Claude Code's own controls, and legitimate options for a general wrapper to carry: a spending limit
+someone actually has, a constraint a person directed, or a protocol check specified as one turn is
+what they serve. They are not completion conditions. How much of each quantity the work needs is
+not known before it is done, and reaching a limit does not mean the work is finished.
+
+What Bare Claude does with each is below. What Claude Code does when a run reaches one has not been
+measured here.
+
+- `maxBudgetUsd` (`--max-budget-usd`) is passed to `claude` as its own `--max-budget-usd`, a limit
+  in US dollars by Claude Code's own cost figures.
+- `maxTokens` (`--max-tokens`) sets `CLAUDE_CODE_MAX_OUTPUT_TOKENS` in the run's settings `env`, the
+  variable Claude Code reads for the tokens the model may generate in one response.
+- `maxOutputLength` (`--max-output-length`) sets `BASH_MAX_OUTPUT_LENGTH`, `TASK_MAX_OUTPUT_LENGTH`
+  and `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS` there, all to the same number. As their names say,
+  they concern command output, task output and file reads going into context: what the model
+  reads, not what it writes. Their units, what Claude Code does with the excess, and what the model
+  is told of it have not been examined here. Nothing here ensures that a model treats a shortened
+  read as incomplete.
+- `--max-turns N`, forwarded with `--claude-arg` or `extraArgs`, is Claude Code's own option for a
+  limit on turns. Bare Claude does not interpret it.
+
+A limit chosen as a forecast of how much the work needs fails as a chosen duration does: the run
+ends however Claude Code ends it at the limit, or works from less than there was to read, and
+nothing about the work said it was done. Custody records the first three in `invocation.json`, and
+`extraArgs` as given, so whoever receives the run can see which were in place.
+
 ### Stopping a run
+
+What follows is how a stop is carried out once someone has decided on one.
 
 `bare-claude` spawns `claude` (or what `--claude-path` names) in a process group of its own, on
 macOS and Linux: Bun calls `setsid()` in the child. Whatever that process starts — the native
@@ -260,15 +442,25 @@ Claude stop: SIGTERM; process group 41321 empty
 Claude home kept at /work/runs/0042/claude-home
 ```
 
-**What this asks of a supervisor.** Because `claude` is no longer in `bare-claude`'s own process
-group, a kill aimed at that group — `timeout -k`'s final SIGKILL, a job-control kill of a shell
-job — ends `bare-claude` alone, and the run goes on unreported. A supervisor must do one of:
+**What this asks of a supervisor that stops a run.** Because `claude` is no longer in
+`bare-claude`'s own process group, a kill aimed at that group — `timeout -k`'s final SIGKILL, a
+job-control kill of a shell job — ends `bare-claude` alone, and the run goes on unreported. A
+supervisor that has decided to stop a run must do one of:
 
 - signal `bare-claude` itself, and allow it at least `--stop-grace-ms` plus 6 seconds — the two
   bounded 2-second waits after SIGKILL, up to a second reading again a group that answers EPERM,
   and a second for the last of the child's output — before
-  any kill of its own, plus whatever removing a temporary home takes. With the default grace,
-  `timeout -k 20 60 bare-claude …` leaves room; `timeout -k 5` does not.
+  any kill of its own, plus whatever removing a temporary home takes. With the default grace that
+  is at least 16 seconds:
+
+  ```bash
+  kill -TERM "$child"  # the supervisor's own bare-claude child; why it stops is the supervisor's
+  # Any SIGKILL of the supervisor's own comes no sooner than --stop-grace-ms + 6 s after this:
+  # 16 s with the default grace, more while a temporary home is being removed.
+  ```
+
+  A kill-after such as `timeout -k K` is the same allowance: with the default grace, `-k 20`
+  leaves room and `-k 5` does not.
 - or signal the reported `Claude process group` directly.
 
 `Claude stop:` says whether SIGKILL was needed and what was left in the group: `empty`,
@@ -1466,11 +1658,16 @@ Optional:
   Defaults to `null`.
 - `addDirs`: Extra directories the run may read (`--add-dir`). A headless run cannot read outside
   its working directory without these. Defaults to `[]`.
-- `maxBudgetUsd`: Spend ceiling for the run in US dollars. Defaults to `null`.
-- `maxTokens`: Cap on generated tokens (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`). Distinct from
-  `maxOutputLength`, which caps *tool* output going into context. Exceeding it errors the turn
-  rather than truncating it. Defaults to `null`.
-- `maxOutputLength`: Maximum output length for various Claude components. Defaults to `null` (default).
+- `maxBudgetUsd`: passed to `claude` as `--max-budget-usd`, Claude Code's own limit in US dollars.
+  Defaults to `null`, which passes nothing. What Claude Code does when a run reaches a limit is not
+  measured here: see [Limits Claude Code applies](#limits-claude-code-applies) for this and the next
+  two.
+- `maxTokens`: sets `CLAUDE_CODE_MAX_OUTPUT_TOKENS` in the settings `env`, the variable Claude Code
+  reads for the tokens generated in one response. Distinct from `maxOutputLength`, which concerns
+  *tool* output going into context. Defaults to `null`, which sets nothing.
+- `maxOutputLength`: one number for `BASH_MAX_OUTPUT_LENGTH`, `TASK_MAX_OUTPUT_LENGTH` and
+  `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS` in the settings `env`. Defaults to `null`, which sets
+  none of them.
 - `extraEnv`: Additional environment variables to set for the Claude process. Defaults to `{}`.
 - `extraArgs`: Additional command-line arguments to pass to Claude. Defaults to `[]`.
 - `extraSettings`: Additional settings, deep-merged into Claude's configuration last, so they
@@ -1531,6 +1728,11 @@ try {
   await claude.dispose();
 }
 ```
+
+Here `finish()` is cleanup when `exited` has settled, and a stop when it has not: an exception
+before then stops the run rather than leaving it unsupervised. A caller that must be able to stop
+waiting without stopping the run keeps `claude` and `supervisor` in an owner that outlives the wait
+(see [Ending a wait without stopping the run](#ending-a-wait-without-stopping-the-run)).
 
 `superviseSignals(options)` takes `graceMs`, and optionally `signals` (default all three),
 `onEvent` — told of each `SupervisorEvent`: `held`, `stopping` (with its `cause`, a signal or
