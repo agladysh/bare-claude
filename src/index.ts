@@ -419,21 +419,26 @@ export interface LaunchOptions {
   addDirs?: string[],
 
   /**
-   * Hard spend ceiling for the run in US dollars, as passed to
-   * `--max-budget-usd`. Defaults to null (no ceiling).
+   * Passed to `claude` as `--max-budget-usd`, Claude Code's own limit in US
+   * dollars. What Claude Code does when a run reaches it is not measured
+   * here. Defaults to null, which passes nothing.
    */
   maxBudgetUsd?: null | number,
 
   /**
-   * Maximum tokens the model may generate, via `CLAUDE_CODE_MAX_OUTPUT_TOKENS`.
-   * Distinct from `maxOutputLength`, which caps *tool* output going into
-   * context. Note that exceeding this errors the turn rather than truncating
-   * it. Defaults to null (default limit).
+   * Set as `CLAUDE_CODE_MAX_OUTPUT_TOKENS` in the settings `env`, the variable
+   * Claude Code reads for the tokens the model may generate in one response.
+   * Distinct from `maxOutputLength`, which concerns *tool* output going into
+   * context. What Claude Code does when a response reaches it is not measured
+   * here. Defaults to null, which sets nothing.
    */
   maxTokens?: null | number,
 
   /**
-   * Maximum output length for various Claude components. Defaults to null (default limit).
+   * Set as `BASH_MAX_OUTPUT_LENGTH`, `TASK_MAX_OUTPUT_LENGTH` and
+   * `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS` in the settings `env`, all to
+   * this one number. What Claude Code does with output beyond them is not
+   * examined here. Defaults to null, which sets none of them.
    */
   maxOutputLength?: null | number,
 
