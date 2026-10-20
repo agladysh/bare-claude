@@ -1605,7 +1605,9 @@ Optional:
   Contains `{ type: 'appendString' | 'setString' | 'appendFile' | 'setFile', value: string }`.
 - `noInstructionFiles`: Whether to disable instruction files. Defaults to `true`.
 - `noMemory`: Whether to disable memory. Defaults to `true`.
-- `noSkills`: Whether to disable skills. Defaults to `true`.
+- `noSkills`: Whether to disable skills. Defaults to `true`. Passes `--disable-slash-commands` and
+  writes `syncClaudeAiSkills: false`, so a run signed in with a Claude account does not download the
+  skills enabled on claude.ai into its home.
 - `noHooks`: Whether to disable hooks. Defaults to `true`.
 - `noPlugins`: Whether to disable plugins. Defaults to `true`.
 - `noMcp`: Whether to disable MCP. Defaults to `true`.
