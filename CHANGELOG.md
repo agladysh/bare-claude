@@ -34,6 +34,15 @@
   - `spawnClaude`'s supervision example now says that its `finish()` is cleanup after the exit and a
     stop before it.
 
+### Fixed
+
+- **`noSkills` left claude.ai skill sync running.** `--disable-slash-commands` hides skills from a
+  run, but a run signed in with a Claude account still downloaded every skill enabled on claude.ai
+  into its home's `skills/synced/`. `noSkills` now also writes `syncClaudeAiSkills: false`, the only
+  switch Claude Code honours for this (read from claude 2.1.304). `extraSettings` still merges over
+  it. The key is absent from schemastore's settings schema; the `buildSettings` TSDoc records it as
+  the one exception.
+
 ## [v0.14.0] - 2026-10-16
 
 ### Added

@@ -722,7 +722,10 @@ export function buildEnv(
  * Pure: no filesystem, no clock, no environment. Claude Code ignores unknown
  * settings keys silently, so nesting matters more than it looks — every key
  * here is present in `https://json.schemastore.org/claude-code-settings.json`,
- * and that property must hold for anything added later.
+ * and that property must hold for anything added later. The one exception is
+ * `syncClaudeAiSkills`: absent from schemastore on 2026-10-20, but present in
+ * the settings schema of the installed claude 2.1.291 through 2.1.304, and no
+ * other route reaches the same switch.
  *
  * `extraSettings` is deep-merged last and therefore wins over everything
  * below, including the `env` block.
@@ -779,6 +782,14 @@ export function buildSettings(config: LaunchConfig): JsonObject {
   if (config.noSkills) {
     env.CLAUDE_CODE_DISABLE_CRON = '1';
     env.CLAUDE_CODE_DISABLE_POLICY_SKILLS = '1';
+    // Read from claude 2.1.304 on 2026-10-20. `--disable-slash-commands` hides
+    // skills from the run but does not gate claude.ai skill sync: a run signed
+    // in with a Claude account still downloads every skill enabled on claude.ai
+    // into `<home>/skills/synced/` at startup and re-syncs while it runs, so
+    // each retained ephemeral home kept its own copy. Only a settings tier
+    // holding `syncClaudeAiSkills: false` vetoes the sync (this file is the user
+    // tier); no environment variable turns it off, and only false is honored.
+    settings.syncClaudeAiSkills = false;
   }
 
   if (config.noHooks) {

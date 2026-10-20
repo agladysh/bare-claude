@@ -415,6 +415,7 @@ describe('buildSettings', () => {
         defaultMode: 'auto',
         disableBypassPermissionsMode: 'disable',
       },
+      syncClaudeAiSkills: false,
       disableAllHooks: true,
       enabledPlugins: {},
       enableAllProjectMcpServers: false,
@@ -495,6 +496,24 @@ describe('buildSettings', () => {
     const off = settingsEnv(buildSettings(cfg({ noSkills: false })));
     expect(off.CLAUDE_CODE_DISABLE_CRON).toBeUndefined();
     expect(off.CLAUDE_CODE_DISABLE_POLICY_SKILLS).toBeUndefined();
+  });
+
+  test('noSkills turns off claude.ai skill sync and composes with caller settings', () => {
+    expect(buildSettings(cfg()).syncClaudeAiSkills).toBe(false);
+    expect(buildSettings(cfg({ noSkills: false })).syncClaudeAiSkills).toBeUndefined();
+    // A caller that already writes the key, alongside its own settings, keeps all of them.
+    const grants = { permissions: { allow: [ 'Read' ] }, env: { ROUTINE: '1' } };
+    const both = buildSettings(cfg({ extraSettings: { ...grants, bashEditDiffEnabled: false, syncClaudeAiSkills: false } }));
+    expect(both.syncClaudeAiSkills).toBe(false);
+    expect(both.bashEditDiffEnabled).toBe(false);
+    expect(both.permissions).toEqual({ defaultMode: 'auto', disableBypassPermissionsMode: 'disable', allow: [ 'Read' ] });
+    expect(settingsEnv(both).ROUTINE).toBe('1');
+    expect(settingsEnv(both).CLAUDE_CODE_DISABLE_POLICY_SKILLS).toBe('1');
+    // Opting out of noSkills omits only this key; a caller's own false still stands.
+    const optedOut = buildSettings(cfg({ noSkills: false, extraSettings: { syncClaudeAiSkills: false } }));
+    expect(optedOut.syncClaudeAiSkills).toBe(false);
+    // The slash-command switch is unchanged; the two act on different things.
+    expect(buildArgv(cfg(), SID)).toContain('--disable-slash-commands');
   });
 
   test('noHooks sets disableAllHooks', () => {
