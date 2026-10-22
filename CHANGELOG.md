@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [v0.15.1] - 2026-10-22
+
+### Changed
+
+- Public contribution instructions require confidential-client scrubbing across
+  published content and Git metadata, and preserve general utility for all callers.
+- Session reports omit confidential client integration details. Runtime behavior
+  is unchanged from 0.15.0.
+
 ## [v0.15.0] - 2026-10-22
 
 ### Fixed
