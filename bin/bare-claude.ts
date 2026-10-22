@@ -73,9 +73,11 @@ function displayHelp() {
     '                         File holding the OAuth token, used when the environment',
     '                         has none (default: $BARE_CLAUDE_TOKEN_FILE, then',
     '                         ~/.config/bare-claude/oauth)',
+    '      --native-store <path>  Enrolled native store (requires --auth native-store)',
     '      --auth <mode>      fallback (default): the environment\'s credential, else',
     '                         the token file; caller: the caller\'s environment or',
     '                         launcher alone, with no token file and no credential link',
+    '                         native-store: Claude Code owns credentials and refresh',
     '      --claude-home <dir>',
     '                         Claude home for the run, created if missing and kept',
     '                         whatever the outcome (default: a temporary directory)',
@@ -115,7 +117,7 @@ function displayHelp() {
     'SIGKILL to bare-claude itself cannot be forwarded: signal the process group it',
     'reports instead. Under custody, a run that never started exits 1.',
     '',
-    'A bare run does not inherit the ambient login session: set CLAUDE_CODE_OAUTH_TOKEN',
+    'A bare run needs explicit auth: select an enrolled native store, set CLAUDE_CODE_OAUTH_TOKEN',
     'from `claude setup-token`, or write the bare token to ~/.config/bare-claude/oauth',
     '(chmod 600). Put bare-claude on PATH from a checkout with',
     '`bun run install:user`; `bun run install:status` and `bun run install:uninstall`',
@@ -369,6 +371,9 @@ async function loadPreset(): Promise<Startup> {
       'claude-path': {
         type: 'string',
       },
+      'native-store': {
+        type: 'string',
+      },
       'token-file': {
         type: 'string',
       },
@@ -551,6 +556,7 @@ async function loadPreset(): Promise<Startup> {
   set('launcher', parseLauncher(values.launcher));
   set('claudePath', values['claude-path']);
   set('tokenFile', values['token-file']);
+  set('nativeStorePath', values['native-store']);
   set('auth', parseAuth(values.auth));
   set('ephemeralClaudeHomePath', values['claude-home']);
   set('model', values.model);

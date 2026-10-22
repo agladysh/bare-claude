@@ -239,6 +239,10 @@ async function checkAuth(
 
   // A warning, not ok: the caller's route may well work, but nothing here
   // has looked at it, and a variable's mere presence would prove nothing.
+  if (auth === 'native-store') {
+    return { name, status: 'warn',
+      detail: 'native-store selected: login and refresh are not inspected', hint: [] };
+  }
   if (auth === 'caller') {
     return {
       name,
