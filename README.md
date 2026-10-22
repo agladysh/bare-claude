@@ -96,6 +96,8 @@ await spawnClaude({
 CLI: `bare-claude --auth native-store --native-store /absolute/path/to/enrolled-store -- 'Explain this project'`.
 Presets use `auth: native-store` and `nativeStorePath: /absolute/path/to/enrolled-store`.
 The path must be absolute; Bare Claude neither creates it nor checks its layout.
+An explicit run home and store must be separate paths, neither inside the other.
+This checks normalized paths, not symlink confinement.
 Claude Code receives `CLAUDE_SECURESTORAGE_CONFIG_DIR=STORE` and
 `ANTHROPIC_CONFIG_DIR=STORE/anthropic-profile`. These override corresponding inherited
 or explicit environment paths. `CLAUDE_CONFIG_DIR` still names the isolated run home;

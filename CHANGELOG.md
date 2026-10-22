@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Doctor reports native-store environment conflicts as a refused invocation instead
+  of throwing. Overlapping explicit native-store/run-home paths are refused.
+- The SIGHUP fixture waits for initial journal creation before testing retained
+  journal behavior; PID publication alone did not establish that precondition.
+
 ### Added
 
 - Explicit `auth: native-store` with absolute `nativeStorePath` (`--native-store`)
