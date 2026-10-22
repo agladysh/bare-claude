@@ -276,11 +276,16 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('stop
     // A runner cannot reach this child through the CLI's own process group,
     // so the group line must be there whether or not the home is kept.
     const { cwd, claudePid } = await setUp();
-    const run = startCli([ '--no-config', '--quiet', 'hello' ], cwd, { ...writing, FAKE_CLAUDE_PID_FILE: claudePid });
+    const ready = path.join(cwd, 'journal-ready');
+    const run = startCli([ '--no-config', '--quiet', 'hello' ], cwd,
+      { ...writing, FAKE_CLAUDE_PID_FILE: claudePid, FAKE_CLAUDE_READY_FILE: ready });
     const claude = await pidFrom(claudePid);
     expect(await eventually(() => run.stderr().includes(`Claude process group ${claude}\n`), 10_000)).toBe(true);
     expect(run.stderr()).not.toContain('Claude session journal at');
 
+    expect(await eventually(() => Bun.file(ready).exists(), 10_000)).toBe(true);
+    const createdJournal = await Bun.file(ready).text();
+    expect(await Bun.file(createdJournal).exists()).toBe(true);
     run.cli.kill('SIGHUP');
     expect(await run.cli.exited).toBe(129);
 
@@ -289,7 +294,9 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('stop
     const home = run.stderr().match(/^Claude home kept at (.+)$/m)?.[1] ?? '';
     expect(path.isAbsolute(home) && path.basename(home).startsWith('bare-claude-home-')).toBe(true);
     dirs.push(home);
+    expect(await eventually(() => run.stderr().includes('Claude session journal at '), 2_000)).toBe(true);
     const journal = run.stderr().match(/^Claude session journal at (.+)$/m)?.[1] ?? '';
+    expect(journal).toBe(createdJournal);
     expect(journal.startsWith(path.join(home, 'projects'))).toBe(true);
     const [ before, after ] = await sizesApart(journal, 300);
     expect(after).toBe(before);

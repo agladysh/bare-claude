@@ -47,6 +47,7 @@
  *   FAKE_CLAUDE_APPEND_EVERY_MS - while sleeping, append one record to the
  *                                session file this often, so a journal that
  *                                stops growing shows its writer has stopped.
+ *   FAKE_CLAUDE_READY_FILE     - path written after initial journal records exist; holds the journal path.
  *   FAKE_CLAUDE_PID_FILE       - path this process writes its PID to, once
  *                                its signal handling is in place.
  *   FAKE_CLAUDE_IGNORE_SIGTERM - `'1'` ignores SIGTERM, as a process that
@@ -129,6 +130,11 @@ if (process.env.FAKE_CLAUDE_WRITE_SESSION !== '0') {
   for (const record of records) {
     await fs.appendFile(sessionPath, `${JSON.stringify(record)}\n`);
   }
+}
+
+const readyFile = process.env.FAKE_CLAUDE_READY_FILE;
+if (readyFile !== undefined) {
+  await fs.writeFile(readyFile, sessionPath ?? 'no-session');
 }
 
 const stdoutFirst = process.env.FAKE_CLAUDE_STDOUT_FIRST;
