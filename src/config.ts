@@ -61,7 +61,7 @@ export const permissionMode = type(
 export type PermissionMode = typeof permissionMode.infer;
 
 /** Who supplies the child's credential; see `AuthMode` in the main module. */
-export const authMode = type("'fallback' | 'caller'");
+export const authMode = type("'fallback' | 'caller' | 'native-store'");
 
 /**
  * A session id that can name a journal file. The same expression as
@@ -136,6 +136,7 @@ const preset = type({
   'auth?': authMode,
   'linkAuth?': 'boolean',
   'tokenFile?': 'string | null',
+  'nativeStorePath?': 'string | null',
   'noProcessEnv?': 'boolean',
 
   // What it may do.

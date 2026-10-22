@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [v0.15.0] - 2026-10-22
+
+### Fixed
+
+- Doctor reports native-store environment conflicts as a refused invocation instead
+  of throwing. Overlapping explicit native-store/run-home paths are refused.
+- The SIGHUP fixture waits for initial journal creation before testing retained
+  journal behavior; PID publication alone did not establish that precondition.
+
+### Added
+
+- Explicit `auth: native-store` with absolute `nativeStorePath` (`--native-store`)
+  selects Claude Code's own enrolled store/profile while retaining ephemeral run
+  configuration. No credential reads/copies or token fallback; conflicting token,
+  file-link and settings sources are refused. Doctor reports selection without
+  asserting login. Native multi-account refresh qualification remains open in issue1.
+
+
 ### Changed
 
 - **Waiting, stopping and cleaning up.** Documentation, TSDoc and `--help` text only; no behaviour

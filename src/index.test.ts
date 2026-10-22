@@ -87,6 +87,7 @@ describe('LaunchConfig', () => {
       auth: 'fallback',
       linkAuth: true,
       tokenFile: null,
+      nativeStorePath: null,
       tools: null,
       disallowedTools: null,
       addDirs: [],
@@ -129,7 +130,7 @@ describe('LaunchConfig', () => {
     for (const auth of [ 'none', 'Fallback', '', 0, null ]) {
       const options: LaunchOptions = { callToAction: '# do it' };
       Object.assign(options, { auth });
-      expect(() => LaunchConfig(options)).toThrow('auth must be "fallback" or "caller"');
+      expect(() => LaunchConfig(options)).toThrow('auth must be "fallback", "caller" or "native-store"');
     }
   });
 

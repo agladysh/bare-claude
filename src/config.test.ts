@@ -197,7 +197,7 @@ describe('parseConfig', () => {
     expect(() => parseConfig('stopGraceMs: 1.5')).toThrow('stopGraceMs');
   });
 
-  test('accepts the two auth modes and nothing else', () => {
+  test('accepts declared auth modes and nothing else', () => {
     expect(parseConfig('auth: caller').configPreset.auth).toBe('caller');
     expect(parseConfig('auth: fallback').configPreset.auth).toBe('fallback');
     expect(() => parseConfig('auth: none')).toThrow('auth must be');

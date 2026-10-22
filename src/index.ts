@@ -147,6 +147,20 @@ export type Launcher = keyof Launchers;
  */
 type SystemPromptOp = 'appendString' | 'setString' | 'appendFile' | 'setFile';
 
+function containsPath(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === '' || (relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative));
+}
+
+const nativeCredentialVariables = [
+  'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN',
+  'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR', 'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR',
+];
+const nativeAuthVariables = [
+  ...nativeCredentialVariables, 'CLAUDE_CONFIG_DIR',
+  'CLAUDE_SECURESTORAGE_CONFIG_DIR', 'ANTHROPIC_CONFIG_DIR',
+];
+
 /**
  * Who supplies the child's credential.
  *
@@ -154,6 +168,9 @@ type SystemPromptOp = 'appendString' | 'setString' | 'appendFile' | 'setFile';
  *   credential, Bare Claude falls back to its own sources — the token file
  *   (see {@link LaunchOptions.tokenFile}) and, where `linkAuth` is on, the
  *   credential file it links into the ephemeral home.
+ * - `'native-store'`: Claude Code reads and refreshes its own enrolled store,
+ *   selected by {@link LaunchOptions.nativeStorePath}. Bare Claude reads no
+ *   credential and performs no token fallback.
  * - `'caller'`: the caller owns authentication. Bare Claude reads no token
  *   file and links no credential file; the child authenticates with whatever
  *   the environment the caller built carries, or however the executable
@@ -161,10 +178,10 @@ type SystemPromptOp = 'appendString' | 'setString' | 'appendFile' | 'setFile';
  *   brings its own credential needs this: under `'fallback'` a token file
  *   would be put beside it whenever the environment lacks a credential.
  */
-export type AuthMode = 'fallback' | 'caller';
+export type AuthMode = 'fallback' | 'caller' | 'native-store';
 
-/** The two {@link AuthMode} values, for checking one that came from untyped code. */
-const authModes: readonly AuthMode[] = [ 'fallback', 'caller' ];
+/** The {@link AuthMode} values, for checking one that came from untyped code. */
+const authModes: readonly AuthMode[] = [ 'fallback', 'caller', 'native-store' ];
 
 /** Narrows a value from untyped code, a JavaScript caller's for one, to an {@link AuthMode}. */
 function isAuthMode(value: unknown): value is AuthMode {
@@ -358,7 +375,7 @@ export interface LaunchOptions {
    * governs the token file — under `auth: 'fallback'` it is still read when
    * the resulting environment has no credential, from the default location
    * under `os.homedir()` if `HOME` is absent. `auth: 'caller'` is what turns
-   * that off.
+   * that off; `auth: 'native-store'` also disables token lookup.
    */
   noProcessEnv?: boolean,
 
@@ -371,6 +388,17 @@ export interface LaunchOptions {
   auth?: AuthMode,
 
   /**
+   * Absolute directory of an already enrolled Claude Code native credential
+   * store. Required only with `auth: 'native-store'`. Sets
+   * `CLAUDE_SECURESTORAGE_CONFIG_DIR` to this path and `ANTHROPIC_CONFIG_DIR`
+   * to its `anthropic-profile` child; the ephemeral `CLAUDE_CONFIG_DIR` stays
+   * separate. No directory, login or credential layout is inspected/created.
+   * Missing login and refresh are Claude Code's responsibility. Token/API-key
+   * environment variables, `tokenFile` and `linkAuth: true` are refused.
+   */
+  nativeStorePath?: string | null,
+
+  /**
    * Whether to symlink the credential file from the real Claude config dir into
    * the ephemeral home, so a bare run keeps the subscription session. Only the
    * credential file is linked, never `.claude.json`, so the child cannot
@@ -380,8 +408,8 @@ export interface LaunchOptions {
    *
    * Platform note: this only helps where Claude Code keeps credentials in a
    * file. On macOS they live in the login keychain and there is nothing to
-   * link — use `CLAUDE_CODE_OAUTH_TOKEN` there. Defaults to true under
-   * `auth: 'fallback'` and false under `auth: 'caller'`.
+   * link. Use a token or an explicitly enrolled native store there. Defaults
+   * to true under `auth: 'fallback'` and false under the other modes.
    */
   linkAuth?: boolean,
 
@@ -482,7 +510,8 @@ export type LaunchConfig = Required<LaunchOptions>;
  * Converts LaunchOptions to a fully resolved LaunchConfig by applying defaults.
  * @param o - The launch options to convert
  * @returns A LaunchConfig with all fields resolved to non-optional values
- * @throws When `auth` is neither `'fallback'` nor `'caller'`; when
+ * @throws When `auth` is not a declared AuthMode; when native store selection
+ *   is missing, relative or combined with another authentication source; when
  *   `auth: 'caller'` is combined with a credential source of Bare Claude's
  *   own, `linkAuth: true` or a `tokenFile`; when a session seed's
  *   `sessionId` does not match {@link sessionIdPattern}
@@ -493,7 +522,7 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
   // Only an absent mode defaults: `??` would also let a null through.
   const requested: unknown = o.auth === undefined ? 'fallback' : o.auth;
   if (!isAuthMode(requested)) {
-    throw new Error(`auth must be "fallback" or "caller", got ${JSON.stringify(requested)}`);
+    throw new Error(`auth must be "fallback", "caller" or "native-store", got ${JSON.stringify(requested)}`);
   }
   const auth = requested;
 
@@ -506,13 +535,39 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
     );
   }
 
-  if (auth === 'caller') {
+  if (auth === 'caller' || auth === 'native-store') {
     if (o.linkAuth === true) {
-      throw new Error('auth "caller" leaves authentication to the caller, so it cannot also take linkAuth');
+      throw new Error(`auth "${auth}" cannot also take linkAuth`);
     }
     if (o.tokenFile !== undefined && o.tokenFile !== null && o.tokenFile !== '') {
-      throw new Error('auth "caller" leaves authentication to the caller, so it cannot also take a tokenFile');
+      throw new Error(`auth "${auth}" cannot also take a tokenFile`);
     }
+  }
+
+  const store: unknown = o.nativeStorePath ?? null;
+  if (auth === 'native-store') {
+    if (typeof store !== 'string' || store.trim() === '' || store.includes('\0') || !path.isAbsolute(store)) {
+      throw new Error('auth "native-store" requires an absolute nativeStorePath');
+    }
+    if ((o.launcher ?? 'claude') !== 'claude') {
+      throw new Error('auth "native-store" requires the claude launcher');
+    }
+    if (o.ephemeralClaudeHomePath !== undefined && o.ephemeralClaudeHomePath !== null
+      && o.ephemeralClaudeHomePath !== '') {
+      const home = path.resolve(o.ephemeralClaudeHomePath);
+      if (containsPath(store, home) || containsPath(home, store)) {
+        throw new Error('nativeStorePath and ephemeralClaudeHomePath must be separate directories, neither inside the other');
+      }
+    }
+    const settingsEnv = o.extraSettings?.env;
+    if (isJsonObject(settingsEnv) && nativeAuthVariables.some(name => name in settingsEnv)) {
+      throw new Error('auth "native-store" cannot take authentication variables in extraSettings.env');
+    }
+    if (o.extraSettings?.apiKeyHelper !== undefined) {
+      throw new Error('auth "native-store" cannot also take extraSettings.apiKeyHelper');
+    }
+  } else if (store !== null) {
+    throw new Error('nativeStorePath requires auth "native-store"');
   }
 
   return {
@@ -544,6 +599,7 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
     auth,
     linkAuth: o.linkAuth ?? auth === 'fallback',
     tokenFile: o.tokenFile ?? null,
+    nativeStorePath: typeof store === 'string' ? path.normalize(store) : null,
     tools: o.tools ?? null,
     disallowedTools: o.disallowedTools ?? null,
     addDirs: o.addDirs ?? [],
@@ -691,7 +747,8 @@ export interface EnvContext {
  *
  * Layered, later wins: inherited process environment (unless `noProcessEnv`,
  * and always minus the parent-session markers), then `spawnEnv`, then
- * `extraEnv`, then `CLAUDE_CONFIG_DIR`.
+ * `extraEnv`, then `CLAUDE_CONFIG_DIR`. Native-store selection also forces its
+ * two path variables and rejects conflicting token/API-key variables.
  * @param config - The resolved launch configuration
  * @param context - Run-specific values the config does not carry
  * @returns The environment to spawn the child with
@@ -708,12 +765,24 @@ export function buildEnv(
     }
   }
 
-  return {
+  const env: Record<string, string | undefined> = {
     ...inherited,
     ...context.spawnEnv,
     ...config.extraEnv,
     CLAUDE_CONFIG_DIR: context.ephemeralClaudeHomePath,
   };
+  if (config.auth === 'native-store') {
+    const conflict = nativeCredentialVariables.find(name => (env[name] ?? '') !== '');
+    if (conflict !== undefined) {
+      throw new Error(`auth "native-store" conflicts with ${conflict}; remove it or choose another auth mode`);
+    }
+    if (config.nativeStorePath === null) {
+      throw new Error('auth "native-store" requires nativeStorePath');
+    }
+    env.CLAUDE_SECURESTORAGE_CONFIG_DIR = config.nativeStorePath;
+    env.ANTHROPIC_CONFIG_DIR = path.join(config.nativeStorePath, 'anthropic-profile');
+  }
+  return env;
 }
 
 /**
