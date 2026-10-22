@@ -15,7 +15,8 @@ session is **not** inherited. Measured against Claude Code 2.1.220: a run with a
 directory reports `Not logged in · Please run /login` and exits 1, even while `claude auth status`
 in the same shell reports a healthy subscription.
 
-Give the subprocess an explicit credential instead. For an Anthropic subscription:
+Give the subprocess an explicit authentication route: the token routes below or
+[an enrolled native store](#native-credential-store). For an Anthropic subscription:
 
 ```bash
 claude setup-token                          # once; prints a long-lived OAuth token
@@ -74,6 +75,52 @@ not a precedence question. Nothing about the environment is inferred or stripped
 whatever credential variables the caller passes reach the child as given, and a preset's
 `extraEnv` is one of the layers that can pass them — see `--no-config` below for keeping a
 repository's preset out of it.
+
+
+### Native credential store
+
+Issue1 reports a working macOS Claude Code2.1.273 route that keeps run settings
+isolated while Claude Code reads and refreshes its own enrolled credential store.
+Select it explicitly:
+
+```typescript
+await spawnClaude({
+  callToAction: 'Explain this project',
+  auth: 'native-store',
+  nativeStorePath: '/absolute/path/to/enrolled-store',
+  noProcessEnv: true,
+  extraEnv: { HOME: '/Users/me', USER: 'me', PATH: '/usr/bin:/bin:/opt/homebrew/bin' },
+});
+```
+
+CLI: `bare-claude --auth native-store --native-store /absolute/path/to/enrolled-store -- 'Explain this project'`.
+Presets use `auth: native-store` and `nativeStorePath: /absolute/path/to/enrolled-store`.
+The path must be absolute; Bare Claude neither creates it nor checks its layout.
+Claude Code receives `CLAUDE_SECURESTORAGE_CONFIG_DIR=STORE` and
+`ANTHROPIC_CONFIG_DIR=STORE/anthropic-profile`. These override corresponding inherited
+or explicit environment paths. `CLAUDE_CONFIG_DIR` still names the isolated run home;
+the existing instruction/skill/hook/plugin controls stay in effect.
+
+Bare Claude reads/copies no native credential, links no credential file and reads no
+fallback token file in this mode. A missing login is left to Claude Code, whose
+exit status is propagated. `linkAuth: true`, an explicit nonempty `tokenFile`,
+non-Claude launchers and `extraSettings.apiKeyHelper` are refused. Nonempty OAuth
+or API-key variables (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`,
+`CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`) in the resulting child environment are
+refused rather than allowed to silently change accounts. Authentication variables
+in `extraSettings.env` are also refused. `noProcessEnv: true` is useful when the
+parent carries a credential intended for another run.
+
+This option selects a path; it does not enroll an account or establish that login
+or refresh works. The doctor reports that distinction without opening credentials.
+Synthetic tests cover routing, conflicts, no fallback, retained bare controls and
+nonzero child/CLI status. A macOS Claude Code2.1.306 probe of a fresh unenrolled
+store reached native `auth status` (`loggedIn: false`, exit1) and the new
+`spawnClaude` route (`Not logged in`, exit1). Two enrolled accounts, native expiry/refresh and concurrent
+refresh behavior have not been qualified here; issue1 remains open for those checks.
+The earlier 2.1.220 token observation does not establish that tokens are the only
+macOS authentication route on subsequent Claude Code versions.
 
 ## Disclaimer
 
@@ -192,7 +239,7 @@ Options:
 - `--token-file [path]`: file holding the OAuth token, read when the environment has none
   (default: `$BARE_CLAUDE_TOKEN_FILE`, then `~/.config/bare-claude/oauth`; see
   [Authentication](#authentication))
-- `--auth [mode]`: `fallback` (default) or `caller` (see
+- `--auth [mode]`: `fallback` (default), `caller` or `native-store` (see
   [Caller-managed authentication](#caller-managed-authentication))
 - `--claude-home [dir]`: Claude home for the run, created if missing and kept whatever the outcome
   (see [Keeping and continuing a run](#keeping-and-continuing-a-run))
@@ -1637,17 +1684,20 @@ Optional:
   stripped so a nested run does not adopt its parent's session; credential variables are
   inherited like everything else. When `true`, nothing is inherited, credentials included: only
   `spawnOptions.env` and `extraEnv` reach the child. Neither value turns off the token file — only
-  `auth: 'caller'` does.
-- `auth`: Who supplies the child's credential, an `AuthMode`: `'fallback'` or `'caller'`; any
+  `auth: 'caller'` and `auth: 'native-store'` do.
+- `auth`: Who supplies the child's credential, an `AuthMode`: `'fallback'`, `'caller'` or `'native-store'`; any
   other value, from an untyped caller, is refused. Defaults to
-  `'fallback'`: the environment's credential, else the token file and `linkAuth`. `'caller'`
+  `'fallback'`: the environment's credential, else the token file and `linkAuth`.
+  `'native-store'` selects an enrolled store without reading credentials or token files. `'caller'`
   reads no token file and links nothing; it cannot be combined with `linkAuth: true` or a
   `tokenFile`. See [Caller-managed authentication](#caller-managed-authentication).
+- `nativeStorePath`: Absolute enrolled-store directory required with `auth: native-store`;
+  see [Native credential store](#native-credential-store). CLI: `--native-store PATH`.
 - `linkAuth`: Whether to symlink the credential file from the real Claude config directory (this
   process's `CLAUDE_CONFIG_DIR`, else `~/.claude`) into the ephemeral one. Only helps where Claude
   Code keeps credentials in a file — on macOS they live in the login keychain, so use
-  `CLAUDE_CODE_OAUTH_TOKEN` there. Defaults to `true` under `auth: 'fallback'`, `false` under
-  `auth: 'caller'`.
+  a token or native-store selection there. Defaults to `true` under `auth: 'fallback'`, `false` under
+  the other modes.
 - `tokenFile`: File holding the subscription token, read into the child's `CLAUDE_CODE_OAUTH_TOKEN`
   at spawn time when the child's environment carries neither that variable nor an alternate
   credential, for the `claude` launcher under `auth: 'fallback'` only. `null`, the default, means

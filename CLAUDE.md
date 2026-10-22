@@ -81,7 +81,11 @@ Verified against `claude` 2.1.220 on macOS. Re-verify, with a dated note, when t
   credential lives in the login keychain under the service `Claude Code-credentials` and is not
   read when the config dir is redirected. Restoring it requires an explicit route:
   `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) in the child environment is the one that
-  works on this platform.
+  was established on that version/platform. This is not an exhaustive claim about
+  later versions: upstream issue1 reports native-store selection on macOS2.1.273
+  with `CLAUDE_SECURESTORAGE_CONFIG_DIR` and `ANTHROPIC_CONFIG_DIR`. The new
+  `auth: native-store` contract passes those paths while retaining ephemeral run
+  config. Its synthetic tests do not establish native login/refresh/account switching.
 - `--print` must be the last flag before the prompt text (measured by `thai/oracle-runtime`).
 - A call-to-action beginning with `-` is consumed by the flag parser even after `--print`. On
   2.1.220 that is `error: unknown option '…'` on stderr and exit 1 with empty stdout; older

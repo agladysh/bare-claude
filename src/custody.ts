@@ -1192,7 +1192,7 @@ const isCustodyInvocation = shape<CustodyInvocation>({
   maxBudgetUsd: nullable(isFiniteNumber),
   maxTokens: nullable(isFiniteNumber),
   maxOutputLength: nullable(isFiniteNumber),
-  auth: literal('fallback', 'caller'),
+  auth: literal('fallback', 'caller', 'native-store'),
   linkAuth: isBoolean,
   noProcessEnv: isBoolean,
   extraArgs: listOf(isString),
