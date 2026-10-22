@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.15.0] - 2026-10-22
+
 ### Fixed
 
 - Doctor reports native-store environment conflicts as a refused invocation instead
