@@ -147,6 +147,11 @@ export type Launcher = keyof Launchers;
  */
 type SystemPromptOp = 'appendString' | 'setString' | 'appendFile' | 'setFile';
 
+function containsPath(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === '' || (relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative));
+}
+
 const nativeCredentialVariables = [
   'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN',
   'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR', 'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR',
@@ -546,6 +551,13 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
     }
     if ((o.launcher ?? 'claude') !== 'claude') {
       throw new Error('auth "native-store" requires the claude launcher');
+    }
+    if (o.ephemeralClaudeHomePath !== undefined && o.ephemeralClaudeHomePath !== null
+      && o.ephemeralClaudeHomePath !== '') {
+      const home = path.resolve(o.ephemeralClaudeHomePath);
+      if (containsPath(store, home) || containsPath(home, store)) {
+        throw new Error('nativeStorePath and ephemeralClaudeHomePath must be separate directories, neither inside the other');
+      }
     }
     const settingsEnv = o.extraSettings?.env;
     if (isJsonObject(settingsEnv) && nativeAuthVariables.some(name => name in settingsEnv)) {

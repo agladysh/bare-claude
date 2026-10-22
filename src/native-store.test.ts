@@ -67,6 +67,26 @@ describe('native-store authentication', () => {
     }
   });
 
+  test('refuses overlapping explicit run/store paths before writing either directory', () => {
+    for (const home of ['/enrolled/account-a', '/enrolled/account-a/anthropic-profile', '/enrolled']) {
+      expect(() => LaunchConfig({ ...config(), ephemeralClaudeHomePath: home })).toThrow('separate directories');
+    }
+    expect(LaunchConfig({ ...config(), ephemeralClaudeHomePath: '/temporary/run' }).auth).toBe('native-store');
+  });
+
+  test('doctor reports a conflicting environment instead of throwing or inspecting fallback credentials', async () => {
+    const secret = 'synthetic-native-conflict-value';
+    const report = await runDoctor({ config: { kind: 'none' },
+      overrides: { auth: 'native-store', nativeStorePath: '/not-enrolled' },
+      env: { CLAUDE_CODE_OAUTH_TOKEN: secret }, cwd: process.cwd() });
+    expect(report.ok).toBe(false);
+    const preset = report.items.find(item => item.name === 'preset');
+    expect(preset?.status).toBe('fail');
+    expect(preset?.hint.join(' ')).toContain('conflicts with CLAUDE_CODE_OAUTH_TOKEN');
+    expect(report.items.find(item => item.name === 'auth')?.detail).toStartWith('not checked:');
+    expect(JSON.stringify(report)).not.toContain(secret);
+  });
+
   test('preset schema accepts native selection', () => {
     const preset = parseConfig('auth: native-store\nnativeStorePath: /store-a\n').configPreset;
     expect(preset.auth).toBe('native-store');

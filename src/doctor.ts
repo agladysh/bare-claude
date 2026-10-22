@@ -540,7 +540,15 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
   // The child's environment, as buildEnv would give it; CLAUDE_CONFIG_DIR is
   // the run's temporary home, which does not exist yet and matters to neither
   // check below.
-  const runEnv = buildEnv(launch, { ephemeralClaudeHomePath: '', processEnv: env });
+  let environmentError: string | null = null;
+  let runEnv: Record<string, string | undefined>;
+  try {
+    runEnv = buildEnv(launch, { ephemeralClaudeHomePath: '', processEnv: env });
+  } catch (error) {
+    environmentError = error instanceof Error ? error.message : String(error);
+    // A refused environment is not an authentication route to inspect.
+    runEnv = { PATH: env.PATH };
+  }
   delete runEnv.CLAUDE_CONFIG_DIR;
   const runCwd = path.resolve(cwd, launch.cwd ?? cwd);
 
@@ -551,23 +559,24 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
   if (runEnv.PATH === undefined) {
     claude.detail += ' (the run\'s environment sets no PATH; resolved with the doctor\'s)';
   }
-  if (run.kind === 'refused') {
+  if (run.kind === 'refused' || environmentError !== null) {
     claude.detail += ' (from the command line alone: the invocation does not resolve)';
   }
 
   let preset = await checkPreset(cwd, source);
-  if (run.kind === 'refused' && preset.status !== 'fail') {
+  const refusal = run.kind === 'refused' ? run.error : environmentError;
+  if (refusal !== null && preset.status !== 'fail') {
     preset = {
       name: 'preset',
       status: 'fail',
       detail: 'the invocation does not resolve; a run with these options would be refused',
-      hint: run.error.split('\n').map(line => line.trim()).filter(line => line !== ''),
+      hint: refusal.split('\n').map(line => line.trim()).filter(line => line !== ''),
     };
   }
 
   // A refused invocation's auth mode is unknown, so no token file is opened:
   // the configuration that failed may be the one that says not to.
-  const auth: DoctorItem = run.kind === 'refused'
+  const auth: DoctorItem = run.kind === 'refused' || environmentError !== null
     ? {
       name: 'auth',
       status: 'warn',
