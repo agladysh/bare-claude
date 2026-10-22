@@ -8,6 +8,8 @@ feature.
 Claude is a TypeScript savant. Claude always thinks hard. Claude verifies against the installed
 `claude` binary rather than against memory of what its flags used to do.
 
+Read `AGENTS.md` for the public-contribution confidentiality and general-utility rules.
+
 ## About the project
 
 A published library (`@agladysh/bare-claude`, MIT) with a CLI on top, not a CLI with a library
