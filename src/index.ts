@@ -1208,9 +1208,59 @@ export async function spawnClaude<
   launchOptions: LaunchOptions,
   spawnOptions: Bun.Spawn.SpawnOptions<In, Out, Err> = {}
 ): Promise<ClaudeSubprocess<In, Out, Err>> {
+  return spawnClaudeInternal(launchOptions, spawnOptions, false);
+}
+
+/**
+ * Sends the exact call-to-action UTF-8 bytes through Claude Code's text stdin.
+ *
+ * The prompt is absent from argv, avoiding the operating system's argument
+ * size limit. A Blob supplies all bytes and EOF without a caller-managed pipe.
+ * Output, supervision, authentication and home/session custody use the same
+ * spawn path as {@link spawnClaude}. Only the native `claude` launcher is
+ * supported; alternate launchers retain their existing argument route.
+ * @param launchOptions - The ordinary launch configuration, including the prompt
+ * @param spawnOptions - Bun options other than stdin, stdio or a terminal; this route owns input
+ * @returns The spawned process and the ordinary session/custody metadata
+ */
+export async function spawnClaudeWithStdinPrompt<
+  Out extends Bun.SpawnOptions.Readable,
+  Err extends Bun.SpawnOptions.Readable
+>(
+  launchOptions: LaunchOptions,
+  spawnOptions: Omit<Bun.Spawn.SpawnOptions<Blob, Out, Err>, 'stdin' | 'stdio' | 'terminal'> = {}
+): Promise<ClaudeSubprocess<Blob, Out, Err>> {
+  if ('stdin' in spawnOptions || 'stdio' in spawnOptions || 'terminal' in spawnOptions) {
+    throw new Error('spawnClaudeWithStdinPrompt owns stdin; omit stdin, stdio and terminal');
+  }
+  if (launchOptions.launcher !== undefined && launchOptions.launcher !== 'claude') {
+    throw new Error('spawnClaudeWithStdinPrompt requires the native claude launcher');
+  }
+  if (typeof launchOptions.callToAction !== 'string') {
+    throw new Error('callToAction must be a string');
+  }
+  if (launchOptions.extraArgs?.some(arg => arg === '--input-format' || arg.startsWith('--input-format='))) {
+    throw new Error('spawnClaudeWithStdinPrompt owns --input-format text');
+  }
+  return spawnClaudeInternal(launchOptions, {
+    ...spawnOptions,
+    stdin: new Blob([ launchOptions.callToAction ]),
+  }, true);
+}
+
+async function spawnClaudeInternal<
+  In extends Bun.SpawnOptions.Writable,
+  Out extends Bun.SpawnOptions.Readable,
+  Err extends Bun.SpawnOptions.Readable
+>(
+  launchOptions: LaunchOptions,
+  spawnOptions: Bun.Spawn.SpawnOptions<In, Out, Err>,
+  promptViaStdin: boolean
+): Promise<ClaudeSubprocess<In, Out, Err>> {
   const c = LaunchConfig(launchOptions);
 
-  assertSafeCallToAction(c.callToAction); // Before any filesystem work, so a refusal leaves nothing behind.
+  // Only an argv prompt can be mistaken for an option. Refuse before custody.
+  if (!promptViaStdin) assertSafeCallToAction(c.callToAction);
 
   // Physical, because the winner keys the project directory, and the child
   // keys it on the directory it actually runs in: an alias or a relative path
@@ -1223,6 +1273,11 @@ export async function spawnClaude<
   // assertSafeCallToAction runs first: an unknown launcher must not leave a
   // temporary directory behind.
   const cmd = buildArgv(c, sessionId);
+  if (promptViaStdin) {
+    // buildArgv ends with --print and the prompt. Keep print mode explicit,
+    // while the input format and payload are owned by this stdin route.
+    cmd.splice(-2, 2, '--input-format', 'text', '--print');
+  }
   const settings = buildSettings(c);
 
   // An empty path would resolve to the working directory and turn it into a

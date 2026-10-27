@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- `spawnClaudeWithStdinPrompt` sends the exact prompt through text stdin with EOF,
+  avoiding argument-size limits while retaining the existing spawn/custody path.
+  The original `spawnClaude` argument route remains unchanged.
+
 ## [v0.15.1] - 2026-10-22
 
 ### Changed

@@ -1609,6 +1609,20 @@ Launches a Claude Code subprocess with the given options. Refuses a `callToActio
 `-`, which `claude` would otherwise parse as a flag instead of the prompt; the check is also
 exported standalone as `assertSafeCallToAction(callToAction)`, throwing the same error.
 
+### spawnClaudeWithStdinPrompt(launchOptions: LaunchOptions, spawnOptions?)
+
+Uses the same launch configuration, authentication, output and session custody as
+`spawnClaude`, but sends the exact `callToAction` UTF-8 bytes through text stdin
+and closes it at EOF. The prompt is absent from argv, so a large prompt does not
+hit the operating system's argument-size limit. It may also begin with `-`.
+
+This route supports the native `claude` launcher. It owns `--input-format text`
+and stdin: omit `stdin`, `stdio`, `terminal` and `--input-format` overrides.
+Other arguments retain their ordinary limits. Existing `spawnClaude` callers,
+including callers that manage stdin themselves, retain their argument route.
+The installed CLI advertises print-mode text input; controlled-child tests verify
+transport and lifecycle behavior without a live model call.
+
 #### LaunchOptions
 
 Required:
