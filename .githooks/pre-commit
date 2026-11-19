@@ -1,0 +1,26 @@
+#!/bin/sh
+
+# shop:begin shop sha256=6298baed50134d2a
+# The estate identifier check: refuses what would carry an identifier off this machine (`shop egress`). Its
+# report is printed only when it refuses; progress (installing the pinned revision) shows as it happens.
+shop_estate=${HERMESOLOGY:-}
+if [ -z "$shop_estate" ]; then
+  shop_parent=$(pwd -P) || exit 2
+  while :; do
+   if [ -f "$shop_parent/.shop/estate.toml" ]; then
+    shop_estate=$shop_parent; HERMESOLOGY=$shop_estate; export HERMESOLOGY; break
+   fi
+   [ "$shop_parent" = / ] && break
+   shop_parent=${shop_parent%/*}; [ -n "$shop_parent" ] || shop_parent=/
+  done
+fi
+if [ -n "$shop_estate" ] && [ -x "$shop_estate/.bin/shop" ]; then
+  shop_tool=$shop_estate/.bin/shop
+else
+  shop_tool=$(command -v shop) || {
+   echo "pre-commit: estate identifier check not established: shop is unavailable; restore the estate installation or select its environment" >&2
+   exit 2
+  }
+fi
+shop_out=$("$shop_tool" egress --staged) || { shop_status=$?; printf '%s\n' "$shop_out" >&2; exit "$shop_status"; }
+# shop:end shop
