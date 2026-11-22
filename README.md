@@ -251,6 +251,11 @@ Options:
 - `--custody [dir]`: keep the run in this new directory, and make stdout one JSON custody event per
   line and nothing else (see [Run custody](#run-custody))
 - `--claude-arg [arg]`: forward a flag to `claude` verbatim, may be included several times
+- `--output-schema [file]`: a JSON Schema file the final answer must satisfy, passed to `claude` as
+  `--json-schema` and enforced by it; the exit status then says whether the answer conformed (see
+  [Output schema](#output-schema)). Not a preset field
+- `--outcome-schema`: with `--outcome`, the run had `--output-schema`: also report its schema
+  outcome
 - `-v, --version`: print the version and exit
 - `-h, --help`: print this help and exit
 
@@ -278,7 +283,22 @@ number — 143, 130, 129 — whatever `claude` itself exited with, so a stopped 
 a completed one. See [Stopping a run](#stopping-a-run).
 
 A refusal made before `claude` is spawned — an invalid configuration, a contradictory option, a
-session seed that cannot be published — exits 1 with a one-line `bare-claude:` message on stderr.
+session seed that cannot be published, an output schema that cannot be used — exits 1 with a
+one-line `bare-claude:` message on stderr.
+
+A run given `--output-schema` and not stopped exits by its [schema outcome](#output-schema), under
+custody too:
+
+| Exit | When |
+| --- | --- |
+| 0 | `conforming`, and `claude` exited 0 |
+| 65 | `not-conforming`: Claude Code reported it gave up on the schema, whatever `claude` exited with |
+| 66 | `no-final-message`, and `claude` exited 0 |
+| `claude`'s own | `claude` exited nonzero with any other outcome |
+
+A line on stderr says which outcome it was whenever it was not `conforming`. 65 and 66 are
+sysexits' `EX_DATAERR` and `EX_NOINPUT`, clear of the 0 and 1 `claude` exits with. Exit 0 still
+says nothing of whether the task was done: only that native accepted an answer against the schema.
 
 ### Waiting, stopping and cleaning up
 
@@ -878,8 +898,9 @@ writes there is ever rewritten or removed. Relative, it resolves against the dir
 
 | File | Written | Holds |
 | --- | --- | --- |
-| `invocation.json` | before the spawn | the custody directory, launcher, executable, model, effort, permission mode, tools, `addDirs`, budget and token caps, auth mode, `linkAuth`, `noProcessEnv`, `extraArgs` as given, the physical cwd, the Claude home, the session (`fresh`, `memory` with its id, or `file` with its source path and digest), the call to action's length and SHA-256, and the configuration that declared the run (below) |
+| `invocation.json` | before the spawn | the custody directory, launcher, executable, model, effort, permission mode, tools, `addDirs`, budget and token caps, auth mode, `linkAuth`, `noProcessEnv`, `extraArgs` as given, the physical cwd, the Claude home, the session (`fresh`, `memory` with its id, or `file` with its source path and digest), the call to action's length and SHA-256, the output schema (`outputSchema`: its source path, the kept copy, size and SHA-256; `null` without one), and the configuration that declared the run (below) |
 | `call-to-action.txt` | before the spawn, only with `keepCallToAction: true` | the call to action, exactly |
+| `output-schema.json` | before the spawn, only for a run given an output schema | the schema's bytes as read; the run is given this copy, so what is recorded is what was passed |
 | `stdout`, `stderr` | by the spawned process, as it runs | its own standard output and error, byte for byte: its descriptors, not pipes. Empty when it never started |
 | `start.json` | after the spawn returned | PID, process group, session id, journal path, Claude home, when the record was written, the caller's identity reading (`identify`), if any, and `seededJournal`: the size and SHA-256 of the bytes put in the journal before the spawn, or `null` when nothing was |
 | `completion.json` | once it was seen to end, or it never started, or a custody-error stop ran its bounded course | outcome, exit code and signal, the stop and its cause, the group's reading, and the size and SHA-256 of each output and of the journal |
@@ -981,6 +1002,87 @@ caller's to establish, with whatever knows the native process. A caller that dec
 `{ sessionId, sourcePath: journal.path, sourceSha256: journal.sha256 }` as `customSessionData`, and
 the digest makes the next spawn refuse a journal that changed since it was read.
 
+## Output schema
+
+`--output-schema FILE` (library: `outputSchemaFile`) gives a headless run the shape its final
+answer must have: a JSON Schema file, with the meaning the sibling wrapper bare-codex gives its own
+`--output-schema`. The result tells the caller, typed, whether the answer conformed.
+
+```bash
+bare-claude --quiet --output-schema form.json -- 'Fill in the form for this repository'
+```
+
+- **Before anything happens.** The file is read before anything is created or spawned. It must be
+  UTF-8 JSON text whose value is an object; a byte order mark is refused. Whether it is a valid
+  JSON Schema is Claude Code's to judge. A missing or unparsable file, or `--json-schema`
+  forwarded beside it (`--claude-arg`, `extraArgs`), is refused with exit 1, as an
+  `OutputSchemaError` in the library.
+- **Native enforcement.** The file's text goes to `claude` verbatim as `--json-schema <text>`,
+  and Claude Code enforces it. Bare Claude adds nothing to the prompt and does not re-validate the
+  answer.
+- **Where the outcome is read.** Claude Code reports how the answer fared only in its
+  `--output-format json` result. The CLI asks for that format when none is forwarded, and refuses
+  another one. Its stdout is then that result: under `--print` it is passed through as JSON. The
+  library sets no output format; pass `--output-format json` in `extraArgs`.
+- **Not a preset field.** A schema dictates the caller's answer, and a preset configures a run
+  without dictating its output. `outputSchemaFile` in a configuration file is refused as an
+  unknown key.
+
+The outcome, `SchemaOutcome` from `@agladysh/bare-claude/outcome`:
+
+```ts
+type SchemaOutcome =
+  | { kind: 'conforming', enforcedBy: SchemaEnforcer, value: Json }
+  | { kind: 'not-conforming', enforcedBy: 'native', errors: string[], finalText: string | null }
+  | { kind: 'not-conforming', enforcedBy: 'wrapper', errors: SchemaValidationError[], finalText: string | null }
+  | { kind: 'no-final-message', enforcedBy: SchemaEnforcer, reason: NoFinalMessageReason, detail: string };
+// SchemaEnforcer = 'native' | 'wrapper'
+// SchemaValidationError = { instancePath: string, keyword: string, message: string }
+// NoFinalMessageReason = 'no-result' | 'unreadable-result' | 'no-structured-output'
+```
+
+- `conforming`: the result carries a non-null `structured_output`, the answer native accepted.
+- `not-conforming`: the result says `is_error: true`, with subtype
+  `error_max_structured_output_retries` or terminal reason `structured_output_retry_exhausted`.
+  `errors` are native's `errors` strings, verbatim; `finalText` is the result's text, if any.
+- `no-final-message`: no result (`no-result`), bytes that are not a result (`unreadable-result`),
+  or a result with no `structured_output` (`no-structured-output`), with a `detail`.
+
+Bare Claude always fills `enforcedBy: "native"`. The `wrapper` variants exist so that a sibling
+wrapper whose harness enforces nothing can report its own JSON Schema validator's errors in the
+same shape: a caller that drives several harnesses reads one type. Nothing here reads or judges the
+answer beyond what the enforcer reported about the schema. `conforming` is not a judgment that the
+work was done, nor that native reported no error; that is `result.status`.
+
+Where a caller reads it:
+
+- **A live CLI run**: the exit status ([Exit Status](#exit-status)): 0, 65, 66, or `claude`'s own.
+- **`--outcome FILE --outcome-schema`**, or `"outputSchema": true` on an `--outcome-batch` line:
+  `result.schema`.
+- **`--outcome-custody DIR`**: `schema` at the top of the reading, and in `--brief` as
+  `{ kind, enforcedBy, reason }` with no value or text. Custody records the schema in
+  `invocation.json` and keeps it as `output-schema.json`, so the reader needs no flag. When stdout
+  was not a JSON result, the outcome is `no-final-message`, `no-result`.
+- **The library**: `readResult(bytes, { outputSchema: true }).schema`, or `readCustody(dir).schema`.
+
+**What is known of Claude Code here, and how.** On 2026-11-22, of Claude Code 2.1.328:
+
+- `claude --help` lists `--json-schema <schema>`: the schema is given inline as JSON text, not as a
+  file path. (Read from the help.)
+- With `--json-schema` and `--output-format stream-json`, the init event's tools carried a
+  `StructuredOutput` tool, also with `--tools Read`. The final `result` had `is_error: false`,
+  subtype `success`, `structured_output` holding the parsed value, and `result` the same value as
+  JSON text. When the model first answered in plain text, native itself appended a user turn
+  requiring the `StructuredOutput` tool, and the model called it. (Observed, one model, one
+  schema; `--output-format json` was not itself run.)
+- The result-message schema lists the error subtypes `error_during_execution`, `error_max_turns`,
+  `error_max_budget_usd` and `error_max_structured_output_retries`, and its error variant carries
+  `errors: string[]` and no `result`. The code that gives up on a schema writes `is_error: true`,
+  that last subtype, terminal reason `structured_output_retry_exhausted`, and one `errors` entry.
+  The text output format then prints only `Error: <errors[0]>`. The bundle names
+  `MAX_STRUCTURED_OUTPUT_RETRIES`. (Read from the 2.1.328 bundle, not observed: no run that gave
+  up on its schema has been seen.)
+
 ## Preloading Context
 
 `--read` preloads files. A preset can preload more than files, via typed descriptors that land as
@@ -1061,7 +1163,9 @@ bare-claude --outcome run/result.json --journal run/home/projects/<key>/<session
 
 This prints one JSON object: `reader` (this package's name and version), `result`, `journal` and
 `join`. Either flag may be given alone. Exit status 1 means only that a named file could not be
-read; it never says how the run ended.
+read; it never says how the run ended. For a run given `--output-schema`, add `--outcome-schema`:
+`result` then carries `schema`, its [schema outcome](#output-schema). A result file cannot say by
+itself that a schema was given, so without the flag there is no `schema`.
 
 For many files, read them in one process:
 
@@ -1069,15 +1173,19 @@ For many files, read them in one process:
 bare-claude --outcome-batch requests.jsonl     # or `-` for stdin
 ```
 
-- **Input.** Each non-empty line is `{"id"?: string, "result"?: path, "journal"?: path}`, or
+- **Input.** Each non-empty line is
+  `{"id"?: string, "result"?: path, "journal"?: path, "outputSchema"?: boolean}`, or
   `{"id"?: string, "custody": dir}`, read as [`--outcome-custody`](#reading-a-custody-directory)
-  reads it. A custody line that also names a result or journal is refused: the directory names its
-  own. Relative paths resolve against the current directory.
+  reads it. `"outputSchema": true` reads the result as `--outcome-schema` does, and needs a
+  `result`. A custody line that also names a result, a journal or `outputSchema` is refused: the
+  directory names its own, and its invocation record says whether the run had a schema. Relative
+  paths resolve against the current directory.
 - **Output.** One JSON line per input line, in order, with `line`, `id`, `reading` and `error`.
   A bad line, or a file that cannot be read, is that line's `error`; the others are still read.
 - **Each file is read once.** Each distinct path is read once per batch, so every line naming a
-  file refers to the same bytes; each distinct custody directory likewise. Exit 1 only when the
-  requests themselves cannot be read.
+  file refers to the same bytes; each distinct custody directory likewise. A result named both
+  with and without `outputSchema` is read once for each. Exit 1 only when the requests themselves
+  cannot be read.
 
 **What a reading says, and what it does not.** Nothing here decides whether a process has ended,
 whether the work was done, or whether anything was delivered. `status: "no-error"` means only that
@@ -1096,7 +1204,8 @@ Results, observed on Claude Code 2.1.292, carry three scopes under similar names
 **Other result fields:**
 
 - `subtype` was `"success"` on every error result observed. It is reported verbatim and never
-  read as an outcome; `status` comes from `is_error` alone.
+  read as an outcome; `status` comes from `is_error` alone. The one exception is `schema`, the
+  [schema outcome](#output-schema), where the subtype may be the only discriminator.
 - `terminalReason`, `stopReason` and `safetyStops` are reported verbatim. `stopReason` and
   `safetyStops` are not interpreted.
 - `contextLimit` is set only on an error result. It says whether `terminal_reason` was
@@ -1146,16 +1255,21 @@ alone cannot attribute a context-limit ending to the result's process.
 
 **Programmatically**, from `@agladysh/bare-claude/outcome`:
 
-- `readResult(bytes)`, `readJournal(bytes)` and `joinResult(result, journal)`: pure, and they
-  never throw.
+- `readResult(bytes, options?)`, `readJournal(bytes)` and `joinResult(result, journal)`: pure,
+  and they never throw. `readResult(bytes, { outputSchema: true })` adds `schema`, a
+  `SchemaOutcome`; `noResultSchemaOutcome(detail)` is the outcome of a schema run with no result
+  to read.
 - `readOutcome(result, journal)`: puts two readings together.
 - `readOutcomeFiles(requests, readFile)`: the batch reader, with your own file reader.
 - `parseOutcomeRequest(line)`: reads one batch line, as an `OutcomeRequest`, a `CustodyRequest`
   or why it is neither.
 - `callTokens(usage)` and `isMeasuredPrompt(tokens)`.
-- Constants: `contextLimitText`, `contextLimitTerminalReason`, `processScope` and `sessionScope`.
-- Types: `TokenSums`, `ResultReading`, `JournalReading`, `JournalSegment`, `ResultJournalJoin`, `JoinKind`,
-  `OutcomeRequest`, `CustodyRequest` and `OutcomeEntry`, with their parts.
+- Constants: `contextLimitText`, `contextLimitTerminalReason`, `processScope`, `sessionScope`,
+  `structuredOutputRetriesSubtype` and `structuredOutputRetriesTerminalReason`.
+- Types: `TokenSums`, `ResultReading`, `ResultOptions`, `JournalReading`, `JournalSegment`,
+  `ResultJournalJoin`, `JoinKind`, `OutcomeRequest`, `CustodyRequest`, `OutcomeEntry`,
+  `SchemaOutcome`, `SchemaEnforcer`, `SchemaValidationError` and `NoFinalMessageReason`, with
+  their parts.
 
 ### Reading a custody directory
 
@@ -1254,7 +1368,8 @@ throws, resolving with a `CustodyReading`: `CustodyState`, `CustodyRecordReading
 `CustodyFileRead`, `CustodyWrittenIn`, `CustodyOutputReading`, `CustodyStdoutReading`,
 `CustodyStdoutResult`, `CustodyJournalReading`, `CustodyAppendedJournal`, `CustodyJournalBoundary`,
 `CustodyJoin` and `RecordedDigest`, with the constants `custodyReadingVersion`, `custodyReadingScope` and
-`stdoutProvenance`.
+`stdoutProvenance`. A reading's `schema` is the run's [schema outcome](#output-schema), `null` when
+its invocation records no output schema.
 
 ### Briefing a custody directory
 
@@ -1339,6 +1454,7 @@ shortened with `…`.
     "terminalReason": "completed", "stopReason": "end_turn", "numTurns": 23, "apiErrorStatus": null,
     "contextLimit": null, "sessionId": "0199e7a0-…"
   },
+  "schema": null,
   "join": { "kind": "joined", "over": "appended" },
   "measured": {
     "lastCall": { "prompt": 387000, "output": 2400, "from": "result" },
@@ -1483,7 +1599,7 @@ const briefs = readings.map(reading => briefCustody(reading, readings));
 
 The brief is a `CustodyBrief`, made of `BriefRun`, `BriefEnd`, `BriefSession` (with `BriefSeeded`),
 `BriefLineage` (`LineageLink`, `LineageEnd`, `LineageEndStatus`, `LineageMatch`,
-`LineageInheritedCall`), `BriefResult`, `BriefMeasured` (`BriefInheritedTotals`, `BriefAppended`),
+`LineageInheritedCall`), `BriefResult`, `BriefSchema`, `BriefMeasured` (`BriefInheritedTotals`, `BriefAppended`),
 `BriefOutput` and `BriefJournal`. Its constants are `custodyBriefVersion`, `custodyBriefScope`
 and `briefCostBasis`.
 
@@ -1736,6 +1852,11 @@ Optional:
 - `maxOutputLength`: one number for `BASH_MAX_OUTPUT_LENGTH`, `TASK_MAX_OUTPUT_LENGTH` and
   `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS` in the settings `env`. Defaults to `null`, which sets
   none of them.
+- `outputSchemaFile`: a JSON Schema file the final answer must satisfy. Read by `LaunchConfig`
+  before anything is created or spawned, and passed verbatim as `--json-schema <text>`; refused
+  with an `OutputSchemaError` when it cannot be read, is not a JSON object, or `extraArgs` also
+  holds `--json-schema`. Sets no output format: pass `--output-format json` in `extraArgs` to
+  read the outcome. Not a preset field. Defaults to `null`. See [Output schema](#output-schema).
 - `extraEnv`: Additional environment variables to set for the Claude process. Defaults to `{}`.
 - `extraArgs`: Additional command-line arguments to pass to Claude. Defaults to `[]`.
 - `extraSettings`: Additional settings, deep-merged into Claude's configuration last, so they
@@ -1898,8 +2019,8 @@ the reading as `observation.json` and calls `onEvent` with `observed`. Whatever 
 that event's `error`, and changes neither the completion nor what `runInCustody` resolves with.
 
 The records are `CustodyInvocation`, `CustodyStart` and `CustodyCompletion`, each with `format` and
-`version` (`custodyVersion`, still 1: `configuration`, `directory` and `seededJournal` were added,
-and nothing else changed meaning);
+`version` (`custodyVersion`, still 1: `configuration`, `directory`, `seededJournal` and
+`outputSchema` (`CustodyOutputSchema`) were added, and nothing else changed meaning);
 a completion's `scope` is `completionScope`. Within them: `CustodySession`, `CustodyOutput`,
 `CustodyJournal`, `CustodyOutcome`, `CustodyStopCause`, `ProcessIdentity`, `CustodyIdentity` and
 `RecordedConfiguration`; `processGroupAfter` is a `ProcessGroupReading` from
@@ -1911,12 +2032,15 @@ a completion's `scope` is `completionScope`. Within them: `CustodySession`, `Cus
 `spawnClaude` is assembly plus side effects. The assembly is exported separately, so the whole
 flag matrix can be inspected and tested without spawning anything:
 
-- `LaunchConfig(options)`: resolves `LaunchOptions` to a fully defaulted `LaunchConfig`.
+- `LaunchConfig(options)`: resolves `LaunchOptions` to a fully defaulted `LaunchConfig`. The one
+  file it reads is `outputSchemaFile`, into `outputSchema` (an `OutputSchema`: absolute `file`,
+  verbatim `text`, `bytes`, `sha256`); `readOutputSchema(file)` does that alone. Both refuse with
+  an `OutputSchemaError` whose `reason` is an `OutputSchemaRefusal`.
 - `buildArgv(config, sessionId)`: the full command vector, `argv[0]` included.
 - `buildSettings(config)`: the `settings.json` document.
 - `buildEnv(config, { ephemeralClaudeHomePath, processEnv?, spawnEnv? })`: the child environment.
 
-All three are pure — no filesystem, no clock, no subprocess.
+All three builders are pure — no filesystem, no clock, no subprocess.
 
 #### Precedence
 

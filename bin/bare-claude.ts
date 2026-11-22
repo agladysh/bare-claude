@@ -36,7 +36,8 @@ import {
 import { alternateCredentialVariables, tokenVariable } from '@agladysh/bare-claude/token';
 import { readUsage } from '@agladysh/bare-claude/usage';
 import {
-  parseOutcomeRequest, readOutcomeFiles, type CustodyRequest, type OutcomeEntry, type OutcomeRequest
+  noResultSchemaOutcome, parseOutcomeRequest, readOutcomeFiles, readResult,
+  type CustodyRequest, type OutcomeEntry, type OutcomeRequest, type SchemaOutcome
 } from '@agladysh/bare-claude/outcome';
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -69,6 +70,13 @@ function displayHelp() {
     '                         Set Claude Code\'s tool output length variables',
     '      --claude-path <path>  Claude Code executable to run (default: claude on PATH)',
     '      --claude-arg <arg> Forward a flag to claude verbatim (repeatable)',
+    '      --output-schema <file>',
+    '                         JSON Schema file the final answer must satisfy, passed to',
+    '                         claude as --json-schema and enforced by it. Asks for',
+    '                         --output-format json unless another format is forwarded,',
+    '                         which is refused. Exit 0 only for a conforming answer:',
+    '                         65 when claude gave up on the schema, 66 when it exited 0',
+    '                         with no structured answer',
     '      --token-file <path>',
     '                         File holding the OAuth token, used when the environment',
     '                         has none (default: $BARE_CLAUDE_TOKEN_FILE, then',
@@ -95,12 +103,15 @@ function displayHelp() {
     '      --outcome <file>   Read a finished run\'s --output-format json result and',
     '                         print what it says as JSON; exit 1 only if unreadable',
     '      --journal <file>   Its session journal, with --outcome or alone',
+    '      --outcome-schema   With --outcome: the run had --output-schema; also report',
+    '                         its schema outcome. Custody directories record their own',
     '      --outcome-custody <dir>',
     '                         Read a custody directory: its records, its stdout as a',
     '                         result, its journal, and what changed since completion',
     '      --outcome-batch <file|->',
-    '                         Read many {"id","result","journal"} or {"id","custody"}',
-    '                         lines in one process, printing one JSON line per line',
+    '                         Read many {"id","result","journal","outputSchema"} or',
+    '                         {"id","custody"} lines in one process, printing one JSON',
+    '                         line per line',
     '      --brief            With --outcome-custody or --outcome-batch: one compact',
     '                         JSON line per custody directory instead of its reading,',
     '                         with no prompt, result, error or stderr text. A batch seeks',
@@ -197,6 +208,7 @@ async function readBytes(file: string): Promise<Uint8Array> {
 /** A batch request with its paths resolved against this process's cwd. */
 function resolveRequest(request: OutcomeRequest): OutcomeRequest {
   return {
+    ...request,
     id: request.id,
     result: request.result === null ? null : path.resolve(request.result),
     journal: request.journal === null ? null : path.resolve(request.journal),
@@ -205,14 +217,16 @@ function resolveRequest(request: OutcomeRequest): OutcomeRequest {
 
 /**
  * `--outcome` and `--journal`: what a finished run's files say, as JSON on
- * stdout. The exit status says whether the named files were read, never how
- * the run ended.
+ * stdout; with `--outcome-schema`, the result's reading carries `schema`.
+ * The exit status says whether the named files were read, never how the run
+ * ended.
  */
-async function reportOutcome(resultPath: string | undefined, journalPath: string | undefined): Promise<number> {
+async function reportOutcome(resultPath: string | undefined, journalPath: string | undefined, outputSchema: boolean): Promise<number> {
   const [ entry ] = await readOutcomeFiles([ resolveRequest({
     id: null,
     result: resultPath ?? null,
     journal: journalPath ?? null,
+    ...(outputSchema ? { outputSchema } : {}),
   }) ], readBytes);
   if (entry === undefined || entry.reading === null) {
     process.stderr.write(`bare-claude: ${entry?.error ?? 'nothing was read'}\n`);
@@ -427,6 +441,12 @@ async function loadPreset(): Promise<Startup> {
       journal: {
         type: 'string',
       },
+      'outcome-schema': {
+        type: 'boolean',
+      },
+      'output-schema': {
+        type: 'string',
+      },
       'outcome-batch': {
         type: 'string',
       },
@@ -492,6 +512,10 @@ async function loadPreset(): Promise<Startup> {
   if (brief && values['outcome-custody'] === undefined && values['outcome-batch'] === undefined) {
     throw new Error('--brief needs --outcome-custody or --outcome-batch');
   }
+  const outcomeSchema = values['outcome-schema'] === true;
+  if (outcomeSchema && values.outcome === undefined) {
+    throw new Error('--outcome-schema needs --outcome: a custody directory records its own schema, and a batch line says {"outputSchema": true}');
+  }
 
   if (values.version) {
     process.stdout.write(`${pkg.version}\n`);
@@ -541,7 +565,7 @@ async function loadPreset(): Promise<Startup> {
   }
 
   if (values.outcome !== undefined || values.journal !== undefined) {
-    return { kind: 'done', exitCode: await reportOutcome(values.outcome, values.journal) };
+    return { kind: 'done', exitCode: await reportOutcome(values.outcome, values.journal, outcomeSchema) };
   }
 
   const choice = configChoice(values.config, values['no-config']);
@@ -593,11 +617,50 @@ async function loadPreset(): Promise<Startup> {
 
   // Read once: what is resolved and what custody records of it are the same bytes.
   const configuration = await readConfiguration(choice);
+  const preset = resolveInvocation(configuration.config, fromCli, values.use);
+  if (values['output-schema'] !== undefined) {
+    withOutputSchema(preset, values['output-schema']);
+  }
   return {
     kind: 'run',
-    preset: resolveInvocation(configuration.config, fromCli, values.use),
+    preset,
     configuration: configurationOf(configuration, values.use),
   };
+}
+
+/**
+ * The value of the last `--output-format` among forwarded arguments, in
+ * either spelling, or null when there is none.
+ */
+function outputFormatOf(args: readonly string[]): string | null {
+  let format: string | null = null;
+  for (const [ index, arg ] of args.entries()) {
+    if (arg === '--output-format') {
+      format = args[index + 1] ?? null;
+    } else if (arg.startsWith('--output-format=')) {
+      format = arg.slice('--output-format='.length);
+    }
+  }
+  return format;
+}
+
+/**
+ * `--output-schema`: the run's schema, set on the resolved preset, which can
+ * never carry one itself. Claude Code reports how the answer fared only in
+ * its `--output-format json` result (in text it prints `Error: …` alone; read
+ * from the 2.1.328 bundle), and the exit status is read from that report, so
+ * that format is asked for when nothing else was forwarded, and another one
+ * is refused. The file itself is read and refused by `LaunchConfig`.
+ */
+function withOutputSchema(preset: Preset, file: string): void {
+  const args = preset.extraArgs ?? [];
+  const format = outputFormatOf(args);
+  if (format === null) {
+    preset.extraArgs = [ ...args, '--output-format', 'json' ];
+  } else if (format !== 'json') {
+    throw new Error(`--output-schema needs claude's --output-format json, where it reports how the answer fared; --output-format ${format} was forwarded`);
+  }
+  preset.outputSchemaFile = file;
 }
 
 function isLauncher(value: string): value is Launcher {
@@ -820,8 +883,11 @@ async function main() {
   // A process group of its own, so a stop reaches what the spawned process
   // starts — a launcher's native child included — and a terminal's Ctrl-C
   // reaches the run only through the supervisor, in order.
+  // A run given a schema keeps its whole stdout, the result its exit status
+  // is read from, and under --print passes it on as it comes.
+  const schema = typeof preset.outputSchemaFile === 'string';
   const claude = await spawnClaude(preset, {
-    stdout: preset.print ? 'inherit' : 'pipe',
+    stdout: preset.print && !schema ? 'inherit' : 'pipe',
     detached: process.platform !== 'win32',
   }).catch((error: unknown) => {
     supervisor.release();
@@ -849,7 +915,7 @@ async function main() {
     // failed launch produces — Claude Code reports "Not logged in" here and
     // then exits 1, sometimes without writing a session file at all.
     const stdout = claude.subprocess.stdout;
-    capture = stdout instanceof ReadableStream ? captureTail(stdout) : null;
+    capture = stdout instanceof ReadableStream ? captureStdout(stdout, { keep: schema, echo: preset.print }) : null;
 
     if (preset.verbose || preset.debug) {
       process.stdout.write(`${claude.sessionJsonlPath}\n`);
@@ -879,7 +945,8 @@ async function main() {
     if (exitCode !== 0 || stoppedBy !== null) {
       keepHome = true;
 
-      if (capture !== null) {
+      // Under --print the output has already been passed on.
+      if (capture !== null && !preset.print) {
         // Bounded: a descendant can hold the pipe open long after the child
         // has gone.
         const tail = (await within(capture.tail, capturedWaitMs, '')).trim();
@@ -892,7 +959,18 @@ async function main() {
     // The shell convention for a command ended by a signal, whatever the
     // child's own exit was: a runner must not read a stopped run as a
     // completed one.
-    return stoppedBy === null ? exitCode : signalExitStatus(stoppedBy);
+    if (stoppedBy !== null) {
+      return signalExitStatus(stoppedBy);
+    }
+    if (schema) {
+      // Bounded, as above; a stdout not closed by then is no result.
+      const bytes = capture === null ? null : await within(capture.bytes, capturedWaitMs, null);
+      const outcome = bytes === null
+        ? noResultSchemaOutcome('stdout was not captured to its end')
+        : readResult(bytes, { outputSchema: true }).schema ?? noResultSchemaOutcome('the result was read without its schema');
+      return schemaExitStatus(exitCode, outcome);
+    }
+    return exitCode;
   } finally {
     // Never rm a live config directory out from under a running child: a
     // failure above still ends the run in order before anything is removed.
@@ -972,6 +1050,8 @@ async function runUnderCustody(
   process.stdout.on('error', endStream);
 
   let group: number | null = null;
+  // Set from the `observed` event; a holder, since it is set in a callback.
+  const observed: { reading: CustodyReading | null } = { reading: null };
   const completion = await runInCustody(preset, {
     directory: custody.directory,
     keepCallToAction: custody.keepCallToAction,
@@ -980,6 +1060,9 @@ async function runUnderCustody(
     onEvent: event => {
       if (event.kind === 'started') {
         group = event.start.processGroup;
+      }
+      if (event.kind === 'observed') {
+        observed.reading = event.observation;
       }
       if (streaming) {
         try {
@@ -1008,6 +1091,12 @@ async function runUnderCustody(
   // A run whose custody failed is not passed off as a success.
   if (completion.exitStatus === null || (completion.exitStatus === 0 && completion.custodyError !== null)) {
     return 1;
+  }
+  // The schema outcome as the directory's own reading says it, the one
+  // `--outcome-custody` gives any later reader.
+  if (typeof preset.outputSchemaFile === 'string') {
+    const outcome = observed.reading?.schema ?? noResultSchemaOutcome('the custody directory was not read after the completion');
+    return schemaExitStatus(completion.exitStatus, outcome);
   }
   return completion.exitStatus;
 }
@@ -1182,31 +1271,85 @@ interface Capture {
   /** The last {@link maxCapturedStdout} characters, once the stream ends or reading stops. */
   tail: Promise<string>,
 
+  /**
+   * Every byte, once the stream has ended; null when the capture keeps none,
+   * or reading stopped before the end, since part of a result is no result.
+   */
+  bytes: Promise<Uint8Array | null>,
+
   /** Stops reading; the stream is cancelled and `tail` resolves with what was read. */
   stop(): void,
 }
 
-/** Drains a stream, keeping only its last {@link maxCapturedStdout} characters. */
-function captureTail(stream: ReadableStream<Uint8Array>): Capture {
+/**
+ * Drains a stream, keeping its last {@link maxCapturedStdout} characters, and
+ * with `keep` every byte; with `echo`, passing each chunk on to this
+ * process's stdout as it comes.
+ */
+function captureStdout(stream: ReadableStream<Uint8Array>, options: { keep: boolean, echo: boolean }): Capture {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
+  const chunks: Uint8Array[] = [];
   let tail = '';
-  const read = async (): Promise<string> => {
+  const read = async (): Promise<{ tail: string, bytes: Uint8Array | null }> => {
+    let ended = false;
     try {
       for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
+        if (options.echo) {
+          process.stdout.write(chunk.value);
+        }
+        if (options.keep) {
+          chunks.push(chunk.value);
+        }
         tail = (tail + decoder.decode(chunk.value, { stream: true })).slice(-maxCapturedStdout);
       }
+      ended = true;
     } catch {
       // A cancelled or broken pipe ends the capture; what was read stands.
     }
-    return (tail + decoder.decode()).slice(-maxCapturedStdout);
+    return {
+      tail: (tail + decoder.decode()).slice(-maxCapturedStdout),
+      bytes: options.keep && ended ? Buffer.concat(chunks) : null,
+    };
   };
+  const done = read();
   return {
-    tail: read(),
+    tail: done.then(d => d.tail),
+    bytes: done.then(d => d.bytes),
     stop: () => {
       reader.cancel().catch(() => { /* Already closed. */ });
     },
   };
+}
+
+/**
+ * Exit statuses of a run given `--output-schema` whose answer did not
+ * conform: `notConforming` when Claude Code reported it gave up on the
+ * schema, `noFinalMessage` when claude exited 0 with no structured answer.
+ * Chosen from sysexits (EX_DATAERR, EX_NOINPUT), clear of the 0 and 1 claude
+ * exits with.
+ */
+const schemaExit = { notConforming: 65, noFinalMessage: 66 } as const;
+
+/**
+ * A schema run's exit status, when no stop came: 0 only for a conforming
+ * answer of a claude that exited 0. A give-up is 65 whatever claude exited
+ * with; otherwise a claude that failed keeps its own status, and one that
+ * exited 0 without a structured answer is 66. Says why on stderr whenever the
+ * answer did not conform.
+ */
+function schemaExitStatus(exitCode: number, outcome: SchemaOutcome): number {
+  switch (outcome.kind) {
+    case 'conforming':
+      return exitCode;
+    case 'not-conforming':
+      process.stderr.write(`bare-claude: output schema: not-conforming, enforced by ${outcome.enforcedBy}; `
+        + `${outcome.errors.length} error(s) in the result\n`);
+      return schemaExit.notConforming;
+    case 'no-final-message':
+      process.stderr.write(`bare-claude: output schema: no-final-message (${outcome.reason}): ${outcome.detail}\n`);
+      return exitCode === 0 ? schemaExit.noFinalMessage : exitCode;
+  }
 }
 
 /**

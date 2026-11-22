@@ -125,6 +125,18 @@ Verified against `claude` 2.1.220 on macOS. Re-verify, with a dated note, when t
   hides this. Anything keyed on a cwd must go through `physicalCwd()`.
 - `claude` exits 1 on auth failure. Anything this project builds must propagate that; a wrapper
   that returns 0 when the run failed is worse than no wrapper.
+- Structured output, 2026-11-22, claude 2.1.328. Read from `--help`: `--json-schema` takes the
+  schema inline as JSON text, not a path. Observed with `-p --output-format stream-json --verbose
+  --json-schema '<object schema>'`: the init event's tools hold `StructuredOutput`, also under
+  `--tools Read`. The `result` event has `is_error: false`, subtype `success`, `structured_output`
+  as the parsed value, and `result` as the same JSON text. Native, not the model, injected a user
+  turn demanding the tool after a plain-text answer. Read from the bundle (`grep -a` on
+  `versions/2.1.328`), **not observed**: a schema give-up writes `is_error: true`, subtype
+  `error_max_structured_output_retries`, terminal reason `structured_output_retry_exhausted` and
+  `errors: [msg]`, with no `result` field. Text output prints only `Error: <errors[0]>`, so only a
+  JSON result tells the kinds apart. That subtype is the one place `src/outcome.ts` reads a
+  subtype. Re-probe by forcing a give-up (`MAX_STRUCTURED_OUTPUT_RETRIES`, an unsatisfiable
+  schema) once someone pays for the run.
 
 ## Measured facts about Bun
 

@@ -22,14 +22,18 @@
  *   of the journal's `cost-state` record written at the same process end.
  *   Its costs are Claude Code's own figures, not billing or subscription usage.
  * - `subtype` was `"success"` on every error result read; it is carried
- *   verbatim and never read as an outcome. `is_error` and `terminal_reason`
- *   are read; `stop_reason` and `safety_stops` are carried verbatim.
+ *   verbatim and never read as an outcome, with one exception: the
+ *   {@link SchemaOutcome} of a run given an output schema (see there).
+ *   `is_error` and `terminal_reason` are read; `stop_reason` and
+ *   `safety_stops` are carried verbatim.
  * - The native version is on journal record envelopes (`version`). Neither
  *   the result nor a `cost-state` record carries one, and a `cost-state`
  *   record has no `uuid` or `timestamp` either.
  */
 
 import { createHash } from 'node:crypto';
+
+import type { Json } from '@agladysh/bare-claude';
 
 import { syntheticModel } from './events.ts';
 
@@ -78,6 +82,125 @@ function sha256(bytes: Uint8Array): string {
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Narrows a parsed value to {@link Json}; anything `JSON.parse` returns is. */
+function isJson(v: unknown): v is Json {
+  if (v === null || typeof v === 'string' || typeof v === 'boolean') {
+    return true;
+  }
+  if (typeof v === 'number') {
+    return Number.isFinite(v);
+  }
+  if (Array.isArray(v)) {
+    return v.every(isJson);
+  }
+  return isRecord(v) && Object.values(v).every(isJson);
+}
+
+/**
+ * The `subtype` of a result whose run never produced an answer that passed
+ * its schema. Read from the claude 2.1.328 bundle on 2026-11-22, not
+ * observed in a run: its result-message schema lists it among the error
+ * subtypes, and the code that ends such a run writes it with `is_error: true`
+ * and `errors`.
+ */
+export const structuredOutputRetriesSubtype = 'error_max_structured_output_retries';
+
+/** The `terminal_reason` the same 2.1.328 code writes beside {@link structuredOutputRetriesSubtype}. Read from the bundle, not observed. */
+export const structuredOutputRetriesTerminalReason = 'structured_output_retry_exhausted';
+
+/**
+ * Who checked an answer against its schema: `native`, the harness itself,
+ * which Bare Claude always is (`claude --json-schema`); or `wrapper`, a
+ * wrapper's own JSON Schema validator after the fact, for a sibling wrapper
+ * whose harness enforces nothing. The two share {@link SchemaOutcome}.
+ */
+export type SchemaEnforcer = 'native' | 'wrapper';
+
+/** One error of a JSON Schema validator, as a wrapper that validates itself reports it. */
+export interface SchemaValidationError {
+  instancePath: string,
+  keyword: string,
+  message: string,
+}
+
+/**
+ * Why a run given a schema has no final message to judge: `no-result`,
+ * nothing was written where the result should be, or nothing there was read
+ * as a result; `unreadable-result`, bytes that are not a result object; or
+ * `no-structured-output`, a result without `structured_output`, which neither
+ * says the schema was met nor that native gave up on it.
+ */
+export type NoFinalMessageReason = 'no-result' | 'unreadable-result' | 'no-structured-output';
+
+/**
+ * How a run given an output schema answered, as the enforcer reported it:
+ *
+ * - `conforming`: the result carries `structured_output`, the answer the
+ *   enforcer accepted, as `value`.
+ * - `not-conforming`: the enforcer gave up on the schema. `errors` is what
+ *   it said, verbatim: native's `errors` strings, or a validator's errors.
+ *   `finalText` is the result's text, if it has any.
+ * - `no-final-message`: neither, with a reason code and a detail.
+ *
+ * Nothing here reads or judges the answer's content beyond what the enforcer
+ * reported about the schema, and `conforming` is not a judgment that the
+ * work was done, nor that native reported no error: that is the result's
+ * `status`.
+ *
+ * Bare Claude reads native's report from the `--output-format json` result.
+ * `conforming` when it carries a non-null `structured_output` (observed
+ * 2026-11-22 on claude 2.1.328: `is_error: false`, subtype `success`, the
+ * parsed value, and `result` the same value as JSON text). `not-conforming`
+ * when it says `is_error: true` with subtype
+ * {@link structuredOutputRetriesSubtype} or terminal reason
+ * {@link structuredOutputRetriesTerminalReason}: the one place a subtype is
+ * read, since it may be the only discriminator. That shape is read from the
+ * 2.1.328 bundle; no such run has been observed.
+ */
+export type SchemaOutcome =
+  | { kind: 'conforming', enforcedBy: SchemaEnforcer, value: Json }
+  | { kind: 'not-conforming', enforcedBy: 'native', errors: string[], finalText: string | null }
+  | { kind: 'not-conforming', enforcedBy: 'wrapper', errors: SchemaValidationError[], finalText: string | null }
+  | { kind: 'no-final-message', enforcedBy: SchemaEnforcer, reason: NoFinalMessageReason, detail: string };
+
+/**
+ * The {@link SchemaOutcome} of a run given a schema whose result was never
+ * read: stdout not asked for as `--output-format json`, a run that never
+ * started, a file that is not there.
+ * @param detail - Why there is no result to read
+ */
+export function noResultSchemaOutcome(detail: string): SchemaOutcome {
+  return { kind: 'no-final-message', enforcedBy: 'native', reason: 'no-result', detail };
+}
+
+/** The schema outcome of a parsed result object. */
+function schemaOutcomeOf(parsed: Record<string, unknown>): SchemaOutcome {
+  const subtype = bounded(parsed.subtype, idLimit);
+  const terminalReason = bounded(parsed.terminal_reason, idLimit);
+  if (parsed.is_error === true
+    && (subtype === structuredOutputRetriesSubtype || terminalReason === structuredOutputRetriesTerminalReason)) {
+    return {
+      kind: 'not-conforming',
+      enforcedBy: 'native',
+      errors: (listOf(parsed.errors) ?? []).flatMap(e => typeof e === 'string' ? [ e ] : []),
+      finalText: typeof parsed.result === 'string' ? parsed.result : null,
+    };
+  }
+  const value = parsed.structured_output;
+  if (value !== undefined && value !== null && isJson(value)) {
+    return { kind: 'conforming', enforcedBy: 'native', value };
+  }
+  const said = `is_error ${JSON.stringify(parsed.is_error ?? null)}, subtype ${JSON.stringify(subtype)}, terminal_reason ${JSON.stringify(terminalReason)}`;
+  return {
+    kind: 'no-final-message',
+    enforcedBy: 'native',
+    reason: 'no-structured-output',
+    detail: value === null
+      ? `the result's structured_output is null (${said})`
+      : `the result carries no structured_output (${said})`,
+  };
 }
 
 /**
@@ -228,6 +351,20 @@ export interface ResultReading {
     contextWindow: number | null,
     scope: string,
   } | null,
+
+  /**
+   * How the run's answer fared against its output schema. Present only when
+   * the reader was told the run had one ({@link ResultOptions.outputSchema});
+   * absent otherwise, since a result without `structured_output` cannot say
+   * whether a schema was given.
+   */
+  schema?: SchemaOutcome,
+}
+
+/** What the reader of a result is told about the run that wrote it. */
+export interface ResultOptions {
+  /** The run was given an output schema (`outputSchemaFile`); read its {@link SchemaOutcome}. */
+  outputSchema?: boolean,
 }
 
 function lastCallOf(usage: unknown): { lastCall: LastCall | null, missing: string | null } {
@@ -274,8 +411,29 @@ function modelTotals(v: unknown): ModelTotals[] {
  * Reads the bytes `claude --print --output-format json` wrote. Never throws:
  * an empty, cut-short or foreign file is itself a finding, with the digest of
  * what was there.
+ * @param bytes - The result file's bytes
+ * @param options - What the reader knows of the run; with `outputSchema`,
+ *   the reading carries `schema`, a `no-final-message` one when the bytes are
+ *   no result
  */
-export function readResult(bytes: Uint8Array): ResultReading {
+export function readResult(bytes: Uint8Array, options: ResultOptions = {}): ResultReading {
+  const read = readResultFile(bytes);
+  if (options.outputSchema !== true) {
+    return read.reading;
+  }
+  const schema: SchemaOutcome = read.parsed !== null
+    ? schemaOutcomeOf(read.parsed)
+    : {
+      kind: 'no-final-message',
+      enforcedBy: 'native',
+      reason: read.reading.file === 'empty' ? 'no-result' : 'unreadable-result',
+      detail: read.reading.why ?? 'the bytes are not a result',
+    };
+  return { ...read.reading, schema };
+}
+
+function readResultFile(bytes: Uint8Array): { reading: ResultReading, parsed: Record<string, unknown> | null } {
+  const finding = (reading: ResultReading) => ({ reading, parsed: null });
   const reading: ResultReading = {
     bytes: bytes.length,
     sha256: bytes.length === 0 ? null : sha256(bytes),
@@ -302,20 +460,20 @@ export function readResult(bytes: Uint8Array): ResultReading {
   try {
     text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
   } catch {
-    return { ...reading, file: 'unreadable', why: 'not UTF-8 text' };
+    return finding({ ...reading, file: 'unreadable', why: 'not UTF-8 text' });
   }
   if (text.trim() === '') {
-    return { ...reading, file: 'empty', why: 'nothing but whitespace was written' };
+    return finding({ ...reading, file: 'empty', why: 'nothing but whitespace was written' });
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    return { ...reading, file: 'unreadable', why: 'not one JSON document; possibly cut short' };
+    return finding({ ...reading, file: 'unreadable', why: 'not one JSON document; possibly cut short' });
   }
   if (!isRecord(parsed) || parsed.type !== 'result') {
-    return { ...reading, file: 'not-a-result', why: 'not a Claude Code result object' };
+    return finding({ ...reading, file: 'not-a-result', why: 'not a Claude Code result object' });
   }
 
   const status: ResultStatus = parsed.is_error === true ? 'error' : parsed.is_error === false ? 'no-error' : 'unstated';
@@ -328,7 +486,7 @@ export function readResult(bytes: Uint8Array): ResultReading {
   const models = modelTotals(parsed.modelUsage);
   const windows = [ ...new Set(models.flatMap(m => m.contextWindow === null ? [] : [ m.contextWindow ])) ];
 
-  return {
+  const result: ResultReading = {
     ...reading,
     status,
     subtype: bounded(parsed.subtype, idLimit),
@@ -352,6 +510,7 @@ export function readResult(bytes: Uint8Array): ResultReading {
       scope: sessionScope,
     },
   };
+  return { reading: result, parsed };
 }
 
 /** Where in a journal a record is. */
@@ -743,6 +902,9 @@ export interface OutcomeRequest {
   id: string | null,
   result: string | null,
   journal: string | null,
+
+  /** The run was given an output schema: the result's reading carries `schema`. Absent means false. */
+  outputSchema?: boolean,
 }
 
 /**
@@ -765,18 +927,23 @@ export interface OutcomeEntry {
 
 /**
  * Reads one batch request from a line of JSON:
- * `{ "id"?: string, "result"?: string, "journal"?: string }`, with at least
- * one of `result` and `journal`, or `{ "id"?: string, "custody": string }`.
- * Returns the request, or why it is not one.
+ * `{ "id"?: string, "result"?: string, "journal"?: string, "outputSchema"?: boolean }`,
+ * with at least one of `result` and `journal`, or
+ * `{ "id"?: string, "custody": string }`, whose invocation record says
+ * itself whether the run had an output schema. Returns the request, or why
+ * it is not one.
  */
 export function parseOutcomeRequest(line: string): OutcomeRequest | CustodyRequest | string {
   const parsed = parseObject(line);
   if (parsed === null) {
     return 'not one JSON object';
   }
-  const { id, result, journal, custody } = parsed;
+  const { id, result, journal, custody, outputSchema } = parsed;
   if (id !== undefined && typeof id !== 'string') {
     return '`id` must be a string';
+  }
+  if (outputSchema !== undefined && typeof outputSchema !== 'boolean') {
+    return '`outputSchema` must be true or false';
   }
   if (custody !== undefined) {
     if (typeof custody !== 'string') {
@@ -785,7 +952,13 @@ export function parseOutcomeRequest(line: string): OutcomeRequest | CustodyReque
     if (result !== undefined || journal !== undefined) {
       return '`custody` cannot be combined with `result` or `journal`: a custody directory names its own';
     }
+    if (outputSchema !== undefined) {
+      return '`custody` cannot be combined with `outputSchema`: its invocation record says whether the run had one';
+    }
     return { id: typeof id === 'string' ? id : null, custody };
+  }
+  if (outputSchema === true && result === undefined) {
+    return '`outputSchema` needs a `result` to read';
   }
   if (result !== undefined && typeof result !== 'string') {
     return '`result` must be a path';
@@ -800,13 +973,15 @@ export function parseOutcomeRequest(line: string): OutcomeRequest | CustodyReque
     id: typeof id === 'string' ? id : null,
     result: typeof result === 'string' ? result : null,
     journal: typeof journal === 'string' ? journal : null,
+    ...(outputSchema === true ? { outputSchema } : {}),
   };
 }
 
 /**
  * Reads many requests in one process, in order. Each distinct path is read
  * once per call and its reading reused, so every entry that names a file
- * refers to the same bytes. A file that cannot be read makes that entry an
+ * refers to the same bytes; a result named both with and without
+ * `outputSchema` is read once for each. A file that cannot be read makes that entry an
  * error naming it; the others are read.
  */
 export async function readOutcomeFiles(
@@ -814,6 +989,7 @@ export async function readOutcomeFiles(
   readFile: (file: string) => Promise<Uint8Array>
 ): Promise<OutcomeEntry[]> {
   const results = new Map<string, Promise<ResultReading>>();
+  const schemaResults = new Map<string, Promise<ResultReading>>();
   const journals = new Map<string, Promise<JournalReading>>();
   const once = <T>(cache: Map<string, Promise<T>>, file: string, read: (bytes: Uint8Array) => T): Promise<T> => {
     const cached = cache.get(file);
@@ -827,10 +1003,17 @@ export async function readOutcomeFiles(
     return pending;
   };
 
+  const asResult = (bytes: Uint8Array) => readResult(bytes);
+  const asSchemaResult = (bytes: Uint8Array) => readResult(bytes, { outputSchema: true });
+
   const entries: OutcomeEntry[] = [];
   for (const request of requests) {
     try {
-      const result = request.result === null ? null : await once(results, request.result, readResult);
+      const result = request.result === null
+        ? null
+        : request.outputSchema === true
+          ? await once(schemaResults, request.result, asSchemaResult)
+          : await once(results, request.result, asResult);
       const journal = request.journal === null ? null : await once(journals, request.journal, readJournal);
       entries.push({ id: request.id, reading: readOutcome(result, journal), error: null });
     } catch (error) {

@@ -13,7 +13,11 @@
  *   environment value, no settings document, no token custody read. The call
  *   to action as its length and digest, and its text in `call-to-action.txt`
  *   only when the caller asks. `extraArgs` are recorded verbatim, so a secret
- *   passed there is recorded with them.
+ *   passed there is recorded with them. An output schema as its source path,
+ *   size and digest.
+ * - `output-schema.json`, before the spawn, only for a run given an output
+ *   schema: the schema's bytes as read, which is the file the run is given,
+ *   so what was recorded and what was passed are the same bytes.
  * - `stdout` and `stderr`: the spawned process's standard output and error,
  *   byte for byte. They are the child's own descriptors, so it writes them
  *   itself as it runs: nothing is buffered or interpreted here, and nothing
@@ -70,9 +74,9 @@ import {
   type SignalSource, type StopReport, type StopSignal, type SupervisorEvent,
 } from '@agladysh/bare-claude/lifecycle';
 import {
-  isMeasuredPrompt, joinResult, readJournal, readResult,
+  isMeasuredPrompt, joinResult, noResultSchemaOutcome, readJournal, readResult,
   type ContextLimitEvidence, type JoinKind, type JournalReading, type ResultFile, type ResultJournalJoin,
-  type ResultReading, type ResultStatus, type TokenSums,
+  type NoFinalMessageReason, type ResultReading, type ResultStatus, type SchemaOutcome, type TokenSums,
 } from '@agladysh/bare-claude/outcome';
 
 import pkg from '../package.json';
@@ -87,6 +91,7 @@ export const completionScope = 'how the spawned process ended, as custody saw it
 export const custodyFiles = {
   invocation: 'invocation.json',
   callToAction: 'call-to-action.txt',
+  outputSchema: 'output-schema.json',
   stdout: 'stdout',
   stderr: 'stderr',
   start: 'start.json',
@@ -197,6 +202,14 @@ export type CustodySession =
   | { kind: 'memory', sessionId: string }
   | { kind: 'file', sessionId: string, sourcePath: string, sourceSha256: string | null };
 
+/** An output schema as `invocation.json` records it; see `CustodyInvocation.outputSchema`. */
+export interface CustodyOutputSchema {
+  source: string,
+  kept: string,
+  bytes: number,
+  sha256: string,
+}
+
 /** `invocation.json`: what the caller chose, written before anything is spawned. */
 export interface CustodyInvocation {
   format: 'bare-claude/run-invocation',
@@ -249,6 +262,14 @@ export interface CustodyInvocation {
 
   /** Its length in bytes and digest; `kept` names its text's file when the caller asked for it. */
   callToAction: { bytes: number, sha256: string, kept: string | null },
+
+  /**
+   * The output schema the run was given: `source`, the caller's file,
+   * absolute; `kept`, the copy custody made and the run was given; the size
+   * and digest of the bytes in both. Null when the run had none; absent from
+   * records written before this field existed, which could not have one.
+   */
+  outputSchema?: CustodyOutputSchema | null,
 
   /**
    * The configuration as the caller stated it; null when it stated none.
@@ -589,6 +610,12 @@ export async function runInCustody(launchOptions: LaunchOptions, options: Custod
       sha256: sha256(config.callToAction),
       kept: keepCallToAction ? file(custodyFiles.callToAction) : null,
     },
+    outputSchema: config.outputSchema === null ? null : {
+      source: config.outputSchema.file,
+      kept: file(custodyFiles.outputSchema),
+      bytes: config.outputSchema.bytes,
+      sha256: config.outputSchema.sha256,
+    },
     configuration: recordedConfiguration(options.configuration),
   };
 
@@ -676,13 +703,19 @@ export async function runInCustody(launchOptions: LaunchOptions, options: Custod
     if (keepCallToAction) {
       await fs.writeFile(file(custodyFiles.callToAction), config.callToAction, { flag: 'wx', mode: 0o600 });
     }
+    // The run is given the kept copy, not the caller's file, which may have
+    // changed since it was read: the bytes recorded are the bytes passed.
+    const schema = config.outputSchema === null ? null : file(custodyFiles.outputSchema);
+    if (config.outputSchema !== null && schema !== null) {
+      await fs.writeFile(schema, config.outputSchema.text, { flag: 'wx', mode: 0o600 });
+    }
     const descriptors: number[] = [];
     try {
       const stdout = openSync(file(custodyFiles.stdout), 'wx', 0o600);
       descriptors.push(stdout);
       const stderr = openSync(file(custodyFiles.stderr), 'wx', 0o600);
       descriptors.push(stderr);
-      return await spawnClaude({ ...launchOptions, cwd, ephemeralClaudeHomePath: claudeHome }, {
+      return await spawnClaude({ ...launchOptions, cwd, ephemeralClaudeHomePath: claudeHome, outputSchemaFile: schema }, {
         env: options.env,
         stdin: 'ignore',
         stdout,
@@ -1055,6 +1088,16 @@ export interface CustodyReading {
    * {@link CustodyJoin} for which reading of the journal it is over.
    */
   join: CustodyJoin | null,
+
+  /**
+   * How the run's answer fared against the output schema `invocation.json`
+   * records, read from the stdout result (`stdout.result.reading.schema`), or
+   * `no-final-message` with reason `no-result` when stdout was not read as a
+   * result: the run must ask for `--output-format json` for native's report
+   * to be there. Null when the invocation records no output schema or could
+   * not be read. An `observation.json` kept by an earlier version lacks it.
+   */
+  schema: SchemaOutcome | null,
 }
 
 /**
@@ -1200,6 +1243,7 @@ const isCustodyInvocation = shape<CustodyInvocation>({
   claudeHome: isString,
   session: isSession,
   callToAction: shape<CustodyInvocation['callToAction']>({ bytes: isCount, sha256: isString, kept: nullable(isString) }),
+  outputSchema: optional(nullable(shape<CustodyOutputSchema>({ source: isString, kept: isString, bytes: isCount, sha256: isString }))),
   configuration: optional(nullable(isRecordedConfiguration)),
 });
 
@@ -1513,6 +1557,7 @@ function stdoutResultOf(
   unread: string | null,
   outputFormat: string | null,
   completion: CustodyCompletion | null,
+  outputSchema: boolean,
 ): CustodyStdoutResult {
   if (completion !== null && completion.outcome === 'not-started') {
     return { status: 'not-read', why: 'the run never started: no process was spawned to write this stdout' };
@@ -1521,9 +1566,9 @@ function stdoutResultOf(
     return { status: 'not-read', why: unread ?? 'nothing was read' };
   }
   if (outputFormat === 'json') {
-    return { status: 'read', basis: 'json-requested', reading: readResult(bytes) };
+    return { status: 'read', basis: 'json-requested', reading: readResult(bytes, { outputSchema }) };
   }
-  const reading = readResult(bytes);
+  const reading = readResult(bytes, { outputSchema });
   if (reading.file === 'result') {
     return { status: 'read', basis: 'parsed-as-result', reading };
   }
@@ -1725,13 +1770,20 @@ export async function readCustody(directory: string): Promise<CustodyReading> {
 
   const out = await readOutput(at(custodyFiles.stdout), recordedAt(custodyFiles.stdout), done?.stdout ?? null, problems);
   const outputFormat = invoked === null ? null : outputFormatIn(invoked.extraArgs);
+  const outputSchema = invoked !== null && invoked.outputSchema !== undefined && invoked.outputSchema !== null;
   const stdout: CustodyStdoutReading = {
     ...out.reading,
     writtenBy: invoked === null ? null : { launcher: invoked.launcher, executable: invoked.executable },
     provenance: stdoutProvenance,
     outputFormat,
-    result: stdoutResultOf(out.bytes, out.reading.why, outputFormat, done),
+    result: stdoutResultOf(out.bytes, out.reading.why, outputFormat, done, outputSchema),
   };
+  let schema: SchemaOutcome | null = null;
+  if (outputSchema) {
+    schema = stdout.result.status === 'read'
+      ? stdout.result.reading.schema ?? noResultSchemaOutcome('the result was read without its schema')
+      : noResultSchemaOutcome(`stdout was not read as a result: ${stdout.result.why}`);
+  }
   const stderr = (await readOutput(at(custodyFiles.stderr), recordedAt(custodyFiles.stderr), done?.stderr ?? null, problems)).reading;
   const journal = await readSessionJournal(invoked, started, done, writtenIn, problems);
 
@@ -1781,6 +1833,7 @@ export async function readCustody(directory: string): Promise<CustodyReading> {
     stderr,
     journal,
     join,
+    schema,
   };
 }
 
@@ -1966,6 +2019,17 @@ export type BriefResult =
     sessionId: string | null,
   };
 
+/**
+ * A reading's {@link SchemaOutcome}, classified: its kind, enforcer and, for
+ * `no-final-message`, its reason code. Never the answer, native's errors or
+ * any text; those stay in the reading. Null when the run had no output schema.
+ */
+export type BriefSchema = {
+  kind: SchemaOutcome['kind'],
+  enforcedBy: SchemaOutcome['enforcedBy'],
+  reason: NoFinalMessageReason | null,
+} | null;
+
 /** This run's appended journal records, counted; never an inherited one. */
 export interface BriefAppended {
   segments: number,
@@ -2083,6 +2147,7 @@ export interface CustodyBrief {
   session: BriefSession,
   lineage: BriefLineage,
   result: BriefResult,
+  schema: BriefSchema,
   join: { kind: JoinKind, over: CustodyJoin['over'] } | null,
   measured: BriefMeasured,
   stdout: BriefOutput,
@@ -2139,6 +2204,12 @@ function briefResult(result: CustodyStdoutResult): BriefResult {
     contextLimit: limit === null ? null : { terminalReason: limit.terminalReason, text: limit.text },
     sessionId: word(reading.sessionId),
   };
+}
+
+function briefSchema(schema: SchemaOutcome | null): BriefSchema {
+  return schema === null
+    ? null
+    : { kind: schema.kind, enforcedBy: schema.enforcedBy, reason: schema.kind === 'no-final-message' ? schema.reason : null };
 }
 
 /** This run's appended records, when they were read apart from the seeded ones. */
@@ -2401,6 +2472,7 @@ export function briefCustody(reading: CustodyReading, predecessors: readonly Cus
     session: sessionOfReading(reading),
     lineage: lineageOf(reading, distinct),
     result: briefResult(reading.stdout.result),
+    schema: briefSchema(reading.schema ?? null),
     join: reading.join === null ? null : { kind: reading.join.kind, over: reading.join.over },
     measured: {
       lastCall: lastCallOf(reading),

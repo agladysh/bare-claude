@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { closeSync, fstatSync, ftruncateSync, openSync, writeSync, type BigIntStats } from 'node:fs';
+import { closeSync, fstatSync, ftruncateSync, openSync, readFileSync, writeSync, type BigIntStats } from 'node:fs';
 import fs, { type FileHandle } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -230,6 +230,103 @@ export interface FileSessionSeed {
 
 /** A prior session to continue: from memory, or from a journal file. */
 export type SessionSeed = InMemorySessionSeed | FileSessionSeed;
+
+/**
+ * Why an output schema was refused, before anything was created or spawned:
+ *
+ * - `unreadable`: the file could not be read, or no file was named.
+ * - `not-json`: its bytes are not UTF-8 JSON text. A byte order mark is not
+ *   stripped, so a file that begins with one is refused here.
+ * - `not-an-object`: it is JSON, but not a JSON object. Whether it is a valid
+ *   JSON Schema is Claude Code's to judge.
+ * - `conflicting-arg`: `extraArgs` also carries `--json-schema`, so the run
+ *   would be given two schemas.
+ */
+export type OutputSchemaRefusal = 'unreadable' | 'not-json' | 'not-an-object' | 'conflicting-arg';
+
+/** The error {@link readOutputSchema} and {@link LaunchConfig} refuse an output schema with. */
+export class OutputSchemaError extends Error {
+  /** Which refusal this is. */
+  readonly reason: OutputSchemaRefusal;
+
+  /** The schema file, absolute; null when no usable path was given. */
+  readonly file: string | null;
+
+  /**
+   * @param reason - Which refusal this is
+   * @param file - The schema file, absolute, or null
+   * @param message - What was refused and why
+   * @param options - The underlying error, when there is one
+   */
+  constructor(reason: OutputSchemaRefusal, file: string | null, message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'OutputSchemaError';
+    this.reason = reason;
+    this.file = file;
+  }
+}
+
+/**
+ * An output schema as read from its file, for `claude --json-schema`. The
+ * text goes to Claude Code exactly as read; `bytes` and `sha256` are of those
+ * bytes.
+ */
+export interface OutputSchema {
+  /** The file, absolute. */
+  file: string,
+
+  /** The file's text, verbatim. */
+  text: string,
+
+  bytes: number,
+
+  /** Lowercase SHA-256 hex digest of the file's bytes. */
+  sha256: string,
+}
+
+/**
+ * Reads an output schema file, refusing what Claude Code must not be given:
+ * a file that cannot be read, is not UTF-8 JSON, or is not a JSON object.
+ * Nothing about it is checked beyond that, and nothing is added to it.
+ * @param file - The schema file; relative to this process's cwd
+ * @returns The schema, its text verbatim
+ * @throws {@link OutputSchemaError} with the reason
+ */
+export function readOutputSchema(file: string): OutputSchema {
+  if (typeof file !== 'string' || file === '' || file.includes('\0')) {
+    throw new OutputSchemaError('unreadable', null, `output schema file must be a path, got ${JSON.stringify(file)}`);
+  }
+  const absolute = path.resolve(file);
+  let bytes: Uint8Array;
+  try {
+    bytes = readFileSync(absolute);
+  } catch (error) {
+    throw new OutputSchemaError('unreadable', absolute,
+      `output schema file ${absolute} cannot be read (${errorCode(error) ?? 'unknown error'})`, { cause: error });
+  }
+  let text: string;
+  try {
+    // Fatal and BOM-preserving, so the text re-encodes to exactly these bytes.
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (error) {
+    throw new OutputSchemaError('not-json', absolute, `output schema file ${absolute} is not UTF-8 text`, { cause: error });
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new OutputSchemaError('not-json', absolute, `output schema file ${absolute} is not one JSON document`, { cause: error });
+  }
+  if (!isJsonObject(parsed)) {
+    throw new OutputSchemaError('not-an-object', absolute, `output schema file ${absolute} is not a JSON object`);
+  }
+  return { file: absolute, text, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
+}
+
+/** Whether a forwarded argument is Claude Code's own `--json-schema`, in either spelling. */
+function isJsonSchemaArg(arg: string): boolean {
+  return arg === '--json-schema' || arg.startsWith('--json-schema=');
+}
 
 // TODO: Support worktrees.
 /**
@@ -471,6 +568,24 @@ export interface LaunchOptions {
   maxOutputLength?: null | number,
 
   /**
+   * A JSON Schema file the run's final answer must satisfy: the meaning
+   * bare-codex gives its `--output-schema`. Read by {@link LaunchConfig},
+   * before anything is created or spawned; it must be UTF-8 JSON text whose
+   * value is an object. Its text, verbatim, is passed as
+   * `claude --json-schema <text>`, and Claude Code enforces it. Bare Claude
+   * adds nothing to the prompt and does not validate the answer again. A
+   * missing or unparsable file, and `--json-schema` also in `extraArgs`, are
+   * refused with an {@link OutputSchemaError}.
+   *
+   * Native reports how the schema fared in its result object, which only
+   * `--output-format json` writes to stdout: pass that in `extraArgs` to read
+   * it, with `readResult` from `@agladysh/bare-claude/outcome`, as a
+   * `SchemaOutcome`. Nothing here sets an output format. Defaults to null,
+   * which passes no schema.
+   */
+  outputSchemaFile?: null | string,
+
+  /**
    * Additional environment variables for the Claude *process*. Distinct from
    * `extraSettings.env`, which Claude Code applies to itself after startup.
    * See {@link spawnClaude} for where this sits in the environment precedence.
@@ -501,10 +616,14 @@ export interface LaunchOptions {
 
 /**
  * A fully resolved {@link LaunchOptions}: every field present, every default
- * applied. This is the sole input to {@link buildArgv}, {@link buildEnv} and
- * {@link buildSettings}, so those three never have to re-derive a default.
+ * applied, and the output schema file read. This is the sole input to
+ * {@link buildArgv}, {@link buildEnv} and {@link buildSettings}, so those
+ * three never have to re-derive a default or touch a file.
  */
-export type LaunchConfig = Required<LaunchOptions>;
+export type LaunchConfig = Required<LaunchOptions> & {
+  /** `outputSchemaFile` as read; null when there is none. */
+  outputSchema: OutputSchema | null,
+};
 
 /**
  * Converts LaunchOptions to a fully resolved LaunchConfig by applying defaults.
@@ -514,7 +633,10 @@ export type LaunchConfig = Required<LaunchOptions>;
  *   is missing, relative or combined with another authentication source; when
  *   `auth: 'caller'` is combined with a credential source of Bare Claude's
  *   own, `linkAuth: true` or a `tokenFile`; when a session seed's
- *   `sessionId` does not match {@link sessionIdPattern}
+ *   `sessionId` does not match {@link sessionIdPattern}; and, as an
+ *   {@link OutputSchemaError}, when `outputSchemaFile` cannot be read, is not
+ *   a JSON object, or comes with `--json-schema` in `extraArgs`. The schema
+ *   file is the only file this reads.
  */
 export function LaunchConfig(o: LaunchOptions): LaunchConfig {
   // Checked at run time because a JavaScript caller is not held to the type,
@@ -570,6 +692,18 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
     throw new Error('nativeStorePath requires auth "native-store"');
   }
 
+  // Two schemas, or one native would never see, must not reach a run: the
+  // conflict is refused before the file is even read.
+  const schemaFile: unknown = o.outputSchemaFile ?? null;
+  if (schemaFile !== null && typeof schemaFile !== 'string') {
+    throw new OutputSchemaError('unreadable', null, `outputSchemaFile must be a path, got ${JSON.stringify(schemaFile)}`);
+  }
+  if (schemaFile !== null && (o.extraArgs ?? []).some(isJsonSchemaArg)) {
+    throw new OutputSchemaError('conflicting-arg', path.resolve(schemaFile),
+      'outputSchemaFile cannot be combined with --json-schema in extraArgs: the run would be given two schemas');
+  }
+  const outputSchema = schemaFile === null ? null : readOutputSchema(schemaFile);
+
   return {
     cwd: o.cwd ?? null,
     ephemeralClaudeHomePath: o.ephemeralClaudeHomePath ?? null,
@@ -606,6 +740,8 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
     maxBudgetUsd: o.maxBudgetUsd ?? null,
     maxTokens: o.maxTokens ?? null,
     maxOutputLength: o.maxOutputLength ?? null,
+    outputSchemaFile: outputSchema?.file ?? null,
+    outputSchema,
     extraEnv: o.extraEnv ?? {},
     extraArgs: o.extraArgs ?? [],
     extraSettings: o.extraSettings ?? {},
@@ -702,6 +838,12 @@ export function buildArgv(config: LaunchConfig, sessionId: string): string[] {
 
   if (config.maxBudgetUsd !== null) {
     argv.push('--max-budget-usd', String(config.maxBudgetUsd));
+  }
+
+  // Claude Code 2.1.328 takes the schema inline, as JSON text, not as a path
+  // (`claude --help`, 2026-11-22). The file's text goes verbatim.
+  if (config.outputSchema !== null) {
+    argv.push('--json-schema', config.outputSchema.text);
   }
 
   argv.push(...config.extraArgs);

@@ -151,7 +151,7 @@ const constructedResult = JSON.stringify({
 
 const readingKeys = [
   'format', 'version', 'scope', 'reader', 'directory', 'read', 'state', 'basis', 'problems', 'entries',
-  'writtenIn', 'invocation', 'start', 'completion', 'stdout', 'stderr', 'journal', 'join',
+  'writtenIn', 'invocation', 'start', 'completion', 'stdout', 'stderr', 'journal', 'join', 'schema',
 ];
 
 /** A seed whose history holds an earlier process's context-limit record; every value constructed. */
@@ -294,6 +294,64 @@ describe.if(posix)('runInCustody', () => {
     expect(await readJson(path.join(run.directory, custodyFiles.invocation)))
       .toMatchObject({ extraArgs: [ '--output-format', 'json' ] });
   }, 20_000);
+
+  test('an output schema is kept and recorded, the run is given the kept copy, and the reading carries its outcome', async () => {
+    const source = path.join(await tempDir(), 'form.json');
+    const text = '{ "type": "object", "required": ["answer"] }\n';
+    await fs.writeFile(source, text);
+    const argvFile = path.join(await tempDir(), 'argv.json');
+    const result = { type: 'result', subtype: 'success', is_error: false, structured_output: { answer: 'ok' }, result: '{"answer":"ok"}' };
+    const run = await begin({ outputSchemaFile: source, extraArgs: [ '--output-format', 'json' ] }, {
+      FAKE_CLAUDE_STDOUT: JSON.stringify(result), FAKE_CLAUDE_ARGV_FILE: argvFile,
+    });
+    expect(await run.completion).toMatchObject({ outcome: 'exited', exitCode: 0 });
+
+    const kept = path.join(run.directory, custodyFiles.outputSchema);
+    expect(await Bun.file(kept).text()).toBe(text);
+    expect((await fs.stat(kept)).mode & 0o777).toBe(0o600);
+    expect(await readJson(path.join(run.directory, custodyFiles.invocation))).toMatchObject({
+      outputSchema: { source, kept, bytes: Buffer.byteLength(text), sha256: sha256(text) },
+    });
+    const argv = await readJson(argvFile);
+    expect(Array.isArray(argv) ? argv[argv.indexOf('--json-schema') + 1] : null).toBe(text);
+
+    // The caller's file changing afterwards changes nothing recorded or read.
+    await fs.writeFile(source, '{}');
+    const reading = await readCustody(run.directory);
+    expect(reading.schema).toEqual({ kind: 'conforming', enforcedBy: 'native', value: { answer: 'ok' } });
+    expect(reading.stdout.result).toMatchObject({ status: 'read', reading: { schema: { kind: 'conforming' } } });
+    expect(briefCustody(reading).schema).toEqual({ kind: 'conforming', enforcedBy: 'native', reason: null });
+    expect(JSON.stringify(briefCustody(reading))).not.toContain('answer');
+  }, 20_000);
+
+  test('a schema run whose stdout is not a result reads as no final message; a run without one has no schema outcome', async () => {
+    const source = path.join(await tempDir(), 'form.json');
+    await fs.writeFile(source, '{}');
+    const text = await begin({ outputSchemaFile: source }, { FAKE_CLAUDE_STDOUT: '{"answer":"ok"}\n' });
+    await text.completion;
+    const reading = await readCustody(text.directory);
+    expect(reading.schema).toMatchObject({ kind: 'no-final-message', enforcedBy: 'native', reason: 'no-result' });
+    expect(briefCustody(reading).schema).toEqual({ kind: 'no-final-message', enforcedBy: 'native', reason: 'no-result' });
+
+    const plain = await begin({ extraArgs: [ '--output-format', 'json' ] }, { FAKE_CLAUDE_STDOUT: '{"type":"result","is_error":false,"result":"hi"}' });
+    await plain.completion;
+    const unchanged = await readCustody(plain.directory);
+    expect(unchanged.schema).toBeNull();
+    expect(briefCustody(unchanged).schema).toBeNull();
+    expect(await readJson(path.join(plain.directory, custodyFiles.invocation))).toMatchObject({ outputSchema: null });
+    expect(unchanged.entries).not.toContain(custodyFiles.outputSchema);
+    expect(unchanged.stdout.result.status === 'read' && 'schema' in unchanged.stdout.result.reading).toBe(false);
+  }, 20_000);
+
+  test('a refused output schema is refused before the custody directory is made', async () => {
+    const root = await tempDir();
+    const directory = path.join(root, 'run');
+    await expect(runInCustody({
+      callToAction: '# x', claudePath: fakeClaude, noProcessEnv: true, auth: 'caller', cwd: root,
+      outputSchemaFile: path.join(root, 'missing.json'),
+    }, { directory, graceMs: 5_000 })).rejects.toThrow('cannot be read');
+    expect(await exists(directory)).toBe(false);
+  });
 
   test.each([
     [ 'no result at all', '' ],

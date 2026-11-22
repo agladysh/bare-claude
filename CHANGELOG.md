@@ -7,6 +7,30 @@
 - `spawnClaudeWithStdinPrompt` sends the exact prompt through text stdin with EOF,
   avoiding argument-size limits while retaining the existing spawn/custody path.
   The original `spawnClaude` argument route remains unchanged.
+- **Output schema.** `--output-schema FILE` (library: `outputSchemaFile`) gives a run the JSON
+  Schema its final answer must satisfy, with bare-codex's meaning for the same option.
+  - **Before the spawn.** `LaunchConfig` reads the file before anything else happens and passes
+    its text verbatim as `claude --json-schema`. A file that cannot be read, is not a JSON object,
+    or comes with a forwarded `--json-schema` is refused with an `OutputSchemaError`
+    (`readOutputSchema`, `OutputSchema`, `OutputSchemaRefusal`). Claude Code enforces the schema;
+    nothing is added to the prompt or re-validated.
+  - **Typed outcome.** `SchemaOutcome` in `@agladysh/bare-claude/outcome` has three kinds:
+    `conforming`, `not-conforming` and `no-final-message`, each with `enforcedBy`. A sibling
+    wrapper that validates for itself can fill the same shape. It is read from the
+    `--output-format json` result: `readResult(bytes, { outputSchema: true })`, `--outcome`
+    with `--outcome-schema`, and `"outputSchema": true` on an `--outcome-batch` line.
+  - **Custody.** A run records the schema in `invocation.json` (`outputSchema`), keeps it as
+    `output-schema.json`, and is given that copy. `readCustody` and `--outcome-custody` report
+    `schema`, and a brief its classification.
+  - **CLI.** Asks for `--output-format json` unless another format is forwarded, which is refused.
+    A run given a schema exits 0 only for a conforming answer: 65 when native gave up on the
+    schema, 66 when claude exited 0 with no structured answer. Runs without the option are
+    unchanged.
+  - **Not a preset field.** A schema dictates the caller's output, so a configuration file naming
+    `outputSchemaFile` is refused.
+  - **What is measured.** On claude 2.1.328, the success shape was observed. The give-up shape
+    (`error_max_structured_output_retries`, `structured_output_retry_exhausted`) was read from the
+    bundle, not observed.
 
 ## [v0.15.1] - 2026-10-22
 

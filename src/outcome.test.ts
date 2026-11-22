@@ -10,6 +10,7 @@ import {
   contextLimitText,
   isMeasuredPrompt,
   joinResult,
+  noResultSchemaOutcome,
   parseOutcomeRequest,
   readJournal,
   readOutcomeFiles,
@@ -310,5 +311,88 @@ describe('readOutcomeFiles', () => {
     expect(entries[2]?.reading).toBeNull();
     expect(entries[2]?.error).toContain('/missing.json');
     expect(entries[3]?.reading?.result?.sha256).toBe(entries[0]?.reading?.result?.sha256 ?? '');
+  });
+});
+
+/**
+ * Results of runs given an output schema. `conforming` follows the shape
+ * observed 2026-11-22 of claude 2.1.328 (`--json-schema`, stream-json result
+ * event); the give-up follows the 2.1.328 bundle's error variant, which no
+ * observed run has produced. Values are constructed.
+ */
+const structuredResult = {
+  type: 'result', subtype: 'success', is_error: false, num_turns: 2, session_id: session,
+  structured_output: { answer: 'ok' }, result: '{"answer":"ok"}',
+};
+const gaveUpResult = {
+  type: 'result', subtype: 'error_max_structured_output_retries', is_error: true,
+  terminal_reason: 'structured_output_retry_exhausted', num_turns: 6, session_id: session,
+  errors: [ 'constructed: the answer failed schema validation' ],
+};
+
+describe('readResult with an output schema', () => {
+  const schemaOf = (bytes: Uint8Array) => readResult(bytes, { outputSchema: true }).schema;
+
+  test('structured_output is a conforming answer, native-enforced, its value as native parsed it', () => {
+    expect(schemaOf(json(structuredResult))).toEqual({ kind: 'conforming', enforcedBy: 'native', value: { answer: 'ok' } });
+  });
+
+  test('native giving up is not-conforming, with its errors verbatim and no final text in the error variant', () => {
+    expect(schemaOf(json(gaveUpResult))).toEqual({
+      kind: 'not-conforming', enforcedBy: 'native',
+      errors: [ 'constructed: the answer failed schema validation' ], finalText: null,
+    });
+  });
+
+  test('the subtype or the terminal reason alone says it gave up, but only on an error result', () => {
+    const bySubtype = { ...gaveUpResult, terminal_reason: 'completed' };
+    expect(schemaOf(json(bySubtype))?.kind).toBe('not-conforming');
+    // An error result reading subtype "success" (as 2.1.292 wrote) still gave up by its terminal reason.
+    const byReason = { ...gaveUpResult, subtype: 'success', result: 'final words' };
+    expect(schemaOf(json(byReason))).toMatchObject({ kind: 'not-conforming', finalText: 'final words' });
+    const notAnError = { ...gaveUpResult, is_error: false };
+    expect(schemaOf(json(notAnError))).toMatchObject({ kind: 'no-final-message', reason: 'no-structured-output' });
+  });
+
+  test('a result without structured_output, or with it null, is no final message, saying what the result said', () => {
+    const { structured_output: _dropped, ...plain } = structuredResult;
+    const without = schemaOf(json(plain));
+    expect(without).toMatchObject({ kind: 'no-final-message', enforcedBy: 'native', reason: 'no-structured-output' });
+    expect(without?.kind === 'no-final-message' ? without.detail : '').toContain('subtype "success"');
+    expect(schemaOf(json({ ...structuredResult, structured_output: null })))
+      .toMatchObject({ kind: 'no-final-message', reason: 'no-structured-output' });
+    // Another error is not a schema verdict.
+    expect(schemaOf(json(errorResult))).toMatchObject({ kind: 'no-final-message', reason: 'no-structured-output' });
+  });
+
+  test('no result is no final message: nothing written, or bytes that are not a result', () => {
+    expect(schemaOf(new Uint8Array())).toMatchObject({ kind: 'no-final-message', reason: 'no-result' });
+    expect(schemaOf(encode('{"type":"res'))).toMatchObject({ kind: 'no-final-message', reason: 'unreadable-result' });
+    expect(schemaOf(json({ type: 'assistant' }))).toMatchObject({ kind: 'no-final-message', reason: 'unreadable-result' });
+    expect(noResultSchemaOutcome('never started'))
+      .toEqual({ kind: 'no-final-message', enforcedBy: 'native', reason: 'no-result', detail: 'never started' });
+  });
+
+  test('without the option the reading is as before: no schema key, whatever the result carries', () => {
+    expect('schema' in readResult(json(structuredResult))).toBe(false);
+    expect('schema' in readResult(json(gaveUpResult), { outputSchema: false })).toBe(false);
+    const { schema: _schema, ...rest } = readResult(json(gaveUpResult), { outputSchema: true });
+    expect(rest).toEqual(readResult(json(gaveUpResult)));
+  });
+
+  test('a batch line declares the schema; a custody line cannot, since its invocation records one', async () => {
+    expect(parseOutcomeRequest('{"id":"s","result":"r.json","outputSchema":true}'))
+      .toEqual({ id: 's', result: 'r.json', journal: null, outputSchema: true });
+    expect(parseOutcomeRequest('{"result":"r.json","outputSchema":false}')).toEqual({ id: null, result: 'r.json', journal: null });
+    expect(parseOutcomeRequest('{"result":"r.json","outputSchema":"yes"}')).toBe('`outputSchema` must be true or false');
+    expect(parseOutcomeRequest('{"journal":"j.jsonl","outputSchema":true}')).toBe('`outputSchema` needs a `result` to read');
+    expect(parseOutcomeRequest('{"custody":"d","outputSchema":true}')).toContain('cannot be combined with `outputSchema`');
+
+    const entries = await readOutcomeFiles([
+      { id: 'with', result: '/r.json', journal: null, outputSchema: true },
+      { id: 'without', result: '/r.json', journal: null },
+    ], async () => json(structuredResult));
+    expect(entries[0]?.reading?.result?.schema).toMatchObject({ kind: 'conforming' });
+    expect(entries[1]?.reading?.result !== null && 'schema' in (entries[1]?.reading?.result ?? {})).toBe(false);
   });
 });

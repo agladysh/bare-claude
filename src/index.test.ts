@@ -12,9 +12,12 @@ import {
   buildEnv,
   buildSettings,
   LaunchConfig,
+  OutputSchemaError,
+  readOutputSchema,
   spawnClaude,
   type JsonObject,
   type LaunchOptions,
+  type OutputSchemaRefusal,
 } from './index.ts';
 
 /** A resolved config for the given overrides, with a fixed safe call to action. */
@@ -94,6 +97,8 @@ describe('LaunchConfig', () => {
       maxBudgetUsd: null,
       maxTokens: null,
       maxOutputLength: null,
+      outputSchemaFile: null,
+      outputSchema: null,
       extraEnv: {},
       extraArgs: [],
       extraSettings: {},
@@ -316,6 +321,101 @@ describe('buildArgv', () => {
   test('is pure: repeated calls agree and nothing is retained between them', () => {
     const c = cfg({ addDirs: [ '/a' ], extraArgs: [ '--verbose' ] });
     expect(buildArgv(c, SID)).toEqual(buildArgv(c, SID));
+  });
+});
+
+describe('outputSchemaFile', () => {
+  let dir = '';
+  /** A schema file holding exactly `content`, in this suite's directory. */
+  const schemaFile = async (name: string, content: string | Uint8Array): Promise<string> => {
+    const file = path.join(dir, name);
+    await fs.writeFile(file, content);
+    return file;
+  };
+  /** The refusal `run` throws, as its reason; fails the test when it throws anything else. */
+  const refusal = (run: () => unknown): OutputSchemaRefusal | null => {
+    try {
+      run();
+    } catch (error) {
+      expect(error).toBeInstanceOf(OutputSchemaError);
+      return error instanceof OutputSchemaError ? error.reason : null;
+    }
+    return null;
+  };
+
+  beforeAll(async () => {
+    dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'bare-claude-output-schema-')));
+  });
+
+  afterAll(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  test('passes the file\'s text verbatim as --json-schema, after derived flags and before extraArgs and --print', async () => {
+    // Whitespace and key order kept: the text is not re-serialized.
+    const text = '{\n  "type": "object",\n  "required": ["answer"],\n  "properties": {"answer": {"type": "string"}}\n}\n';
+    const file = await schemaFile('form.json', text);
+    const argv = buildArgv(cfg({ outputSchemaFile: file, maxBudgetUsd: 1, extraArgs: [ '--verbose' ] }), SID);
+    const at = argv.indexOf('--json-schema');
+    expect(at).toBeGreaterThan(argv.indexOf('--max-budget-usd'));
+    expect(argv[at + 1]).toBe(text);
+    expect(argv.indexOf('--verbose')).toBe(at + 2);
+    expect(argv.slice(-2)).toEqual([ '--print', '# do it' ]);
+    expect(argv.filter(arg => arg === '--json-schema')).toHaveLength(1);
+  });
+
+  test('resolves to the absolute file with its size and digest; none by default, and argv is then unchanged', async () => {
+    const text = '{"type":"object"}';
+    const file = await schemaFile('digest.json', text);
+    const c = cfg({ outputSchemaFile: path.relative(process.cwd(), file) });
+    expect(c.outputSchemaFile).toBe(file);
+    expect(c.outputSchema).toEqual({
+      file, text, bytes: Buffer.byteLength(text), sha256: createHash('sha256').update(text).digest('hex'),
+    });
+    expect(cfg().outputSchema).toBeNull();
+    expect(cfg({ outputSchemaFile: null }).outputSchema).toBeNull();
+    expect(buildArgv(cfg(), SID)).not.toContain('--json-schema');
+  });
+
+  test('refuses a missing file, one that is not JSON, and JSON that is not an object', async () => {
+    expect(refusal(() => cfg({ outputSchemaFile: path.join(dir, 'missing.json') }))).toBe('unreadable');
+    expect(refusal(() => cfg({ outputSchemaFile: '' }))).toBe('unreadable');
+    expect(refusal(() => cfg({ outputSchemaFile: dir }))).toBe('unreadable');
+    const notJson = await schemaFile('not.json', '{"type": "object"');
+    expect(refusal(() => cfg({ outputSchemaFile: notJson }))).toBe('not-json');
+    const notUtf8 = await schemaFile('latin1.json', new Uint8Array([ 0x7b, 0x22, 0xe9, 0x22, 0x3a, 0x31, 0x7d ]));
+    expect(refusal(() => cfg({ outputSchemaFile: notUtf8 }))).toBe('not-json');
+    const bom = await schemaFile('bom.json', '\uFEFF{"type":"object"}');
+    expect(refusal(() => readOutputSchema(bom))).toBe('not-json');
+    for (const [ name, text ] of [ [ 'array.json', '[]' ], [ 'string.json', '"object"' ], [ 'null.json', 'null' ] ] as const) {
+      const file = await schemaFile(name, text);
+      expect(refusal(() => cfg({ outputSchemaFile: file }))).toBe('not-an-object');
+    }
+  });
+
+  test('refuses --json-schema forwarded beside it, in either spelling, before reading the file', async () => {
+    const file = await schemaFile('conflict.json', '{}');
+    expect(refusal(() => cfg({ outputSchemaFile: file, extraArgs: [ '--json-schema', '{}' ] }))).toBe('conflicting-arg');
+    expect(refusal(() => cfg({ outputSchemaFile: file, extraArgs: [ '--json-schema={}' ] }))).toBe('conflicting-arg');
+    // The conflict is refused first: the missing file is never reached.
+    expect(refusal(() => cfg({ outputSchemaFile: path.join(dir, 'missing.json'), extraArgs: [ '--json-schema', '{}' ] })))
+      .toBe('conflicting-arg');
+    // Without the option, a forwarded --json-schema is the caller's own and passes as given.
+    expect(buildArgv(cfg({ extraArgs: [ '--json-schema', '{}' ] }), SID)).toContain('--json-schema');
+  });
+
+  test('a refused schema leaves nothing behind: no home is created and nothing is spawned', async () => {
+    const home = path.join(dir, 'never-made-home');
+    const ran = path.join(dir, 'ran');
+    const probe = await schemaFile('probe.sh', `#!/bin/sh\ntouch '${ran}'\n`);
+    await fs.chmod(probe, 0o755);
+    const run = spawnClaude({
+      callToAction: '# probe', claudePath: probe, noProcessEnv: true, auth: 'caller',
+      ephemeralClaudeHomePath: home, outputSchemaFile: path.join(dir, 'missing.json'),
+    });
+    await expect(run).rejects.toBeInstanceOf(OutputSchemaError);
+    expect(await fs.stat(home).then(() => true, () => false)).toBe(false);
+    expect(await fs.stat(ran).then(() => true, () => false)).toBe(false);
   });
 });
 

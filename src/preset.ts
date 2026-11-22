@@ -47,8 +47,12 @@ export interface Preset extends LaunchOptions {
  * A preset as written in `bare-claude.yaml` or assembled from argv: every field
  * optional, `use` naming the presets it inherits from, and `read` accepting a
  * bare string as shorthand for a one-element list.
+ *
+ * `outputSchemaFile` is not a preset field: a schema dictates the shape of the
+ * caller's answer, and a preset configures a run without dictating its output.
+ * The caller gives it per run (`--output-schema`), on the resolved preset.
  */
-export interface DynamicPreset extends Omit<Partial<Preset>, 'read'> {
+export interface DynamicPreset extends Omit<Partial<Preset>, 'read' | 'outputSchemaFile'> {
   /** Preset ids to inherit from, merged left to right. Never itself inherited. */
   use?: string | string[];
 
