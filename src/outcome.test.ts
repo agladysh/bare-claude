@@ -155,8 +155,33 @@ describe('readResult', () => {
   test('an empty file says nothing was written; another document is not a result', () => {
     expect(readResult(new Uint8Array()).file).toBe('empty');
     expect(readResult(new Uint8Array()).sha256).toBeNull();
-    expect(readResult(json([ errorResult ])).file).toBe('not-a-result');
-    expect(readResult(json({ type: 'assistant' })).file).toBe('not-a-result');
+    expect(readResult(new Uint8Array()).form).toBeNull();
+    expect(readResult(json({ type: 'assistant' }))).toMatchObject({ file: 'not-a-result', form: 'object' });
+    expect(readResult(json('a string'))).toMatchObject({ file: 'not-a-result', form: null });
+    expect(readResult(json(errorResult)).form).toBe('object');
+  });
+
+  test('the verbose array is read by its last element, a result, and says so; the digest is of the whole file', () => {
+    const messages = [ { type: 'system', subtype: 'init' }, { type: 'assistant' }, { type: 'user' } ];
+    const bytes = json([ ...messages, errorResult ]);
+    const reading = readResult(bytes);
+    expect(reading).toMatchObject({ file: 'result', form: 'array', why: null, status: 'error', terminalReason: 'blocking_limit' });
+    expect(reading.bytes).toBe(bytes.length);
+    expect(reading.sha256).toBe(createHash('sha256').update(bytes).digest('hex'));
+    const { form: arrayForm, bytes: _a, sha256: _b, ...fromArray } = reading;
+    const { form: objectForm, bytes: _c, sha256: _d, ...fromObject } = readResult(json(errorResult));
+    expect(fromArray).toEqual(fromObject);
+    expect([ arrayForm, objectForm ]).toEqual([ 'array', 'object' ]);
+    expect(readResult(json([ errorResult ])).file).toBe('result');
+  });
+
+  test('an array without a result last is not a result: an empty one, or one whose result is not last', () => {
+    expect(readResult(json([]))).toMatchObject({ file: 'not-a-result', form: 'array', status: 'unstated' });
+    expect(readResult(json([]))?.why).toContain('empty JSON array');
+    const resultNotLast = readResult(json([ errorResult, { type: 'assistant' } ]));
+    expect(resultNotLast).toMatchObject({ file: 'not-a-result', form: 'array', status: 'unstated', terminalReason: null });
+    expect(resultNotLast.why).toContain('last element is not a Claude Code result object');
+    expect(readResult(json([ { type: 'assistant' }, 'text' ])).file).toBe('not-a-result');
   });
 
   test('a result with no recorded call says why it has no last call', () => {
@@ -315,33 +340,73 @@ describe('readOutcomeFiles', () => {
 });
 
 /**
- * Results of runs given an output schema. `conforming` follows the shape
- * observed 2026-11-22 of claude 2.1.328 (`--json-schema`, stream-json result
- * event); the give-up follows the 2.1.328 bundle's error variant, which no
- * observed run has produced. Values are constructed.
+ * Results of runs given an output schema, in the shapes observed 2026-11-22
+ * of claude 2.1.328 (`-p --output-format json --json-schema`): a satisfiable
+ * schema's result, and the give-up of an unsatisfiable one under
+ * `MAX_STRUCTURED_OUTPUT_RETRIES=1` (no `result`, no `structured_output`).
+ * With native verbose, each was the last element of an array of the run's
+ * messages. Values, ids and texts are constructed.
  */
 const structuredResult = {
-  type: 'result', subtype: 'success', is_error: false, num_turns: 2, session_id: session,
-  structured_output: { answer: 'ok' }, result: '{"answer":"ok"}',
+  type: 'result', subtype: 'success', is_error: false, num_turns: 3, session_id: session,
+  terminal_reason: 'completed', structured_output: { answer: 'ok' }, result: '{"answer":"ok"}',
 };
 const gaveUpResult = {
   type: 'result', subtype: 'error_max_structured_output_retries', is_error: true,
-  terminal_reason: 'structured_output_retry_exhausted', num_turns: 6, session_id: session,
-  errors: [ 'constructed: the answer failed schema validation' ],
+  terminal_reason: 'structured_output_retry_exhausted', num_turns: 3, session_id: session,
+  errors: [ 'constructed: Failed to provide valid structured output after 1 attempts' ],
 };
+/** What precedes the result in the verbose array, by type as observed; contents constructed. */
+const verboseMessages = [
+  { type: 'system', subtype: 'init', session_id: session, tools: [ 'StructuredOutput' ] },
+  { type: 'assistant', message: { content: [] } },
+  { type: 'rate_limit_event' },
+  { type: 'user', message: { content: [] } },
+];
+const schemaDigest = 'a'.repeat(64);
 
 describe('readResult with an output schema', () => {
   const schemaOf = (bytes: Uint8Array) => readResult(bytes, { outputSchema: true }).schema;
 
   test('structured_output is a conforming answer, native-enforced, its value as native parsed it', () => {
-    expect(schemaOf(json(structuredResult))).toEqual({ kind: 'conforming', enforcedBy: 'native', value: { answer: 'ok' } });
+    expect(schemaOf(json(structuredResult)))
+      .toEqual({ kind: 'conforming', enforcedBy: 'native', value: { answer: 'ok' }, schemaSha256: null });
   });
 
-  test('native giving up is not-conforming, with its errors verbatim and no final text in the error variant', () => {
+  test('native giving up is not-conforming, with its errors verbatim and no final message in the error variant', () => {
     expect(schemaOf(json(gaveUpResult))).toEqual({
       kind: 'not-conforming', enforcedBy: 'native',
-      errors: [ 'constructed: the answer failed schema validation' ], finalText: null,
+      errors: [ 'constructed: Failed to provide valid structured output after 1 attempts' ], finalMessage: null,
+      schemaSha256: null,
     });
+  });
+
+  test('the verbose array is read by its last element: conforming, and a give-up, as from the lone object', () => {
+    const conforming = readResult(json([ ...verboseMessages, structuredResult ]), { outputSchema: true });
+    expect(conforming).toMatchObject({ file: 'result', form: 'array', status: 'no-error' });
+    expect(conforming.schema).toEqual(schemaOf(json(structuredResult)));
+    expect(conforming.schema?.kind).toBe('conforming');
+    const gaveUp = readResult(json([ ...verboseMessages, gaveUpResult ]), { outputSchema: true });
+    expect(gaveUp).toMatchObject({ file: 'result', form: 'array', status: 'error' });
+    expect(gaveUp.schema).toEqual(schemaOf(json(gaveUpResult)));
+  });
+
+  test('an array that does not end in a result is no final message, an unreadable result saying why', () => {
+    for (const array of [ [], verboseMessages, [ ...verboseMessages, structuredResult, { type: 'assistant' } ] ]) {
+      const reading = readResult(json(array), { outputSchema: true });
+      expect(reading).toMatchObject({ file: 'not-a-result', form: 'array' });
+      expect(reading.schema).toMatchObject({ kind: 'no-final-message', enforcedBy: 'native', reason: 'unreadable-result' });
+      expect(reading.schema?.kind === 'no-final-message' ? reading.schema.detail : '').toContain('array');
+    }
+  });
+
+  test('every kind names the schema by its digest when the reader is given it, and null when not', () => {
+    const given = { sha256: schemaDigest };
+    for (const bytes of [ json(structuredResult), json(gaveUpResult), json({ ...structuredResult, structured_output: null }), new Uint8Array(), json([]) ]) {
+      expect(readResult(bytes, { outputSchema: given }).schema?.schemaSha256).toBe(schemaDigest);
+      expect(readResult(bytes, { outputSchema: true }).schema?.schemaSha256).toBeNull();
+    }
+    expect(noResultSchemaOutcome('never started', schemaDigest).schemaSha256).toBe(schemaDigest);
   });
 
   test('the subtype or the terminal reason alone says it gave up, but only on an error result', () => {
@@ -349,7 +414,7 @@ describe('readResult with an output schema', () => {
     expect(schemaOf(json(bySubtype))?.kind).toBe('not-conforming');
     // An error result reading subtype "success" (as 2.1.292 wrote) still gave up by its terminal reason.
     const byReason = { ...gaveUpResult, subtype: 'success', result: 'final words' };
-    expect(schemaOf(json(byReason))).toMatchObject({ kind: 'not-conforming', finalText: 'final words' });
+    expect(schemaOf(json(byReason))).toMatchObject({ kind: 'not-conforming', finalMessage: 'final words' });
     const notAnError = { ...gaveUpResult, is_error: false };
     expect(schemaOf(json(notAnError))).toMatchObject({ kind: 'no-final-message', reason: 'no-structured-output' });
   });
@@ -369,8 +434,8 @@ describe('readResult with an output schema', () => {
     expect(schemaOf(new Uint8Array())).toMatchObject({ kind: 'no-final-message', reason: 'no-result' });
     expect(schemaOf(encode('{"type":"res'))).toMatchObject({ kind: 'no-final-message', reason: 'unreadable-result' });
     expect(schemaOf(json({ type: 'assistant' }))).toMatchObject({ kind: 'no-final-message', reason: 'unreadable-result' });
-    expect(noResultSchemaOutcome('never started'))
-      .toEqual({ kind: 'no-final-message', enforcedBy: 'native', reason: 'no-result', detail: 'never started' });
+    expect(noResultSchemaOutcome('never started', null))
+      .toEqual({ kind: 'no-final-message', enforcedBy: 'native', reason: 'no-result', detail: 'never started', schemaSha256: null });
   });
 
   test('without the option the reading is as before: no schema key, whatever the result carries', () => {

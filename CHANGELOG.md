@@ -11,26 +11,39 @@
   Schema its final answer must satisfy, with bare-codex's meaning for the same option.
   - **Before the spawn.** `LaunchConfig` reads the file before anything else happens and passes
     its text verbatim as `claude --json-schema`. A file that cannot be read, is not a JSON object,
-    or comes with a forwarded `--json-schema` is refused with an `OutputSchemaError`
+    or comes with a forwarded `--json-schema` is refused with an `OutputSchemaFileError`
     (`readOutputSchema`, `OutputSchema`, `OutputSchemaRefusal`). Claude Code enforces the schema;
     nothing is added to the prompt or re-validated.
-  - **Typed outcome.** `SchemaOutcome` in `@agladysh/bare-claude/outcome` has three kinds:
-    `conforming`, `not-conforming` and `no-final-message`, each with `enforcedBy`. A sibling
-    wrapper that validates for itself can fill the same shape. It is read from the
-    `--output-format json` result: `readResult(bytes, { outputSchema: true })`, `--outcome`
-    with `--outcome-schema`, and `"outputSchema": true` on an `--outcome-batch` line.
+  - **Typed outcome.** `OutputSchemaOutcome` in `@agladysh/bare-claude/outcome` has three kinds:
+    `conforming`, `not-conforming` (with `errors` and `finalMessage`) and `no-final-message`,
+    each with `enforcedBy` and `schemaSha256`, the digest of the schema file's bytes, or null
+    where the reader was not told which schema it was. The type and field names are the sibling
+    wrappers' (`OutputSchemaEnforcer`, `OutputSchemaError`, `OutputSchemaNoMessageReason`), so a
+    caller reads one shape from each. It is read from the `--output-format json` result:
+    `readResult(bytes, { outputSchema })`, with the schema (the spawn's new `outputSchema`) or
+    `true`; `--outcome` with `--outcome-schema`; and `"outputSchema": true` on an
+    `--outcome-batch` line.
   - **Custody.** A run records the schema in `invocation.json` (`outputSchema`), keeps it as
     `output-schema.json`, and is given that copy. `readCustody` and `--outcome-custody` report
-    `schema`, and a brief its classification.
+    `schema`, named by the recorded digest, and a brief its classification.
   - **CLI.** Asks for `--output-format json` unless another format is forwarded, which is refused.
     A run given a schema exits 0 only for a conforming answer: 65 when native gave up on the
     schema, 66 when claude exited 0 with no structured answer. Runs without the option are
     unchanged.
   - **Not a preset field.** A schema dictates the caller's output, so a configuration file naming
     `outputSchemaFile` is refused.
-  - **What is measured.** On claude 2.1.328, the success shape was observed. The give-up shape
-    (`error_max_structured_output_retries`, `structured_output_retry_exhausted`) was read from the
-    bundle, not observed.
+  - **What is measured.** On claude 2.1.328, both the success shape and the give-up shape
+    (`error_max_structured_output_retries`, `structured_output_retry_exhausted`, no `result`,
+    exit 1) were observed under `--output-format json`.
+
+### Changed
+
+- **Verbose results are read.** Where Claude Code is verbose (its settings, or a forwarded
+  `--verbose`), `--output-format json` prints an array of the run's messages with the result last
+  (observed on 2.1.328). `readResult`, and through it custody, `--outcome`, `--outcome-batch`,
+  `--outcome-custody` and the exit status of a schema run, now read such an array by its final
+  result object instead of calling it `not-a-result`. `ResultReading.form` (`object`, `array` or
+  null) says which form was read; an array that does not end in a result is still `not-a-result`.
 
 ## [v0.15.1] - 2026-10-22
 

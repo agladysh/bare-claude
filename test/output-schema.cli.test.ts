@@ -1,8 +1,10 @@
 /**
  * Black-box tests of `--output-schema`: the real CLI against the fake
  * `claude`, which writes whatever result a test constructs. Results follow the
- * shapes of claude 2.1.328 (observed for a conforming answer, read from its
- * bundle for a give-up); every value is constructed. No model, no network.
+ * shapes observed 2026-11-22 of claude 2.1.328 under `--output-format json`:
+ * a conforming answer, a give-up, and, with native verbose, either as the
+ * last element of an array of the run's messages. Every value is
+ * constructed. No model, no network.
  */
 import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import fs from 'node:fs/promises';
@@ -21,7 +23,10 @@ const gaveUp = {
   terminal_reason: 'structured_output_retry_exhausted', errors: [ 'constructed: no valid structured output' ],
 };
 const unstructured = { type: 'result', subtype: 'success', is_error: false, result: 'free text' };
-const schemaText = '{ "type": "object", "required": ["answer"], "additionalProperties": false,\n  "properties": { "answer": { "type": "string" } } }\n';
+/** What precedes the result in native's verbose array; the types as observed, the contents constructed. */
+const verboseMessages = [ { type: 'system', subtype: 'init' }, { type: 'assistant' }, { type: 'user' } ];
+const verbose = (result: Record<string, unknown> | null) => JSON.stringify(result === null ? verboseMessages : [ ...verboseMessages, result ]);
+const schemaText ='{ "type": "object", "required": ["answer"], "additionalProperties": false,\n  "properties": { "answer": { "type": "string" } } }\n';
 
 const dirs: string[] = [];
 
@@ -90,6 +95,23 @@ describe('a live run with --output-schema', () => {
     });
     expect(failed.exitCode).toBe(1);
     expect(failed.stderr).toContain('no-final-message (unreadable-result)');
+  });
+
+  test('native verbose, forwarded: the array is read by its final result, and no final result is still a finding', async () => {
+    const { cwd, schema, argvFile } = await setUp();
+    const args = [ ...base, '--claude-arg=--verbose', '--output-schema', schema, 'fill the form' ];
+    const answered = await runCli(args, { cwd, env: { FAKE_CLAUDE_STDOUT: verbose(conforming), FAKE_CLAUDE_ARGV_FILE: argvFile } });
+    expect(answered.stderr).not.toContain('output schema');
+    expect(answered.exitCode).toBe(0);
+    expect(await argvOf(argvFile)).toContain('--verbose');
+
+    const gaveUpVerbose = await runCli(args, { cwd, env: { FAKE_CLAUDE_STDOUT: verbose(gaveUp), FAKE_CLAUDE_EXIT_CODE: '1' } });
+    expect(gaveUpVerbose.exitCode).toBe(65);
+
+    const unended = await runCli(args, { cwd, env: { FAKE_CLAUDE_STDOUT: verbose(null) } });
+    expect(unended.exitCode).toBe(66);
+    expect(unended.stderr).toContain('no-final-message (unreadable-result)');
+    expect(unended.stderr).toContain('last element is not a Claude Code result object');
   });
 
   test('--print still passes the result through, read whole for the exit status', async () => {
@@ -172,7 +194,7 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('--ou
     const read = await runCli([ '--outcome-custody', directory ], { cwd });
     expect(read.exitCode).toBe(0);
     expect(JSON.parse(read.stdout)).toMatchObject({
-      schema: { kind: 'not-conforming', enforcedBy: 'native', errors: [ 'constructed: no valid structured output' ], finalText: null },
+      schema: { kind: 'not-conforming', enforcedBy: 'native', errors: [ 'constructed: no valid structured output' ], finalMessage: null },
       invocation: { record: { extraArgs: [ '--output-format', 'json' ], outputSchema: { kept: path.join(directory, 'output-schema.json') } } },
     });
     const brief = await runCli([ '--outcome-custody', directory, '--brief' ], { cwd });
@@ -186,6 +208,28 @@ describe.if(process.platform === 'darwin' || process.platform === 'linux')('--ou
     });
     expect(run.exitCode).toBe(0);
   });
+
+  test('native verbose under custody: a conforming array exits 0, read as the array, the schema named by its digest', async () => {
+    const { cwd, schema } = await setUp();
+    const directory = path.join(cwd, 'run');
+    const run = await runCli([ ...base, '--custody', directory, '--claude-arg=--verbose', '--output-schema', schema, 'x' ], {
+      cwd, env: { FAKE_CLAUDE_STDOUT: verbose(conforming) },
+    });
+    expect(run.exitCode).toBe(0);
+
+    const digest = new Bun.CryptoHasher('sha256').update(schemaText).digest('hex');
+    const read = await runCli([ '--outcome-custody', directory ], { cwd });
+    expect(JSON.parse(read.stdout)).toMatchObject({
+      schema: { kind: 'conforming', enforcedBy: 'native', value: { answer: 'ok' }, schemaSha256: digest },
+      stdout: { result: { status: 'read', reading: { file: 'result', form: 'array' } } },
+      invocation: { record: { outputSchema: { sha256: digest } } },
+    });
+
+    const unended = await runCli([ ...base, '--custody', path.join(cwd, 'unended'), '--claude-arg=--verbose', '--output-schema', schema, 'x' ], {
+      cwd, env: { FAKE_CLAUDE_STDOUT: verbose(null) },
+    });
+    expect(unended.exitCode).toBe(66);
+  });
 });
 
 describe('offline readers', () => {
@@ -195,9 +239,23 @@ describe('offline readers', () => {
     await fs.writeFile(file, JSON.stringify(conforming));
     const withSchema = await runCli([ '--outcome', file, '--outcome-schema' ], { cwd });
     expect(withSchema.exitCode).toBe(0);
-    expect(JSON.parse(withSchema.stdout)).toMatchObject({ result: { schema: { kind: 'conforming', value: { answer: 'ok' } } } });
+    // A bare result file does not say which schema it answered.
+    expect(JSON.parse(withSchema.stdout)).toMatchObject({
+      result: { form: 'object', schema: { kind: 'conforming', value: { answer: 'ok' }, schemaSha256: null } },
+    });
     const without = await runCli([ '--outcome', file ], { cwd });
     expect(JSON.parse(without.stdout).result).not.toHaveProperty('schema');
+  });
+
+  test('--outcome reads a verbose array by its final result', async () => {
+    const { cwd } = await setUp();
+    const file = path.join(cwd, 'result.json');
+    await fs.writeFile(file, verbose(gaveUp));
+    const run = await runCli([ '--outcome', file, '--outcome-schema' ], { cwd });
+    expect(run.exitCode).toBe(0);
+    expect(JSON.parse(run.stdout)).toMatchObject({
+      result: { file: 'result', form: 'array', status: 'error', schema: { kind: 'not-conforming', finalMessage: null } },
+    });
   });
 
   test('--outcome-schema needs --outcome', async () => {

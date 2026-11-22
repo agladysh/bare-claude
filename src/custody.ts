@@ -76,7 +76,7 @@ import {
 import {
   isMeasuredPrompt, joinResult, noResultSchemaOutcome, readJournal, readResult,
   type ContextLimitEvidence, type JoinKind, type JournalReading, type ResultFile, type ResultJournalJoin,
-  type NoFinalMessageReason, type ResultReading, type ResultStatus, type SchemaOutcome, type TokenSums,
+  type OutputSchemaNoMessageReason, type ResultReading, type ResultStatus, type OutputSchemaOutcome, type TokenSums,
 } from '@agladysh/bare-claude/outcome';
 
 import pkg from '../package.json';
@@ -1094,10 +1094,11 @@ export interface CustodyReading {
    * records, read from the stdout result (`stdout.result.reading.schema`), or
    * `no-final-message` with reason `no-result` when stdout was not read as a
    * result: the run must ask for `--output-format json` for native's report
-   * to be there. Null when the invocation records no output schema or could
-   * not be read. An `observation.json` kept by an earlier version lacks it.
+   * to be there. Its `schemaSha256` is the digest `invocation.json` records.
+   * Null when the invocation records no output schema or could not be read.
+   * An `observation.json` kept by an earlier version lacks it.
    */
-  schema: SchemaOutcome | null,
+  schema: OutputSchemaOutcome | null,
 }
 
 /**
@@ -1557,7 +1558,7 @@ function stdoutResultOf(
   unread: string | null,
   outputFormat: string | null,
   completion: CustodyCompletion | null,
-  outputSchema: boolean,
+  outputSchema: CustodyOutputSchema | null,
 ): CustodyStdoutResult {
   if (completion !== null && completion.outcome === 'not-started') {
     return { status: 'not-read', why: 'the run never started: no process was spawned to write this stdout' };
@@ -1565,10 +1566,11 @@ function stdoutResultOf(
   if (bytes === null) {
     return { status: 'not-read', why: unread ?? 'nothing was read' };
   }
+  const options = outputSchema === null ? {} : { outputSchema };
   if (outputFormat === 'json') {
-    return { status: 'read', basis: 'json-requested', reading: readResult(bytes, { outputSchema }) };
+    return { status: 'read', basis: 'json-requested', reading: readResult(bytes, options) };
   }
-  const reading = readResult(bytes, { outputSchema });
+  const reading = readResult(bytes, options);
   if (reading.file === 'result') {
     return { status: 'read', basis: 'parsed-as-result', reading };
   }
@@ -1770,7 +1772,7 @@ export async function readCustody(directory: string): Promise<CustodyReading> {
 
   const out = await readOutput(at(custodyFiles.stdout), recordedAt(custodyFiles.stdout), done?.stdout ?? null, problems);
   const outputFormat = invoked === null ? null : outputFormatIn(invoked.extraArgs);
-  const outputSchema = invoked !== null && invoked.outputSchema !== undefined && invoked.outputSchema !== null;
+  const outputSchema = invoked?.outputSchema ?? null;
   const stdout: CustodyStdoutReading = {
     ...out.reading,
     writtenBy: invoked === null ? null : { launcher: invoked.launcher, executable: invoked.executable },
@@ -1778,11 +1780,11 @@ export async function readCustody(directory: string): Promise<CustodyReading> {
     outputFormat,
     result: stdoutResultOf(out.bytes, out.reading.why, outputFormat, done, outputSchema),
   };
-  let schema: SchemaOutcome | null = null;
-  if (outputSchema) {
+  let schema: OutputSchemaOutcome | null = null;
+  if (outputSchema !== null) {
     schema = stdout.result.status === 'read'
-      ? stdout.result.reading.schema ?? noResultSchemaOutcome('the result was read without its schema')
-      : noResultSchemaOutcome(`stdout was not read as a result: ${stdout.result.why}`);
+      ? stdout.result.reading.schema ?? noResultSchemaOutcome('the result was read without its schema', outputSchema.sha256)
+      : noResultSchemaOutcome(`stdout was not read as a result: ${stdout.result.why}`, outputSchema.sha256);
   }
   const stderr = (await readOutput(at(custodyFiles.stderr), recordedAt(custodyFiles.stderr), done?.stderr ?? null, problems)).reading;
   const journal = await readSessionJournal(invoked, started, done, writtenIn, problems);
@@ -2020,14 +2022,14 @@ export type BriefResult =
   };
 
 /**
- * A reading's {@link SchemaOutcome}, classified: its kind, enforcer and, for
+ * A reading's {@link OutputSchemaOutcome}, classified: its kind, enforcer and, for
  * `no-final-message`, its reason code. Never the answer, native's errors or
  * any text; those stay in the reading. Null when the run had no output schema.
  */
 export type BriefSchema = {
-  kind: SchemaOutcome['kind'],
-  enforcedBy: SchemaOutcome['enforcedBy'],
-  reason: NoFinalMessageReason | null,
+  kind: OutputSchemaOutcome['kind'],
+  enforcedBy: OutputSchemaOutcome['enforcedBy'],
+  reason: OutputSchemaNoMessageReason | null,
 } | null;
 
 /** This run's appended journal records, counted; never an inherited one. */
@@ -2206,7 +2208,7 @@ function briefResult(result: CustodyStdoutResult): BriefResult {
   };
 }
 
-function briefSchema(schema: SchemaOutcome | null): BriefSchema {
+function briefSchema(schema: OutputSchemaOutcome | null): BriefSchema {
   return schema === null
     ? null
     : { kind: schema.kind, enforcedBy: schema.enforcedBy, reason: schema.kind === 'no-final-message' ? schema.reason : null };

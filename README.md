@@ -1016,7 +1016,7 @@ bare-claude --quiet --output-schema form.json -- 'Fill in the form for this repo
   UTF-8 JSON text whose value is an object; a byte order mark is refused. Whether it is a valid
   JSON Schema is Claude Code's to judge. A missing or unparsable file, or `--json-schema`
   forwarded beside it (`--claude-arg`, `extraArgs`), is refused with exit 1, as an
-  `OutputSchemaError` in the library.
+  `OutputSchemaFileError` in the library.
 - **Native enforcement.** The file's text goes to `claude` verbatim as `--json-schema <text>`,
   and Claude Code enforces it. Bare Claude adds nothing to the prompt and does not re-validate the
   answer.
@@ -1024,64 +1024,87 @@ bare-claude --quiet --output-schema form.json -- 'Fill in the form for this repo
   `--output-format json` result. The CLI asks for that format when none is forwarded, and refuses
   another one. Its stdout is then that result: under `--print` it is passed through as JSON. The
   library sets no output format; pass `--output-format json` in `extraArgs`.
+- **Verbose native.** Where Claude Code is verbose (`"verbose": true` in its settings, or
+  `--verbose` forwarded with `--claude-arg`), `--output-format json` prints a JSON array of the
+  run's messages with the result object last. Every reader takes that last element as the result,
+  and says so (`form: "array"`); an array that does not end in a result object is still no result.
+  Bare Claude's own `--verbose` changes only its transcript rendering and is not passed on.
 - **Not a preset field.** A schema dictates the caller's answer, and a preset configures a run
   without dictating its output. `outputSchemaFile` in a configuration file is refused as an
   unknown key.
 
-The outcome, `SchemaOutcome` from `@agladysh/bare-claude/outcome`:
+The outcome, `OutputSchemaOutcome` from `@agladysh/bare-claude/outcome`:
 
 ```ts
-type SchemaOutcome =
-  | { kind: 'conforming', enforcedBy: SchemaEnforcer, value: Json }
-  | { kind: 'not-conforming', enforcedBy: 'native', errors: string[], finalText: string | null }
-  | { kind: 'not-conforming', enforcedBy: 'wrapper', errors: SchemaValidationError[], finalText: string | null }
-  | { kind: 'no-final-message', enforcedBy: SchemaEnforcer, reason: NoFinalMessageReason, detail: string };
-// SchemaEnforcer = 'native' | 'wrapper'
-// SchemaValidationError = { instancePath: string, keyword: string, message: string }
-// NoFinalMessageReason = 'no-result' | 'unreadable-result' | 'no-structured-output'
+type OutputSchemaOutcome =
+  | { kind: 'conforming', enforcedBy: OutputSchemaEnforcer, value: Json, schemaSha256: string | null }
+  | { kind: 'not-conforming', enforcedBy: 'native', errors: string[], finalMessage: string | null, schemaSha256: string | null }
+  | { kind: 'not-conforming', enforcedBy: 'wrapper', errors: OutputSchemaError[], finalMessage: string | null, schemaSha256: string | null }
+  | { kind: 'no-final-message', enforcedBy: OutputSchemaEnforcer, reason: OutputSchemaNoMessageReason, detail: string, schemaSha256: string | null };
+// OutputSchemaEnforcer = 'native' | 'wrapper'
+// OutputSchemaError = { instancePath: string, keyword: string, message: string }
+// OutputSchemaNoMessageReason = 'no-result' | 'unreadable-result' | 'no-structured-output'
 ```
 
 - `conforming`: the result carries a non-null `structured_output`, the answer native accepted.
 - `not-conforming`: the result says `is_error: true`, with subtype
   `error_max_structured_output_retries` or terminal reason `structured_output_retry_exhausted`.
-  `errors` are native's `errors` strings, verbatim; `finalText` is the result's text, if any.
-- `no-final-message`: no result (`no-result`), bytes that are not a result (`unreadable-result`),
-  or a result with no `structured_output` (`no-structured-output`), with a `detail`.
+  `errors` are native's `errors` strings, verbatim; `finalMessage` is the result's text, if any
+  (native's give-up has none, so it is null there).
+- `no-final-message`: no result (`no-result`), bytes that are not a result, an array not ending in
+  one included (`unreadable-result`), or a result with no `structured_output`
+  (`no-structured-output`), with a `detail`.
+- `schemaSha256`, on every kind: the lowercase hex SHA-256 of the schema file's bytes the run was
+  given, when the reader knows them: a live CLI run, custody (from `invocation.json`), and a library
+  caller that passes the schema (below). It is null when the reader was told only that there was a
+  schema: `--outcome --outcome-schema`, an `--outcome-batch` line, `readResult` with
+  `outputSchema: true`, and a custody run whose directory could not be read back.
 
 Bare Claude always fills `enforcedBy: "native"`. The `wrapper` variants exist so that a sibling
 wrapper whose harness enforces nothing can report its own JSON Schema validator's errors in the
-same shape: a caller that drives several harnesses reads one type. Nothing here reads or judges the
-answer beyond what the enforcer reported about the schema. `conforming` is not a judgment that the
-work was done, nor that native reported no error; that is `result.status`.
+same shape. The type and field names are the ones the sibling wrappers use, so a caller that drives
+several harnesses reads one shape; which `reason` codes each can give is its own. Nothing here
+reads or judges the answer beyond what the enforcer reported about the schema. `conforming` is not
+a judgment that the work was done, nor that native reported no error; that is `result.status`.
 
 Where a caller reads it:
 
 - **A live CLI run**: the exit status ([Exit Status](#exit-status)): 0, 65, 66, or `claude`'s own.
 - **`--outcome FILE --outcome-schema`**, or `"outputSchema": true` on an `--outcome-batch` line:
-  `result.schema`.
+  `result.schema`, with `result.form` saying whether the file was the result object or the verbose
+  array.
 - **`--outcome-custody DIR`**: `schema` at the top of the reading, and in `--brief` as
-  `{ kind, enforcedBy, reason }` with no value or text. Custody records the schema in
+  `{ kind, enforcedBy, reason }` with no value, text or digest. Custody records the schema in
   `invocation.json` and keeps it as `output-schema.json`, so the reader needs no flag. When stdout
   was not a JSON result, the outcome is `no-final-message`, `no-result`.
-- **The library**: `readResult(bytes, { outputSchema: true }).schema`, or `readCustody(dir).schema`.
+- **The library**: `readResult(bytes, { outputSchema }).schema`, where `outputSchema` is the spawn's
+  own `outputSchema` (or any `{ sha256 }`), or `true` when the schema is not known; or
+  `readCustody(dir).schema`.
 
 **What is known of Claude Code here, and how.** On 2026-11-22, of Claude Code 2.1.328:
 
 - `claude --help` lists `--json-schema <schema>`: the schema is given inline as JSON text, not as a
   file path. (Read from the help.)
 - With `--json-schema` and `--output-format stream-json`, the init event's tools carried a
-  `StructuredOutput` tool, also with `--tools Read`. The final `result` had `is_error: false`,
-  subtype `success`, `structured_output` holding the parsed value, and `result` the same value as
-  JSON text. When the model first answered in plain text, native itself appended a user turn
-  requiring the `StructuredOutput` tool, and the model called it. (Observed, one model, one
-  schema; `--output-format json` was not itself run.)
-- The result-message schema lists the error subtypes `error_during_execution`, `error_max_turns`,
-  `error_max_budget_usd` and `error_max_structured_output_retries`, and its error variant carries
-  `errors: string[]` and no `result`. The code that gives up on a schema writes `is_error: true`,
-  that last subtype, terminal reason `structured_output_retry_exhausted`, and one `errors` entry.
-  The text output format then prints only `Error: <errors[0]>`. The bundle names
-  `MAX_STRUCTURED_OUTPUT_RETRIES`. (Read from the 2.1.328 bundle, not observed: no run that gave
-  up on its schema has been seen.)
+  `StructuredOutput` tool, also with `--tools Read`. When the model first answered in plain text,
+  native itself appended a user turn requiring the `StructuredOutput` tool, and the model called
+  it. (Observed.)
+- `claude -p --model haiku --output-format json --json-schema '<schema>'` with a satisfiable schema
+  exited 0. The result had `is_error: false`, subtype `success`, terminal reason `completed`,
+  `structured_output` holding the parsed value, and `result` the same value as JSON text.
+  (Observed.)
+- The same with an unsatisfiable schema (a string with `minLength: 3` and `maxLength: 1`) and
+  `MAX_STRUCTURED_OUTPUT_RETRIES=1` in the environment exited 1. The result had `is_error: true`,
+  subtype `error_max_structured_output_retries`, terminal reason
+  `structured_output_retry_exhausted`, neither `result` nor `structured_output`, and one `errors`
+  string beginning `Failed to provide valid structured output after 1 attempts — last
+  StructuredOutput error: Output does not match required schema: `. (Observed.)
+- In both runs the host's Claude Code settings were verbose, and stdout was a JSON array of the
+  run's messages with that result as its last element (7 and 10 elements). (Observed.)
+- Still read from the 2.1.328 bundle, not observed: the result-message schema's other error
+  subtypes (`error_during_execution`, `error_max_turns`, `error_max_budget_usd`); that the text
+  output format prints only `Error: <errors[0]>`; and the single-object form of a schema run's
+  `--output-format json` without verbose.
 
 ## Preloading Context
 
@@ -1214,6 +1237,10 @@ Results, observed on Claude Code 2.1.292, carry three scopes under similar names
 - A token count that was not recorded is `null`, never `0`. A `prompt` is `null` unless all three
   input counts were recorded.
 - `file` is `result`, `empty`, `unreadable` (possibly cut short) or `not-a-result`, with the SHA-256 of the bytes read (null for an empty result file).
+- `form` is `object` for a lone result object, or `array` for the JSON array verbose Claude Code
+  prints, every message of the run with the result last (observed on 2.1.328). An array is read by
+  its last element; one that does not end in a result object is `not-a-result`. `form` is null when
+  the bytes are not one JSON object or array.
 
 **The journal is read by cost-state segment.** Claude Code writes a `cost-state` record carrying
 the session's cumulative totals. Not every process end writes one, and a process that spent
@@ -1256,9 +1283,10 @@ alone cannot attribute a context-limit ending to the result's process.
 **Programmatically**, from `@agladysh/bare-claude/outcome`:
 
 - `readResult(bytes, options?)`, `readJournal(bytes)` and `joinResult(result, journal)`: pure,
-  and they never throw. `readResult(bytes, { outputSchema: true })` adds `schema`, a
-  `SchemaOutcome`; `noResultSchemaOutcome(detail)` is the outcome of a schema run with no result
-  to read.
+  and they never throw. `readResult(bytes, { outputSchema })` adds `schema`, an
+  `OutputSchemaOutcome`, its `schemaSha256` from `outputSchema.sha256`, or null for
+  `outputSchema: true`; `noResultSchemaOutcome(detail, schemaSha256)` is the outcome of a schema
+  run with no result to read.
 - `readOutcome(result, journal)`: puts two readings together.
 - `readOutcomeFiles(requests, readFile)`: the batch reader, with your own file reader.
 - `parseOutcomeRequest(line)`: reads one batch line, as an `OutcomeRequest`, a `CustodyRequest`
@@ -1268,7 +1296,7 @@ alone cannot attribute a context-limit ending to the result's process.
   `structuredOutputRetriesSubtype` and `structuredOutputRetriesTerminalReason`.
 - Types: `TokenSums`, `ResultReading`, `ResultOptions`, `JournalReading`, `JournalSegment`,
   `ResultJournalJoin`, `JoinKind`, `OutcomeRequest`, `CustodyRequest`, `OutcomeEntry`,
-  `SchemaOutcome`, `SchemaEnforcer`, `SchemaValidationError` and `NoFinalMessageReason`, with
+  `OutputSchemaOutcome`, `OutputSchemaEnforcer`, `OutputSchemaError` and `OutputSchemaNoMessageReason`, with
   their parts.
 
 ### Reading a custody directory
@@ -1854,7 +1882,7 @@ Optional:
   none of them.
 - `outputSchemaFile`: a JSON Schema file the final answer must satisfy. Read by `LaunchConfig`
   before anything is created or spawned, and passed verbatim as `--json-schema <text>`; refused
-  with an `OutputSchemaError` when it cannot be read, is not a JSON object, or `extraArgs` also
+  with an `OutputSchemaFileError` when it cannot be read, is not a JSON object, or `extraArgs` also
   holds `--json-schema`. Sets no output format: pass `--output-format json` in `extraArgs` to
   read the outcome. Not a preset field. Defaults to `null`. See [Output schema](#output-schema).
 - `extraEnv`: Additional environment variables to set for the Claude process. Defaults to `{}`.
@@ -1877,6 +1905,9 @@ A promise that resolves to a `ClaudeSubprocess` object containing:
 - `seededJournal`: The size and SHA-256 of exactly the bytes put in the session journal before the
   spawn — the `customSessionData` seed, with anything the CLI preloaded into it — or `null` when
   nothing was seeded. Everything after them was appended once the spawn had happened
+- `outputSchema`: The `OutputSchema` read from `outputSchemaFile` (`file`, verbatim `text`,
+  `bytes`, `sha256`), the one passed as `--json-schema`, or `null` without one. Pass it to
+  `readResult(bytes, { outputSchema })` so the outcome's `schemaSha256` names it
 - `dispose()`: Removes the ephemeral Claude home directory, but only when `spawnClaude` created it.
   Idempotent. Call it in a `finally`; without it every spawn leaks a temporary directory.
 
@@ -2035,7 +2066,7 @@ flag matrix can be inspected and tested without spawning anything:
 - `LaunchConfig(options)`: resolves `LaunchOptions` to a fully defaulted `LaunchConfig`. The one
   file it reads is `outputSchemaFile`, into `outputSchema` (an `OutputSchema`: absolute `file`,
   verbatim `text`, `bytes`, `sha256`); `readOutputSchema(file)` does that alone. Both refuse with
-  an `OutputSchemaError` whose `reason` is an `OutputSchemaRefusal`.
+  an `OutputSchemaFileError` whose `reason` is an `OutputSchemaRefusal`.
 - `buildArgv(config, sessionId)`: the full command vector, `argv[0]` included.
 - `buildSettings(config)`: the `settings.json` document.
 - `buildEnv(config, { ephemeralClaudeHomePath, processEnv?, spawnEnv? })`: the child environment.

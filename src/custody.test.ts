@@ -318,8 +318,8 @@ describe.if(posix)('runInCustody', () => {
     // The caller's file changing afterwards changes nothing recorded or read.
     await fs.writeFile(source, '{}');
     const reading = await readCustody(run.directory);
-    expect(reading.schema).toEqual({ kind: 'conforming', enforcedBy: 'native', value: { answer: 'ok' } });
-    expect(reading.stdout.result).toMatchObject({ status: 'read', reading: { schema: { kind: 'conforming' } } });
+    expect(reading.schema).toEqual({ kind: 'conforming', enforcedBy: 'native', value: { answer: 'ok' }, schemaSha256: sha256(text) });
+    expect(reading.stdout.result).toMatchObject({ status: 'read', reading: { form: 'object', schema: { kind: 'conforming' } } });
     expect(briefCustody(reading).schema).toEqual({ kind: 'conforming', enforcedBy: 'native', reason: null });
     expect(JSON.stringify(briefCustody(reading))).not.toContain('answer');
   }, 20_000);
@@ -330,7 +330,7 @@ describe.if(posix)('runInCustody', () => {
     const text = await begin({ outputSchemaFile: source }, { FAKE_CLAUDE_STDOUT: '{"answer":"ok"}\n' });
     await text.completion;
     const reading = await readCustody(text.directory);
-    expect(reading.schema).toMatchObject({ kind: 'no-final-message', enforcedBy: 'native', reason: 'no-result' });
+    expect(reading.schema).toMatchObject({ kind: 'no-final-message', enforcedBy: 'native', reason: 'no-result', schemaSha256: sha256('{}') });
     expect(briefCustody(reading).schema).toEqual({ kind: 'no-final-message', enforcedBy: 'native', reason: 'no-result' });
 
     const plain = await begin({ extraArgs: [ '--output-format', 'json' ] }, { FAKE_CLAUDE_STDOUT: '{"type":"result","is_error":false,"result":"hi"}' });
@@ -341,6 +341,29 @@ describe.if(posix)('runInCustody', () => {
     expect(await readJson(path.join(plain.directory, custodyFiles.invocation))).toMatchObject({ outputSchema: null });
     expect(unchanged.entries).not.toContain(custodyFiles.outputSchema);
     expect(unchanged.stdout.result.status === 'read' && 'schema' in unchanged.stdout.result.reading).toBe(false);
+  }, 20_000);
+
+  // Native verbose prints the run's messages as one array, the result last
+  // (observed 2026-11-22, claude 2.1.328); the stdout is still the result.
+  test('a verbose array on stdout is read by its final result: conforming, or no final message when none ends it', async () => {
+    const source = path.join(await tempDir(), 'form.json');
+    const text = '{ "type": "object" }';
+    await fs.writeFile(source, text);
+    const messages = [ { type: 'system', subtype: 'init' }, { type: 'assistant' }, { type: 'user' } ];
+    const result = { type: 'result', subtype: 'success', is_error: false, structured_output: { answer: 'ok' }, result: '{"answer":"ok"}' };
+    const options = { outputSchemaFile: source, extraArgs: [ '--output-format', 'json' ] };
+
+    const verbose = await begin(options, { FAKE_CLAUDE_STDOUT: JSON.stringify([ ...messages, result ]) });
+    await verbose.completion;
+    const reading = await readCustody(verbose.directory);
+    expect(reading.stdout.result).toMatchObject({ status: 'read', basis: 'json-requested', reading: { file: 'result', form: 'array' } });
+    expect(reading.schema).toEqual({ kind: 'conforming', enforcedBy: 'native', value: { answer: 'ok' }, schemaSha256: sha256(text) });
+
+    const unended = await begin(options, { FAKE_CLAUDE_STDOUT: JSON.stringify(messages) });
+    await unended.completion;
+    const none = await readCustody(unended.directory);
+    expect(none.stdout.result).toMatchObject({ status: 'read', reading: { file: 'not-a-result', form: 'array' } });
+    expect(none.schema).toMatchObject({ kind: 'no-final-message', reason: 'unreadable-result', schemaSha256: sha256(text) });
   }, 20_000);
 
   test('a refused output schema is refused before the custody directory is made', async () => {

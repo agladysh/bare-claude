@@ -130,13 +130,24 @@ Verified against `claude` 2.1.220 on macOS. Re-verify, with a dated note, when t
   --json-schema '<object schema>'`: the init event's tools hold `StructuredOutput`, also under
   `--tools Read`. The `result` event has `is_error: false`, subtype `success`, `structured_output`
   as the parsed value, and `result` as the same JSON text. Native, not the model, injected a user
-  turn demanding the tool after a plain-text answer. Read from the bundle (`grep -a` on
-  `versions/2.1.328`), **not observed**: a schema give-up writes `is_error: true`, subtype
-  `error_max_structured_output_retries`, terminal reason `structured_output_retry_exhausted` and
-  `errors: [msg]`, with no `result` field. Text output prints only `Error: <errors[0]>`, so only a
-  JSON result tells the kinds apart. That subtype is the one place `src/outcome.ts` reads a
-  subtype. Re-probe by forcing a give-up (`MAX_STRUCTURED_OUTPUT_RETRIES`, an unsatisfiable
-  schema) once someone pays for the run.
+  turn demanding the tool after a plain-text answer. Observed with `-p --model haiku
+  --output-format json --json-schema '<schema>'`: a satisfiable schema exits 0, the result as
+  above with terminal reason `completed`. An unsatisfiable one (a string with `minLength: 3` and
+  `maxLength: 1`) under `MAX_STRUCTURED_OUTPUT_RETRIES=1` in the environment exits 1; the result
+  has `is_error: true`, subtype `error_max_structured_output_retries`, terminal reason
+  `structured_output_retry_exhausted`, one `errors` string (`Failed to provide valid structured
+  output after 1 attempts — last StructuredOutput error: Output does not match required schema:
+  …`), and neither `result` nor `structured_output`. That subtype is the one place
+  `src/outcome.ts` reads a subtype. Still read from the bundle (`grep -a` on `versions/2.1.328`),
+  **not observed**: text output prints only `Error: <errors[0]>`, so only a JSON result tells the
+  kinds apart.
+- `--output-format json` under native verbose, 2026-11-22, claude 2.1.328, observed in both runs
+  above with the host's settings at `"verbose": true`: stdout is a JSON array of every message
+  of the run (7 and 10 elements: `system`/`init`, `assistant`, `rate_limit_event`, `user`, …),
+  the result object last — not the lone result object. That a forwarded `--verbose` does the same
+  with `--output-format json` is taken as the same setting, not separately captured; the
+  single-object form without verbose is read from the bundle for a schema run. `readResult` takes
+  the last element; Bare Claude's own `--verbose` is rendering only and never reaches `claude`.
 
 ## Measured facts about Bun
 

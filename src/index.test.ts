@@ -12,7 +12,7 @@ import {
   buildEnv,
   buildSettings,
   LaunchConfig,
-  OutputSchemaError,
+  OutputSchemaFileError,
   readOutputSchema,
   spawnClaude,
   type JsonObject,
@@ -337,8 +337,8 @@ describe('outputSchemaFile', () => {
     try {
       run();
     } catch (error) {
-      expect(error).toBeInstanceOf(OutputSchemaError);
-      return error instanceof OutputSchemaError ? error.reason : null;
+      expect(error).toBeInstanceOf(OutputSchemaFileError);
+      return error instanceof OutputSchemaFileError ? error.reason : null;
     }
     return null;
   };
@@ -413,9 +413,26 @@ describe('outputSchemaFile', () => {
       callToAction: '# probe', claudePath: probe, noProcessEnv: true, auth: 'caller',
       ephemeralClaudeHomePath: home, outputSchemaFile: path.join(dir, 'missing.json'),
     });
-    await expect(run).rejects.toBeInstanceOf(OutputSchemaError);
+    await expect(run).rejects.toBeInstanceOf(OutputSchemaFileError);
     expect(await fs.stat(home).then(() => true, () => false)).toBe(false);
     expect(await fs.stat(ran).then(() => true, () => false)).toBe(false);
+  });
+
+  test('the spawn reports the schema it was given, whose digest names it in the outcome; none without one', async () => {
+    const text = '{ "type": "object" }';
+    const file = await schemaFile('given.json', text);
+    const probe = await schemaFile('quiet.sh', '#!/bin/sh\nexit 0\n');
+    await fs.chmod(probe, 0o755);
+    const given = { file, text, bytes: Buffer.byteLength(text), sha256: createHash('sha256').update(text).digest('hex') };
+    for (const [ outputSchemaFile, expected ] of [ [ file, given ], [ null, null ] ] satisfies [ string | null, unknown ][]) {
+      const claude = await spawnClaude({ callToAction: '# probe', claudePath: probe, noProcessEnv: true, auth: 'caller', outputSchemaFile });
+      try {
+        await claude.subprocess.exited;
+        expect(claude.outputSchema).toEqual(expected);
+      } finally {
+        await claude.dispose();
+      }
+    }
   });
 });
 

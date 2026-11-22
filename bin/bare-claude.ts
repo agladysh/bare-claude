@@ -37,7 +37,7 @@ import { alternateCredentialVariables, tokenVariable } from '@agladysh/bare-clau
 import { readUsage } from '@agladysh/bare-claude/usage';
 import {
   noResultSchemaOutcome, parseOutcomeRequest, readOutcomeFiles, readResult,
-  type CustodyRequest, type OutcomeEntry, type OutcomeRequest, type SchemaOutcome
+  type CustodyRequest, type OutcomeEntry, type OutcomeRequest, type OutputSchemaOutcome
 } from '@agladysh/bare-claude/outcome';
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -962,12 +962,14 @@ async function main() {
     if (stoppedBy !== null) {
       return signalExitStatus(stoppedBy);
     }
-    if (schema) {
+    const outputSchema = claude.outputSchema;
+    if (outputSchema !== null) {
       // Bounded, as above; a stdout not closed by then is no result.
       const bytes = capture === null ? null : await within(capture.bytes, capturedWaitMs, null);
       const outcome = bytes === null
-        ? noResultSchemaOutcome('stdout was not captured to its end')
-        : readResult(bytes, { outputSchema: true }).schema ?? noResultSchemaOutcome('the result was read without its schema');
+        ? noResultSchemaOutcome('stdout was not captured to its end', outputSchema.sha256)
+        : readResult(bytes, { outputSchema }).schema
+          ?? noResultSchemaOutcome('the result was read without its schema', outputSchema.sha256);
       return schemaExitStatus(exitCode, outcome);
     }
     return exitCode;
@@ -1095,7 +1097,8 @@ async function runUnderCustody(
   // The schema outcome as the directory's own reading says it, the one
   // `--outcome-custody` gives any later reader.
   if (typeof preset.outputSchemaFile === 'string') {
-    const outcome = observed.reading?.schema ?? noResultSchemaOutcome('the custody directory was not read after the completion');
+    // Unread, the directory does not say which schema it kept.
+    const outcome = observed.reading?.schema ?? noResultSchemaOutcome('the custody directory was not read after the completion', null);
     return schemaExitStatus(completion.exitStatus, outcome);
   }
   return completion.exitStatus;
@@ -1338,7 +1341,7 @@ const schemaExit = { notConforming: 65, noFinalMessage: 66 } as const;
  * exited 0 without a structured answer is 66. Says why on stderr whenever the
  * answer did not conform.
  */
-function schemaExitStatus(exitCode: number, outcome: SchemaOutcome): number {
+function schemaExitStatus(exitCode: number, outcome: OutputSchemaOutcome): number {
   switch (outcome.kind) {
     case 'conforming':
       return exitCode;

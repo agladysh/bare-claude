@@ -23,7 +23,7 @@
  *   Its costs are Claude Code's own figures, not billing or subscription usage.
  * - `subtype` was `"success"` on every error result read; it is carried
  *   verbatim and never read as an outcome, with one exception: the
- *   {@link SchemaOutcome} of a run given an output schema (see there).
+ *   {@link OutputSchemaOutcome} of a run given an output schema (see there).
  *   `is_error` and `terminal_reason` are read; `stop_reason` and
  *   `safety_stops` are carried verbatim.
  * - The native version is on journal record envelopes (`version`). Neither
@@ -100,26 +100,27 @@ function isJson(v: unknown): v is Json {
 
 /**
  * The `subtype` of a result whose run never produced an answer that passed
- * its schema. Read from the claude 2.1.328 bundle on 2026-11-22, not
- * observed in a run: its result-message schema lists it among the error
- * subtypes, and the code that ends such a run writes it with `is_error: true`
- * and `errors`.
+ * its schema. Observed 2026-11-22 on claude 2.1.328, `--output-format json`
+ * with an unsatisfiable schema and `MAX_STRUCTURED_OUTPUT_RETRIES=1`: the
+ * result had `is_error: true`, this subtype, terminal reason
+ * {@link structuredOutputRetriesTerminalReason}, one `errors` string and
+ * neither `result` nor `structured_output`; claude exited 1.
  */
 export const structuredOutputRetriesSubtype = 'error_max_structured_output_retries';
 
-/** The `terminal_reason` the same 2.1.328 code writes beside {@link structuredOutputRetriesSubtype}. Read from the bundle, not observed. */
+/** The `terminal_reason` beside {@link structuredOutputRetriesSubtype}, observed in the same 2.1.328 run. */
 export const structuredOutputRetriesTerminalReason = 'structured_output_retry_exhausted';
 
 /**
  * Who checked an answer against its schema: `native`, the harness itself,
  * which Bare Claude always is (`claude --json-schema`); or `wrapper`, a
  * wrapper's own JSON Schema validator after the fact, for a sibling wrapper
- * whose harness enforces nothing. The two share {@link SchemaOutcome}.
+ * whose harness enforces nothing. The two share {@link OutputSchemaOutcome}.
  */
-export type SchemaEnforcer = 'native' | 'wrapper';
+export type OutputSchemaEnforcer = 'native' | 'wrapper';
 
 /** One error of a JSON Schema validator, as a wrapper that validates itself reports it. */
-export interface SchemaValidationError {
+export interface OutputSchemaError {
   instancePath: string,
   keyword: string,
   message: string,
@@ -132,7 +133,7 @@ export interface SchemaValidationError {
  * `no-structured-output`, a result without `structured_output`, which neither
  * says the schema was met nor that native gave up on it.
  */
-export type NoFinalMessageReason = 'no-result' | 'unreadable-result' | 'no-structured-output';
+export type OutputSchemaNoMessageReason = 'no-result' | 'unreadable-result' | 'no-structured-output';
 
 /**
  * How a run given an output schema answered, as the enforcer reported it:
@@ -141,42 +142,52 @@ export type NoFinalMessageReason = 'no-result' | 'unreadable-result' | 'no-struc
  *   enforcer accepted, as `value`.
  * - `not-conforming`: the enforcer gave up on the schema. `errors` is what
  *   it said, verbatim: native's `errors` strings, or a validator's errors.
- *   `finalText` is the result's text, if it has any.
+ *   `finalMessage` is the result's text, if it has any.
  * - `no-final-message`: neither, with a reason code and a detail.
+ *
+ * Every kind carries `schemaSha256`, the hex SHA-256 of the schema file's
+ * bytes the run was given, or null when the reader was not told which
+ * schema that was ({@link ResultOptions.outputSchema} `true`): the offline
+ * readers of a bare result file. The field names are shared with the
+ * sibling wrappers, so a caller reads one shape from each; which `reason`
+ * codes a wrapper can give is its own.
  *
  * Nothing here reads or judges the answer's content beyond what the enforcer
  * reported about the schema, and `conforming` is not a judgment that the
  * work was done, nor that native reported no error: that is the result's
  * `status`.
  *
- * Bare Claude reads native's report from the `--output-format json` result.
- * `conforming` when it carries a non-null `structured_output` (observed
- * 2026-11-22 on claude 2.1.328: `is_error: false`, subtype `success`, the
- * parsed value, and `result` the same value as JSON text). `not-conforming`
- * when it says `is_error: true` with subtype
- * {@link structuredOutputRetriesSubtype} or terminal reason
- * {@link structuredOutputRetriesTerminalReason}: the one place a subtype is
- * read, since it may be the only discriminator. That shape is read from the
- * 2.1.328 bundle; no such run has been observed.
+ * Bare Claude reads native's report from the `--output-format json` result,
+ * a lone object or the last element of the verbose array
+ * ({@link ResultForm}). Observed 2026-11-22 on claude 2.1.328
+ * (`claude -p --output-format json --json-schema`): a satisfiable schema
+ * gave `is_error: false`, subtype `success`, `structured_output` the parsed
+ * value and `result` the same value as JSON text, read here as `conforming`;
+ * an unsatisfiable one gave the shape described at
+ * {@link structuredOutputRetriesSubtype}, read here as `not-conforming`.
+ * Either that subtype or that terminal reason, on an error result, is a
+ * give-up: the one place a subtype is read. That either alone suffices is a
+ * reading choice; both were present in the run observed.
  */
-export type SchemaOutcome =
-  | { kind: 'conforming', enforcedBy: SchemaEnforcer, value: Json }
-  | { kind: 'not-conforming', enforcedBy: 'native', errors: string[], finalText: string | null }
-  | { kind: 'not-conforming', enforcedBy: 'wrapper', errors: SchemaValidationError[], finalText: string | null }
-  | { kind: 'no-final-message', enforcedBy: SchemaEnforcer, reason: NoFinalMessageReason, detail: string };
+export type OutputSchemaOutcome =
+  | { kind: 'conforming', enforcedBy: OutputSchemaEnforcer, value: Json, schemaSha256: string | null }
+  | { kind: 'not-conforming', enforcedBy: 'native', errors: string[], finalMessage: string | null, schemaSha256: string | null }
+  | { kind: 'not-conforming', enforcedBy: 'wrapper', errors: OutputSchemaError[], finalMessage: string | null, schemaSha256: string | null }
+  | { kind: 'no-final-message', enforcedBy: OutputSchemaEnforcer, reason: OutputSchemaNoMessageReason, detail: string, schemaSha256: string | null };
 
 /**
- * The {@link SchemaOutcome} of a run given a schema whose result was never
+ * The {@link OutputSchemaOutcome} of a run given a schema whose result was never
  * read: stdout not asked for as `--output-format json`, a run that never
  * started, a file that is not there.
  * @param detail - Why there is no result to read
+ * @param schemaSha256 - The schema's digest, or null when the reader does not know it
  */
-export function noResultSchemaOutcome(detail: string): SchemaOutcome {
-  return { kind: 'no-final-message', enforcedBy: 'native', reason: 'no-result', detail };
+export function noResultSchemaOutcome(detail: string, schemaSha256: string | null): OutputSchemaOutcome {
+  return { kind: 'no-final-message', enforcedBy: 'native', reason: 'no-result', detail, schemaSha256 };
 }
 
 /** The schema outcome of a parsed result object. */
-function schemaOutcomeOf(parsed: Record<string, unknown>): SchemaOutcome {
+function schemaOutcomeOf(parsed: Record<string, unknown>, schemaSha256: string | null): OutputSchemaOutcome {
   const subtype = bounded(parsed.subtype, idLimit);
   const terminalReason = bounded(parsed.terminal_reason, idLimit);
   if (parsed.is_error === true
@@ -185,12 +196,13 @@ function schemaOutcomeOf(parsed: Record<string, unknown>): SchemaOutcome {
       kind: 'not-conforming',
       enforcedBy: 'native',
       errors: (listOf(parsed.errors) ?? []).flatMap(e => typeof e === 'string' ? [ e ] : []),
-      finalText: typeof parsed.result === 'string' ? parsed.result : null,
+      finalMessage: typeof parsed.result === 'string' ? parsed.result : null,
+      schemaSha256,
     };
   }
   const value = parsed.structured_output;
   if (value !== undefined && value !== null && isJson(value)) {
-    return { kind: 'conforming', enforcedBy: 'native', value };
+    return { kind: 'conforming', enforcedBy: 'native', value, schemaSha256 };
   }
   const said = `is_error ${JSON.stringify(parsed.is_error ?? null)}, subtype ${JSON.stringify(subtype)}, terminal_reason ${JSON.stringify(terminalReason)}`;
   return {
@@ -200,6 +212,7 @@ function schemaOutcomeOf(parsed: Record<string, unknown>): SchemaOutcome {
     detail: value === null
       ? `the result's structured_output is null (${said})`
       : `the result carries no structured_output (${said})`,
+    schemaSha256,
   };
 }
 
@@ -254,6 +267,17 @@ export function isMeasuredPrompt(tokens: CallTokens | null): boolean {
 export type ResultFile = 'result' | 'empty' | 'unreadable' | 'not-a-result';
 
 /**
+ * Which top-level JSON form the bytes had: `object`, the result object
+ * alone; or `array`, every message of the run with the result object last.
+ * Observed 2026-11-22 on claude 2.1.328: with its settings at
+ * `"verbose": true`, `--output-format json` printed the array, the result
+ * its last element; a forwarded `--verbose` is taken to do the same, not
+ * separately observed. An array is read by that last element only; one that
+ * does not end in a result object is `not-a-result`.
+ */
+export type ResultForm = 'object' | 'array';
+
+/**
  * What the result says about itself, from `is_error` alone. `no-error` is not
  * completion, delivery or success of the work.
  */
@@ -302,6 +326,9 @@ export interface ResultReading {
   sha256: string | null,
 
   file: ResultFile,
+
+  /** The top-level JSON form read; null when the bytes are not one JSON object or array. */
+  form: ResultForm | null,
 
   /** Why the file is not a readable result, or null. */
   why: string | null,
@@ -358,13 +385,19 @@ export interface ResultReading {
    * absent otherwise, since a result without `structured_output` cannot say
    * whether a schema was given.
    */
-  schema?: SchemaOutcome,
+  schema?: OutputSchemaOutcome,
 }
 
 /** What the reader of a result is told about the run that wrote it. */
 export interface ResultOptions {
-  /** The run was given an output schema (`outputSchemaFile`); read its {@link SchemaOutcome}. */
-  outputSchema?: boolean,
+  /**
+   * The run was given an output schema (`outputSchemaFile`): read its
+   * {@link OutputSchemaOutcome}. The schema itself, or anything with its
+   * `sha256` (a `LaunchConfig.outputSchema`, a spawn's `outputSchema`),
+   * when the reader knows which it was, for the outcome's `schemaSha256`;
+   * `true` when it knows only that there was one, and `schemaSha256` is null.
+   */
+  outputSchema?: boolean | { readonly sha256: string },
 }
 
 function lastCallOf(usage: unknown): { lastCall: LastCall | null, missing: string | null } {
@@ -408,9 +441,10 @@ function modelTotals(v: unknown): ModelTotals[] {
 }
 
 /**
- * Reads the bytes `claude --print --output-format json` wrote. Never throws:
- * an empty, cut-short or foreign file is itself a finding, with the digest of
- * what was there.
+ * Reads the bytes `claude --print --output-format json` wrote: the result
+ * object, or the verbose array whose last element it is ({@link ResultForm}).
+ * Never throws: an empty, cut-short or foreign file is itself a finding, with
+ * the digest of what was there.
  * @param bytes - The result file's bytes
  * @param options - What the reader knows of the run; with `outputSchema`,
  *   the reading carries `schema`, a `no-final-message` one when the bytes are
@@ -418,16 +452,19 @@ function modelTotals(v: unknown): ModelTotals[] {
  */
 export function readResult(bytes: Uint8Array, options: ResultOptions = {}): ResultReading {
   const read = readResultFile(bytes);
-  if (options.outputSchema !== true) {
+  const given = options.outputSchema;
+  if (given === undefined || given === false) {
     return read.reading;
   }
-  const schema: SchemaOutcome = read.parsed !== null
-    ? schemaOutcomeOf(read.parsed)
+  const schemaSha256 = given === true ? null : given.sha256;
+  const schema: OutputSchemaOutcome = read.parsed !== null
+    ? schemaOutcomeOf(read.parsed, schemaSha256)
     : {
       kind: 'no-final-message',
       enforcedBy: 'native',
       reason: read.reading.file === 'empty' ? 'no-result' : 'unreadable-result',
       detail: read.reading.why ?? 'the bytes are not a result',
+      schemaSha256,
     };
   return { ...read.reading, schema };
 }
@@ -438,6 +475,7 @@ function readResultFile(bytes: Uint8Array): { reading: ResultReading, parsed: Re
     bytes: bytes.length,
     sha256: bytes.length === 0 ? null : sha256(bytes),
     file: 'result',
+    form: null,
     why: null,
     status: 'unstated',
     subtype: null,
@@ -466,14 +504,38 @@ function readResultFile(bytes: Uint8Array): { reading: ResultReading, parsed: Re
     return finding({ ...reading, file: 'empty', why: 'nothing but whitespace was written' });
   }
 
-  let parsed: unknown;
+  let document: unknown;
   try {
-    parsed = JSON.parse(text);
+    document = JSON.parse(text);
   } catch {
     return finding({ ...reading, file: 'unreadable', why: 'not one JSON document; possibly cut short' });
   }
-  if (!isRecord(parsed) || parsed.type !== 'result') {
-    return finding({ ...reading, file: 'not-a-result', why: 'not a Claude Code result object' });
+  const isResult = (v: unknown): v is Record<string, unknown> => isRecord(v) && v.type === 'result';
+  let parsed: Record<string, unknown>;
+  if (Array.isArray(document)) {
+    const last: unknown = document.at(-1);
+    if (!isResult(last)) {
+      return finding({
+        ...reading,
+        file: 'not-a-result',
+        form: 'array',
+        why: document.length === 0
+          ? 'an empty JSON array, with no result object last'
+          : `a JSON array of ${document.length} whose last element is not a Claude Code result object`,
+      });
+    }
+    parsed = last;
+    reading.form = 'array';
+  } else if (isResult(document)) {
+    parsed = document;
+    reading.form = 'object';
+  } else {
+    return finding({
+      ...reading,
+      file: 'not-a-result',
+      form: isRecord(document) ? 'object' : null,
+      why: 'not a Claude Code result object',
+    });
   }
 
   const status: ResultStatus = parsed.is_error === true ? 'error' : parsed.is_error === false ? 'no-error' : 'unstated';

@@ -245,7 +245,7 @@ export type SessionSeed = InMemorySessionSeed | FileSessionSeed;
 export type OutputSchemaRefusal = 'unreadable' | 'not-json' | 'not-an-object' | 'conflicting-arg';
 
 /** The error {@link readOutputSchema} and {@link LaunchConfig} refuse an output schema with. */
-export class OutputSchemaError extends Error {
+export class OutputSchemaFileError extends Error {
   /** Which refusal this is. */
   readonly reason: OutputSchemaRefusal;
 
@@ -260,7 +260,7 @@ export class OutputSchemaError extends Error {
    */
   constructor(reason: OutputSchemaRefusal, file: string | null, message: string, options?: ErrorOptions) {
     super(message, options);
-    this.name = 'OutputSchemaError';
+    this.name = 'OutputSchemaFileError';
     this.reason = reason;
     this.file = file;
   }
@@ -290,18 +290,18 @@ export interface OutputSchema {
  * Nothing about it is checked beyond that, and nothing is added to it.
  * @param file - The schema file; relative to this process's cwd
  * @returns The schema, its text verbatim
- * @throws {@link OutputSchemaError} with the reason
+ * @throws {@link OutputSchemaFileError} with the reason
  */
 export function readOutputSchema(file: string): OutputSchema {
   if (typeof file !== 'string' || file === '' || file.includes('\0')) {
-    throw new OutputSchemaError('unreadable', null, `output schema file must be a path, got ${JSON.stringify(file)}`);
+    throw new OutputSchemaFileError('unreadable', null, `output schema file must be a path, got ${JSON.stringify(file)}`);
   }
   const absolute = path.resolve(file);
   let bytes: Uint8Array;
   try {
     bytes = readFileSync(absolute);
   } catch (error) {
-    throw new OutputSchemaError('unreadable', absolute,
+    throw new OutputSchemaFileError('unreadable', absolute,
       `output schema file ${absolute} cannot be read (${errorCode(error) ?? 'unknown error'})`, { cause: error });
   }
   let text: string;
@@ -309,16 +309,16 @@ export function readOutputSchema(file: string): OutputSchema {
     // Fatal and BOM-preserving, so the text re-encodes to exactly these bytes.
     text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch (error) {
-    throw new OutputSchemaError('not-json', absolute, `output schema file ${absolute} is not UTF-8 text`, { cause: error });
+    throw new OutputSchemaFileError('not-json', absolute, `output schema file ${absolute} is not UTF-8 text`, { cause: error });
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch (error) {
-    throw new OutputSchemaError('not-json', absolute, `output schema file ${absolute} is not one JSON document`, { cause: error });
+    throw new OutputSchemaFileError('not-json', absolute, `output schema file ${absolute} is not one JSON document`, { cause: error });
   }
   if (!isJsonObject(parsed)) {
-    throw new OutputSchemaError('not-an-object', absolute, `output schema file ${absolute} is not a JSON object`);
+    throw new OutputSchemaFileError('not-an-object', absolute, `output schema file ${absolute} is not a JSON object`);
   }
   return { file: absolute, text, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
 }
@@ -575,12 +575,12 @@ export interface LaunchOptions {
    * `claude --json-schema <text>`, and Claude Code enforces it. Bare Claude
    * adds nothing to the prompt and does not validate the answer again. A
    * missing or unparsable file, and `--json-schema` also in `extraArgs`, are
-   * refused with an {@link OutputSchemaError}.
+   * refused with an {@link OutputSchemaFileError}.
    *
    * Native reports how the schema fared in its result object, which only
    * `--output-format json` writes to stdout: pass that in `extraArgs` to read
    * it, with `readResult` from `@agladysh/bare-claude/outcome`, as a
-   * `SchemaOutcome`. Nothing here sets an output format. Defaults to null,
+   * `OutputSchemaOutcome`. Nothing here sets an output format. Defaults to null,
    * which passes no schema.
    */
   outputSchemaFile?: null | string,
@@ -634,7 +634,7 @@ export type LaunchConfig = Required<LaunchOptions> & {
  *   `auth: 'caller'` is combined with a credential source of Bare Claude's
  *   own, `linkAuth: true` or a `tokenFile`; when a session seed's
  *   `sessionId` does not match {@link sessionIdPattern}; and, as an
- *   {@link OutputSchemaError}, when `outputSchemaFile` cannot be read, is not
+ *   {@link OutputSchemaFileError}, when `outputSchemaFile` cannot be read, is not
  *   a JSON object, or comes with `--json-schema` in `extraArgs`. The schema
  *   file is the only file this reads.
  */
@@ -696,10 +696,10 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
   // conflict is refused before the file is even read.
   const schemaFile: unknown = o.outputSchemaFile ?? null;
   if (schemaFile !== null && typeof schemaFile !== 'string') {
-    throw new OutputSchemaError('unreadable', null, `outputSchemaFile must be a path, got ${JSON.stringify(schemaFile)}`);
+    throw new OutputSchemaFileError('unreadable', null, `outputSchemaFile must be a path, got ${JSON.stringify(schemaFile)}`);
   }
   if (schemaFile !== null && (o.extraArgs ?? []).some(isJsonSchemaArg)) {
-    throw new OutputSchemaError('conflicting-arg', path.resolve(schemaFile),
+    throw new OutputSchemaFileError('conflicting-arg', path.resolve(schemaFile),
       'outputSchemaFile cannot be combined with --json-schema in extraArgs: the run would be given two schemas');
   }
   const outputSchema = schemaFile === null ? null : readOutputSchema(schemaFile);
@@ -1133,6 +1133,13 @@ interface ClaudeSubprocess<
    */
   seededJournal: { bytes: number, sha256: string } | null,
   /**
+   * The output schema this run was given, as read from `outputSchemaFile`
+   * (its text is the `--json-schema` passed); null without one. Pass it as
+   * `readResult(bytes, { outputSchema })` from `@agladysh/bare-claude/outcome`
+   * so the outcome's `schemaSha256` names it.
+   */
+  outputSchema: OutputSchema | null,
+  /**
    * Removes the ephemeral Claude home directory, but only when spawnClaude
    * created it: a caller-supplied `ephemeralClaudeHomePath` is left alone.
    * Idempotent. Without this every spawn leaks a temporary directory.
@@ -1558,6 +1565,7 @@ async function spawnClaudeInternal<
     sessionJsonlPath,
     processGroup,
     seededJournal: journal === null ? null : { bytes: journal.bytes, sha256: journal.sha256 },
+    outputSchema: c.outputSchema,
     dispose: async () => {
       if (disposed || !ownsClaudeHome) {
         return;
