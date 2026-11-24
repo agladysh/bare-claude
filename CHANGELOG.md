@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Usage of the selected account.** `readUsage` (and `--usage`) reads the usage cache from
+  `$CLAUDE_CONFIG_DIR/.claude.json` when `CLAUDE_CONFIG_DIR` is set, where the `claude -p /usage`
+  it runs in the same environment refreshes it; it read `~/.claude.json`, another account's or a
+  stale payload, under any launcher that selects an account home. `usageConfigPath` exports the
+  rule.
+
 ### Added
 
 - `spawnClaudeWithStdinPrompt` sends the exact prompt through text stdin with EOF,

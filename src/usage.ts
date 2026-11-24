@@ -228,8 +228,23 @@ export interface ReadUsageOptions {
    */
   refresh?: boolean,
 
-  /** Path to Claude Code's config file. Defaults to `~/.claude.json`. */
+  /** Path to Claude Code's config file. Defaults to {@link usageConfigPath}. */
   configPath?: string,
+}
+
+/**
+ * Where Claude Code keeps the config file that holds its usage cache: inside
+ * `CLAUDE_CONFIG_DIR` when that is set (as for every account home a launcher
+ * selects), else `~/.claude.json`. `claude -p /usage`, run in the same
+ * environment, refreshes the cache in that file; reading another file would
+ * report a different account's usage, or a stale one.
+ */
+export function usageConfigPath(
+  env: Record<string, string | undefined> = process.env,
+  home: string = os.homedir()
+): string {
+  const dir = env.CLAUDE_CONFIG_DIR;
+  return dir !== undefined && dir !== '' ? path.join(dir, '.claude.json') : path.join(home, '.claude.json');
 }
 
 /**
@@ -238,7 +253,7 @@ export interface ReadUsageOptions {
  */
 export async function readUsage(options: ReadUsageOptions = {}): Promise<UsageReport | null> {
   const claudePath = options.claudePath ?? 'claude';
-  const configPath = options.configPath ?? path.join(os.homedir(), '.claude.json');
+  const configPath = options.configPath ?? usageConfigPath();
 
   let loggedIn = false;
   let plan: string | null = null;
