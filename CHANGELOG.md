@@ -2,6 +2,58 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Project settings now apply to every run. This changes behaviour for every consumer.**
+  `--setting-sources` was always `user`. It is now the new `settingSources` option
+  (`--setting-sources`): `user`, plus any of `project` and `local`, each named once. The default
+  is all three, so the cwd's `.claude/settings.json` and `.claude/settings.local.json` now apply,
+  **deny rules included**, along with whatever of its instruction files, skills, subagents, hooks
+  and `.mcp.json` the `no*` switches leave on. `user` is required: it is the run's own
+  `settings.json`, where every switch of this library is written. Measured on claude 2.1.332,
+  2026-11-27: under `user` alone, a project's deny rules did not deny, and none of its
+  configuration reached the run. Pass `settingSources: ['user']` to keep the old behaviour. How a
+  project's settings meet the worker's `no*` switches has not been measured. Those switches are
+  written into the user tier, below the project tier.
+- **Effort is no longer forced.** `effortLevel` defaults to null. `--effort` and the settings
+  `effortLevel` are now written only when an effort is given, so the effort Claude Code is
+  configured with applies. Before, every run got `high`. `invocation.json` records
+  `effortLevel: null`, and `BriefRun.effortLevel` may be null.
+- **Six more parent-session variables are stripped** from the inherited environment, beside
+  `CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_EXECPATH`,
+  `CLAUDE_CODE_SESSION_ID`, `CLAUDE_EFFORT` and `CLAUDE_PID`:
+  - `CLAUDE_CODE_MESSAGING_SOCKET`
+  - `CLAUDE_CODE_MESSAGING_TOKEN`
+  - `CLAUDE_CODE_SESSION_ATTENDED`
+  - `CLAUDE_CODE_SUBAGENT_MODEL`
+  - `CLAUDE_CODE_SUBAGENT_EFFORT`
+  - `CLAUDE_CODE_CHILD_NOTES_DIR`
+
+  A run started from inside a Claude Code session used to receive that session's inbox socket
+  and token, its attended flag, its subagent model and effort, and its notes directory. A run is
+  its own session. `spawnOptions.env` and `extraEnv` can still set any of them.
+
+### Added
+
+- **Profiles.** `profile` (`--profile`, a `LaunchProfile`) is `'worker'` (the default) or
+  `'root'`. A worker keeps every bare default. A root gets what an interactive session in its
+  project has:
+  - instruction files, memory, skills, hooks, plugins, MCP, subagents, tasks and compaction, with
+    every `no*` switch among them false;
+  - `permissionMode: 'auto'`, all setting sources, and no forced effort.
+
+  `noIntegrations`, `noHousekeeping`, `noBashEditDiff`, `noMothership`, auth and the ephemeral
+  home are the same under both profiles. Any option given explicitly wins over the profile.
+  `invocation.json` records `profile` and `settingSources`. Both fields are absent from older
+  records. The CLI's own worker default permission mode is still `acceptEdits`, where the
+  library's is `auto`. Under `--profile root` the CLI takes the profile's `auto`.
+- **Measured.** On claude 2.1.332, a `profile: root` run of a nine-step fixture brief loaded:
+  - the project's CLAUDE.md, skill, subagent, hooks and MCP server;
+  - its effort, `low`.
+
+  It refused both of the project's deny rules, edited, tested and committed. The method is in
+  `doc/sessions/2026-11-27-root-profile.md`.
+
 ### Fixed
 
 - **Usage of the selected account.** `readUsage` (and `--usage`) reads the usage cache from

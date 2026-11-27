@@ -19,8 +19,11 @@ example.
 Three mechanisms, in order of importance:
 
 1. **Hermetic spawn** — `spawnClaude()` builds an ephemeral `CLAUDE_CONFIG_DIR`, writes a
-   `settings.json` into it, and execs the system `claude --print`. Ambient context (CLAUDE.md
-   files, memory, skills, hooks, plugins, MCP, agents) is switched off by construction.
+   `settings.json` into it, and execs the system `claude --print`. Under the default `worker`
+   profile, ambient context (CLAUDE.md files, memory, skills, hooks, plugins, MCP, agents) is
+   switched off by construction. The cwd's project and local settings are loaded (from 0.16.0),
+   so its deny rules apply. The `root` profile keeps the project's whole capability, and only the
+   login and home stay hermetic.
 2. **Synthetic session** — `SessionBuilder` fabricates Claude Code session NDJSON so a run starts
    with files already read, at zero model cost, in the model's native transcript format.
 3. **Transcript rendering** — `events.ts` type guards plus the `display.ts` rule table turn a
@@ -123,6 +126,20 @@ Verified against `claude` 2.1.220 on macOS. Re-verify, with a dated note, when t
   macOS host: spawned in `/tmp/x` (an alias of `/private/tmp/x`), a fresh run wrote under
   `-private-tmp-x` and recorded `/private/tmp/x` as its cwd. A resumed run is found by its id and
   hides this. Anything keyed on a cwd must go through `physicalCwd()`.
+- Setting sources gate the whole project scope, 2026-11-27, claude 2.1.332, macOS, one fixture
+  (`doc/sessions/2026-11-27-root-profile.md`). Under `--setting-sources user`, with every `no*`
+  switch false, none of these reached the run: the cwd's CLAUDE.md, `.claude/settings.json`,
+  skills, subagents, hooks and `.mcp.json`. Its deny rules did not deny: the denied script ran
+  and the denied file was read, both on a classifier accept. With `user,project,local` all of it
+  arrived, and both deny rules refused (`reject`, rule source `projectSettings`). A forced
+  `--effort` overrides a project's `effortLevel`; with neither `--effort` nor a settings
+  `effortLevel`, the project's `low` applied (`"effort":"low"` in the journal).
+- A Bash call in a Claude Code session, 2026-11-27, claude 2.1.332, had these in its
+  environment: `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN` (the session's
+  inbox), `CLAUDE_CODE_SESSION_ATTENDED`, `CLAUDE_CODE_SUBAGENT_MODEL`,
+  `CLAUDE_CODE_SUBAGENT_EFFORT` and `CLAUDE_CODE_CHILD_NOTES_DIR`. They belong to the parent
+  session and are stripped with the other markers. A `--print` run then named its own socket,
+  `/tmp/cc-socks/<its pid>.sock`.
 - `claude` exits 1 on auth failure. Anything this project builds must propagate that; a wrapper
   that returns 0 when the run failed is worse than no wrapper.
 - Structured output, 2026-11-22, claude 2.1.328. Read from `--help`: `--json-schema` takes the

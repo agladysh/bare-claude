@@ -70,8 +70,10 @@ describe('LaunchConfig', () => {
       launcher: 'claude',
       claudePath: 'claude',
       model: null,
-      effortLevel: 'high',
+      profile: 'worker',
+      effortLevel: null,
       permissionMode: 'auto',
+      settingSources: [ 'user', 'project', 'local' ],
       changeSystemPrompt: null,
       noInstructionFiles: true,
       noMemory: true,
@@ -157,6 +159,98 @@ describe('LaunchConfig', () => {
     expect(cfg({ maxOutputLength: 0 }).maxOutputLength).toBe(0);
     expect(cfg({ tools: [] }).tools).toEqual([]);
   });
+
+  test('refuses setting sources without the user tier, an unknown or repeated source, or none', () => {
+    for (const settingSources of [ [], [ 'project' ], [ 'project', 'local' ], [ 'user', 'policy' ], [ 'user', 'user' ] ]) {
+      const options: LaunchOptions = { callToAction: '# do it' };
+      Object.assign(options, { settingSources });
+      expect(() => LaunchConfig(options)).toThrow('settingSources');
+    }
+    expect(cfg({ settingSources: [ 'user' ] }).settingSources).toEqual([ 'user' ]);
+    expect(cfg({ settingSources: [ 'local', 'user' ] }).settingSources).toEqual([ 'local', 'user' ]);
+  });
+
+  test('refuses a profile that is neither, as a JavaScript caller could pass', () => {
+    for (const profile of [ 'Root', '', 'interactive', null ]) {
+      const options: LaunchOptions = { callToAction: '# do it' };
+      Object.assign(options, { profile });
+      expect(() => LaunchConfig(options)).toThrow('profile must be "worker" or "root"');
+    }
+  });
+});
+
+describe('profile', () => {
+  test('root turns on what an interactive session in the project has, with every setting source and auto mode', () => {
+    const root = cfg({ profile: 'root' });
+    expect(root.profile).toBe('root');
+    expect({
+      noInstructionFiles: root.noInstructionFiles,
+      noMemory: root.noMemory,
+      noSkills: root.noSkills,
+      noHooks: root.noHooks,
+      noPlugins: root.noPlugins,
+      noMcp: root.noMcp,
+      noAgents: root.noAgents,
+      noTasks: root.noTasks,
+      noCompact: root.noCompact,
+      permissionMode: root.permissionMode,
+      settingSources: root.settingSources,
+      effortLevel: root.effortLevel,
+    }).toEqual({
+      noInstructionFiles: false,
+      noMemory: false,
+      noSkills: false,
+      noHooks: false,
+      noPlugins: false,
+      noMcp: false,
+      noAgents: false,
+      noTasks: false,
+      noCompact: false,
+      permissionMode: 'auto',
+      settingSources: [ 'user', 'project', 'local' ],
+      effortLevel: null,
+    });
+  });
+
+  test('root leaves the hermetic switches that are not project capability as the worker has them', () => {
+    const root = cfg({ profile: 'root' });
+    const worker = cfg();
+    expect([ root.noIntegrations, root.noHousekeeping, root.noBashEditDiff, root.noMothership, root.auth ])
+      .toEqual([ worker.noIntegrations, worker.noHousekeeping, worker.noBashEditDiff, worker.noMothership, worker.auth ]);
+  });
+
+  test('worker is the default and keeps every bare default', () => {
+    expect(cfg({ profile: 'worker' })).toEqual(cfg());
+  });
+
+  test('a caller\'s explicit option wins over the profile', () => {
+    const root = cfg({ profile: 'root', noMcp: true, permissionMode: 'plan', effortLevel: 'low', settingSources: [ 'user' ] });
+    expect([ root.noMcp, root.permissionMode, root.effortLevel, root.settingSources ])
+      .toEqual([ true, 'plan', 'low', [ 'user' ] ]);
+  });
+
+  test('root reaches argv and settings with nothing switched off', () => {
+    expect(buildArgv(cfg({ profile: 'root' }), SID)).toEqual([
+      'claude',
+      '--session-id', SID,
+      '--permission-mode', 'auto',
+      '--setting-sources', 'user,project,local',
+      '--no-chrome',
+      '--print', '# do it',
+    ]);
+    const settings = buildSettings(cfg({ profile: 'root' }));
+    for (const key of [ 'effortLevel', 'syncClaudeAiSkills', 'disableAllHooks', 'enabledPlugins', 'enableAllProjectMcpServers', 'enabledMcpjsonServers' ]) {
+      expect(`${key}:${String(key in settings)}`).toBe(`${key}:false`);
+    }
+    const env = settingsEnv(settings);
+    for (const key of [
+      'CLAUDE_CODE_DISABLE_CLAUDE_MDS', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY', 'CLAUDE_CODE_DISABLE_CRON',
+      'CLAUDE_CODE_DISABLE_POLICY_SKILLS', 'ENABLE_CLAUDEAI_MCP_SERVERS', 'CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS',
+      'CLAUDE_CODE_ENABLE_TASKS', 'DISABLE_COMPACT',
+    ]) {
+      expect(`${key}:${String(key in env)}`).toBe(`${key}:false`);
+    }
+  });
 });
 
 describe('buildArgv', () => {
@@ -164,9 +258,8 @@ describe('buildArgv', () => {
     expect(buildArgv(cfg(), SID)).toEqual([
       'claude',
       '--session-id', SID,
-      '--effort', 'high',
       '--permission-mode', 'auto',
-      '--setting-sources', 'user',
+      '--setting-sources', 'user,project,local',
       '--disable-slash-commands',
       '--no-chrome',
       '--print', '# do it',
@@ -244,9 +337,20 @@ describe('buildArgv', () => {
     expect(argv[argv.indexOf('--permission-mode') + 1]).toBe('plan');
   });
 
-  test('always restricts setting sources to the ephemeral user settings', () => {
-    const argv = buildArgv(cfg(), SID);
-    expect(argv[argv.indexOf('--setting-sources') + 1]).toBe('user');
+  test('passes --effort only when an effort level is given', () => {
+    expect(buildArgv(cfg(), SID)).not.toContain('--effort');
+    const argv = buildArgv(cfg({ effortLevel: 'low' }), SID);
+    expect(argv.filter(arg => arg === '--effort')).toHaveLength(1);
+    expect(argv[argv.indexOf('--effort') + 1]).toBe('low');
+  });
+
+  test('loads the user, project and local settings by default, and the sources given otherwise', () => {
+    const all = buildArgv(cfg(), SID);
+    expect(all[all.indexOf('--setting-sources') + 1]).toBe('user,project,local');
+    const user = buildArgv(cfg({ settingSources: [ 'user' ] }), SID);
+    expect(user[user.indexOf('--setting-sources') + 1]).toBe('user');
+    const two = buildArgv(cfg({ settingSources: [ 'user', 'local' ] }), SID);
+    expect(two[two.indexOf('--setting-sources') + 1]).toBe('user,local');
   });
 
   test('maps every system prompt operation to its flag', () => {
@@ -468,6 +572,31 @@ describe('buildEnv', () => {
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('keep-me');
   });
 
+  test('strips the parent session\'s inbox, attended flag, subagent choices and notes directory', () => {
+    const parent = {
+      CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/cc-socks/1.sock',
+      CLAUDE_CODE_MESSAGING_TOKEN: 'parent-token',
+      CLAUDE_CODE_SESSION_ATTENDED: '1',
+      CLAUDE_CODE_SUBAGENT_MODEL: 'parent-model',
+      CLAUDE_CODE_SUBAGENT_EFFORT: 'xhigh',
+      CLAUDE_CODE_CHILD_NOTES_DIR: '/parent/notes',
+    };
+    for (const profile of [ 'worker', 'root' ] as const) {
+      const env = buildEnv(cfg({ profile }), {
+        ephemeralClaudeHomePath: home,
+        processEnv: { ...parent, PATH: '/usr/bin' },
+      });
+      expect(Object.keys(env).sort()).toEqual([ 'CLAUDE_CONFIG_DIR', 'PATH' ]);
+    }
+    // A caller naming one means it, as with the other markers.
+    const named = buildEnv(cfg(), {
+      ephemeralClaudeHomePath: home,
+      processEnv: parent,
+      spawnEnv: { CLAUDE_CODE_SUBAGENT_MODEL: 'chosen' },
+    });
+    expect(named.CLAUDE_CODE_SUBAGENT_MODEL).toBe('chosen');
+  });
+
   test('noProcessEnv drops the ambient environment entirely', () => {
     const env = buildEnv(cfg({ noProcessEnv: true }), {
       ephemeralClaudeHomePath: home,
@@ -528,7 +657,6 @@ describe('buildSettings', () => {
         autoAllowBashIfSandboxed: true,
         failIfUnavailable: true,
       },
-      effortLevel: 'high',
       permissions: {
         defaultMode: 'auto',
         disableBypassPermissionsMode: 'disable',
@@ -577,7 +705,6 @@ describe('buildSettings', () => {
     expect(off).toEqual({
       $schema: 'https://json.schemastore.org/claude-code-settings.json',
       sandbox: { enabled: true, autoAllowBashIfSandboxed: true, failIfUnavailable: true },
-      effortLevel: 'high',
       permissions: { defaultMode: 'auto', disableBypassPermissionsMode: 'disable' },
       env: { CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR: '1' },
     });
@@ -750,6 +877,11 @@ describe('buildSettings', () => {
   test('model is mirrored into settings only when set', () => {
     expect(buildSettings(cfg({ model: 'opus' })).model).toBe('opus');
     expect(buildSettings(cfg()).model).toBeUndefined();
+  });
+
+  test('effortLevel is written into settings only when given', () => {
+    expect('effortLevel' in buildSettings(cfg())).toBe(false);
+    expect(buildSettings(cfg({ effortLevel: 'medium' })).effortLevel).toBe('medium');
   });
 
   test('effortLevel and permissionMode reach settings as well as argv', () => {

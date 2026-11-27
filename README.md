@@ -228,7 +228,13 @@ Options:
   [Briefing a custody directory](#briefing-a-custody-directory))
 - `--doctor`: report what a run needs and exit 1 when something required is missing
   (see [Doctor](#doctor))
-- `--effort [level]`: `low`, `medium`, `high` (default), `xhigh` or `max`
+- `--profile [name]`: `worker` (default) or `root`; see `profile` under
+  [LaunchOptions](#launchoptions). The CLI's worker runs in `acceptEdits` mode, where the library's
+  default is `auto`; a root runs in `auto` either way
+- `--effort [level]`: `low`, `medium`, `high`, `xhigh` or `max`. Not passed by default, so the
+  effort Claude Code is configured with applies
+- `--setting-sources [list]`: comma-separated, `user` and any of `project` and `local` (default
+  all three)
 - `--tools [list]`: comma-separated tools to allow; the empty string allows none
 - `--disallowed-tools [list]`: comma-separated tools to deny; `*` denies all
 - `--add-dir [dir]`: allow reads outside the working directory, may be included several times
@@ -898,7 +904,7 @@ writes there is ever rewritten or removed. Relative, it resolves against the dir
 
 | File | Written | Holds |
 | --- | --- | --- |
-| `invocation.json` | before the spawn | the custody directory, launcher, executable, model, effort, permission mode, tools, `addDirs`, budget and token caps, auth mode, `linkAuth`, `noProcessEnv`, `extraArgs` as given, the physical cwd, the Claude home, the session (`fresh`, `memory` with its id, or `file` with its source path and digest), the call to action's length and SHA-256, the output schema (`outputSchema`: its source path, the kept copy, size and SHA-256; `null` without one), and the configuration that declared the run (below) |
+| `invocation.json` | before the spawn | the custody directory, launcher, executable, model, effort (`null` when left to Claude Code's configuration), permission mode, profile, setting sources, tools, `addDirs`, budget and token caps, auth mode, `linkAuth`, `noProcessEnv`, `extraArgs` as given, the physical cwd, the Claude home, the session (`fresh`, `memory` with its id, or `file` with its source path and digest), the call to action's length and SHA-256, the output schema (`outputSchema`: its source path, the kept copy, size and SHA-256; `null` without one), and the configuration that declared the run (below) |
 | `call-to-action.txt` | before the spawn, only with `keepCallToAction: true` | the call to action, exactly |
 | `output-schema.json` | before the spawn, only for a run given an output schema | the schema's bytes as read; the run is given this copy, so what is recorded is what was passed |
 | `stdout`, `stderr` | by the spawned process, as it runs | its own standard output and error, byte for byte: its descriptors, not pipes. Empty when it never started |
@@ -1781,9 +1787,26 @@ Optional:
   names `claude`, but that names `ollama launch`'s target, not a filesystem path, so this option
   doesn't reach it.
 - `model`: The model to use. If not specified, uses Claude's default model.
-- `effortLevel`: The effort level (`'low'`, `'medium'`, `'high'`, `'xhigh'`, `'max'`). Defaults to `'high'`.
+- `profile`: The kind of run, a `LaunchProfile`: `'worker'` (default) or `'root'`. It sets the
+  defaults of `permissionMode` and of `noInstructionFiles`, `noMemory`, `noSkills`, `noHooks`,
+  `noPlugins`, `noMcp`, `noAgents`, `noTasks` and `noCompact`; any of them given explicitly wins.
+  A worker has the bare defaults listed below. A root has everything an interactive session in
+  its project has: all of those switches `false` and `permissionMode: 'auto'`. Both load every
+  setting source and leave effort unforced. The other switches (`noIntegrations`,
+  `noHousekeeping`, `noBashEditDiff`, `noMothership`), auth and the ephemeral home are the same
+  under both.
+- `effortLevel`: The effort level (`'low'`, `'medium'`, `'high'`, `'xhigh'`, `'max'`), passed as
+  `--effort` and written to the run's settings only when given. Defaults to `null`: the effort
+  Claude Code is otherwise configured with applies.
 - `permissionMode`: The permission mode. One of `'acceptEdits'`, `'auto'`, `'bypassPermissions'`,
   `'dontAsk'`, `'plan'`. Defaults to `'auto'`.
+- `settingSources`: The setting sources the run loads (`--setting-sources`), from the exported
+  `settingSources`: `'user'`, `'project'`, `'local'`. It must include `'user'`, the run's own
+  `settings.json` in its ephemeral home, and name each once. Defaults to all three, so the cwd's
+  `.claude/settings.json` and `.claude/settings.local.json` apply, deny rules included, and with
+  them its instruction files, skills, subagents, hooks and `.mcp.json`, as far as the `no*`
+  switches allow. Measured 2026-11-27 on claude 2.1.332: under `'user'` alone none of the
+  project's configuration reached the run, and its deny rules did not deny.
   This is the *intersection* of two vocabularies: the value is passed to `--permission-mode` and
   also written to `permissions.defaultMode`, and the two accept different sets. `'manual'` is valid
   for the flag only, and `'default'` and `'delegate'` for the setting only — using one of those
@@ -1810,6 +1833,8 @@ Optional:
   rejects instead.
 - `changeSystemPrompt`: Configuration for modifying the system prompt.
   Contains `{ type: 'appendString' | 'setString' | 'appendFile' | 'setFile', value: string }`.
+- The nine switches below up to `noCompact` default as listed for the worker profile; under
+  `profile: 'root'` each defaults to `false`.
 - `noInstructionFiles`: Whether to disable instruction files. Defaults to `true`.
 - `noMemory`: Whether to disable memory. Defaults to `true`.
 - `noSkills`: Whether to disable skills. Defaults to `true`. Passes `--disable-slash-commands` and
@@ -1839,9 +1864,13 @@ Optional:
 - `noMothership`: Whether to disable calling the mothership.
   Defaults to `false` if `launcher` is `claude` (including when it is left unset), and `true` otherwise.
 - `noProcessEnv`: Whether to drop the inherited process environment. Defaults to `false`.
-  When `false`, everything is inherited except the session markers Claude Code injects into its
-  children (`CLAUDECODE`, `CLAUDE_CODE_*`, `CLAUDE_PID`, `CLAUDE_EFFORT`), which are always
-  stripped so a nested run does not adopt its parent's session; credential variables are
+  When `false`, everything is inherited except the session variables Claude Code gives its
+  children (`CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_ENTRYPOINT`,
+  `CLAUDE_CODE_EXECPATH`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_EFFORT`, `CLAUDE_PID`, the parent's
+  inbox `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN`,
+  `CLAUDE_CODE_SESSION_ATTENDED`, `CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_SUBAGENT_EFFORT` and
+  `CLAUDE_CODE_CHILD_NOTES_DIR`), which are always stripped so a nested run is its own session
+  and does not adopt its parent's; `spawnOptions.env` and `extraEnv` may still set them. Credential variables are
   inherited like everything else. When `true`, nothing is inherited, credentials included: only
   `spawnOptions.env` and `extraEnv` reach the child. Neither value turns off the token file — only
   `auth: 'caller'` and `auth: 'native-store'` do.

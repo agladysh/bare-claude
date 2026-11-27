@@ -77,6 +77,21 @@ describe('parseConfig', () => {
     expect(parseConfig('effortLevel: max').configPreset.effortLevel).toBe('max');
   });
 
+  test('accepts the worker and root profiles and nothing else', () => {
+    expect(parseConfig('profile: root').configPreset.profile).toBe('root');
+    expect(parseConfig('presets:\n  r:\n    profile: worker\n').presets.r?.profile).toBe('worker');
+    expect(() => parseConfig('profile: interactive')).toThrow('profile must be');
+  });
+
+  test('accepts setting sources that include the user tier, and refuses the rest', () => {
+    expect(parseConfig('settingSources: [user]').configPreset.settingSources).toEqual([ 'user' ]);
+    expect(parseConfig('settingSources: [user, project, local]').configPreset.settingSources)
+      .toEqual([ 'user', 'project', 'local' ]);
+    expect(() => parseConfig('settingSources: [user, policy]')).toThrow('settingSources');
+    expect(() => parseConfig('settingSources: [project]')).toThrow('settingSources');
+    expect(() => parseConfig('settingSources: []')).toThrow('settingSources');
+  });
+
   test('rejects a permission mode either half of Claude Code would refuse', () => {
     // `manual` is the dangerous one: `--permission-mode` accepts it, the
     // settings schema does not, and an invalid settings file is dropped

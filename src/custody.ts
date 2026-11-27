@@ -65,7 +65,7 @@ import path from 'node:path';
 
 import {
   assertSafeCallToAction, LaunchConfig, Launchers, physicalCwd, spawnClaude,
-  type AuthMode, type Launcher, type LaunchOptions, type SessionSeed,
+  type AuthMode, type Launcher, type LaunchOptions, type LaunchProfile, type SessionSeed, type SettingSource,
 } from '@agladysh/bare-claude';
 import type { ConfigFileRecord, ConfigProvenance } from '@agladysh/bare-claude/config';
 import {
@@ -233,8 +233,19 @@ export interface CustodyInvocation {
   executable: string,
 
   model: string | null,
-  effortLevel: string,
+
+  /** Null when none was given and the run took Claude Code's configured effort (from 0.16.0). */
+  effortLevel: string | null,
   permissionMode: string,
+
+  /** The run's profile. Absent from records written before 0.16.0, whose runs were all workers. */
+  profile?: LaunchProfile,
+
+  /**
+   * The setting sources the run loaded. Absent from records written before
+   * 0.16.0, whose runs all loaded `user` alone.
+   */
+  settingSources?: SettingSource[],
   tools: string[] | null,
   disallowedTools: string[] | null,
   addDirs: string[],
@@ -592,6 +603,8 @@ export async function runInCustody(launchOptions: LaunchOptions, options: Custod
     model: config.model,
     effortLevel: config.effortLevel,
     permissionMode: config.permissionMode,
+    profile: config.profile,
+    settingSources: config.settingSources,
     tools: config.tools,
     disallowedTools: config.disallowedTools,
     addDirs: config.addDirs,
@@ -1228,8 +1241,10 @@ const isCustodyInvocation = shape<CustodyInvocation>({
   launcher: isLauncher,
   executable: isString,
   model: nullable(isString),
-  effortLevel: isString,
+  effortLevel: nullable(isString),
   permissionMode: isString,
+  profile: optional(literal('worker', 'root')),
+  settingSources: optional(listOf(literal('user', 'project', 'local'))),
   tools: nullable(listOf(isString)),
   disallowedTools: nullable(listOf(isString)),
   addDirs: listOf(isString),
@@ -1871,7 +1886,9 @@ export interface BriefRun {
 
   launcher: Launcher,
   model: string | null,
-  effortLevel: string,
+
+  /** Null when the run took Claude Code's configured effort. */
+  effortLevel: string | null,
 
   /** Its size and digest; never its text. */
   callToAction: RecordedDigest,

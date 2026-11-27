@@ -179,6 +179,46 @@ describe('which configuration is read', () => {
     expect(flagValues(seen, '--add-dir')).toEqual([ '/from-config', '/from-flag' ]);
   });
 
+  test('the worker keeps acceptEdits; --profile root runs in auto mode with nothing switched off', async () => {
+    const cwd = await repo();
+
+    const worker = await argvProbe();
+    const plain = await runCli([ '--no-config', '--quiet', 'hello' ], { cwd, env: { FAKE_CLAUDE_ARGV_FILE: worker.file } });
+    expect(plain.exitCode).toBe(0);
+    const workerArgv = await worker.read() ?? [];
+    expect(flagValues(workerArgv, '--permission-mode')).toEqual([ 'acceptEdits' ]);
+    expect(flagValues(workerArgv, '--setting-sources')).toEqual([ 'user,project,local' ]);
+    expect(workerArgv).not.toContain('--effort');
+    expect(workerArgv).toContain('--disable-slash-commands');
+
+    const root = await argvProbe();
+    const rooted = await runCli([ '--no-config', '--profile', 'root', '--quiet', 'hello' ], { cwd, env: { FAKE_CLAUDE_ARGV_FILE: root.file } });
+    expect(rooted.exitCode).toBe(0);
+    const rootArgv = await root.read() ?? [];
+    expect(flagValues(rootArgv, '--permission-mode')).toEqual([ 'auto' ]);
+    expect(flagValues(rootArgv, '--setting-sources')).toEqual([ 'user,project,local' ]);
+    expect(rootArgv).not.toContain('--effort');
+    expect(rootArgv).not.toContain('--disable-slash-commands');
+  });
+
+  test('--setting-sources and --effort reach claude as given; an unknown profile or source is refused unspawned', async () => {
+    const cwd = await repo();
+    const argv = await argvProbe();
+    const given = await runCli([ '--no-config', '--setting-sources', 'user', '--effort', 'low', '--quiet', 'hello' ],
+      { cwd, env: { FAKE_CLAUDE_ARGV_FILE: argv.file } });
+    expect(given.exitCode).toBe(0);
+    const seen = await argv.read() ?? [];
+    expect(flagValues(seen, '--setting-sources')).toEqual([ 'user' ]);
+    expect(flagValues(seen, '--effort')).toEqual([ 'low' ]);
+
+    for (const args of [ [ '--profile', 'interactive' ], [ '--setting-sources', 'project' ], [ '--setting-sources', 'user,policy' ] ]) {
+      const refused = await argvProbe();
+      const result = await runCli([ '--no-config', ...args, '--quiet', 'hello' ], { cwd, env: { FAKE_CLAUDE_ARGV_FILE: refused.file } });
+      expect(result.exitCode).not.toBe(0);
+      expect(await refused.read()).toBeNull();
+    }
+  });
+
   test('a declared cwd is where the child runs and where --read resolves', async () => {
     const launchedFrom = await repo();
     const work = await repo();

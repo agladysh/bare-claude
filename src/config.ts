@@ -63,6 +63,17 @@ export type PermissionMode = typeof permissionMode.infer;
 /** Who supplies the child's credential; see `AuthMode` in the main module. */
 export const authMode = type("'fallback' | 'caller' | 'native-store'");
 
+/** The kind of run; see `LaunchProfile` in the main module. */
+export const launchProfile = type("'worker' | 'root'");
+
+/**
+ * Setting sources, by the rule `LaunchConfig` enforces: `user` always, then
+ * any of `project` and `local`, each once.
+ */
+export const settingSourceList = type("('user' | 'project' | 'local')[]").narrow((list, ctx) =>
+  (list.includes('user') && new Set(list).size === list.length)
+    || ctx.mustBe('a list naming "user", and each source once'));
+
 /**
  * A session id that can name a journal file. The same expression as
  * `sessionIdPattern` in the main module, which `LaunchConfig` enforces; a
@@ -120,8 +131,10 @@ const preset = type({
   'launcher?': "'claude' | 'ollama'",
   'claudePath?': 'string',
   'model?': 'string | null',
-  'effortLevel?': effortLevel,
+  'profile?': launchProfile,
+  'effortLevel?': effortLevel.or('null'),
   'permissionMode?': permissionMode,
+  'settingSources?': settingSourceList,
   'changeSystemPrompt?': type({
     '+': 'reject',
     type: "'appendString' | 'setString' | 'appendFile' | 'setFile'",
@@ -193,6 +206,14 @@ type _PresetHasEverySchemaField = AssertNoDrift<
 
 type _SchemaAcceptsEveryAuthMode = AssertNoDrift<
   Exclude<NonNullable<DynamicPreset['auth']>, typeof authMode.infer>
+>;
+
+type _SchemaAcceptsEveryProfile = AssertNoDrift<
+  Exclude<NonNullable<DynamicPreset['profile']>, typeof launchProfile.infer>
+>;
+
+type _SchemaAcceptsEverySettingSource = AssertNoDrift<
+  Exclude<NonNullable<DynamicPreset['settingSources']>[number], typeof settingSourceList.infer[number]>
 >;
 
 /**

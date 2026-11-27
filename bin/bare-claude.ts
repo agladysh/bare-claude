@@ -20,9 +20,10 @@ import { SessionBuilder } from '@agladysh/bare-claude/SessionBuilder';
 
 import pkg from '../package.json';
 import {
-  authMode, effortLevel, readConfig, readConfigFiles, type ConfigReading, type ConfigSource, type EffortLevel
+  authMode, effortLevel, launchProfile, readConfig, readConfigFiles, settingSourceList,
+  type ConfigReading, type ConfigSource, type EffortLevel
 } from '@agladysh/bare-claude/config';
-import type { AuthMode } from '@agladysh/bare-claude';
+import type { AuthMode, LaunchProfile, SettingSource } from '@agladysh/bare-claude';
 import { resolveInvocation, type DynamicPreset, type Preset } from '@agladysh/bare-claude/preset';
 import { formatDoctorReport, runDoctor } from '@agladysh/bare-claude/doctor';
 import {
@@ -59,7 +60,15 @@ function displayHelp() {
     '  -q, --quiet            Do not print the transcript',
     '  -p, --print            Print what `claude --print` printed',
     '',
-    '      --effort <level>   low, medium, high (default), xhigh or max',
+    '      --profile <name>   worker (default): instruction files, memory, skills, hooks,',
+    '                         plugins, MCP, subagents and compaction off, permission',
+    '                         mode acceptEdits; root: all of them on, permission mode auto.',
+    '                         Options given explicitly win over the profile',
+    '      --effort <level>   low, medium, high, xhigh or max (default: not passed, so',
+    '                         Claude Code\'s configured effort applies)',
+    '      --setting-sources <list>',
+    '                         Comma-separated: user, and any of project and local',
+    '                         (default: user,project,local)',
     '      --tools <list>     Comma-separated tools to allow; empty for none',
     '      --disallowed-tools <list>',
     '                         Comma-separated tools to deny; "*" for all',
@@ -462,6 +471,12 @@ async function loadPreset(): Promise<Startup> {
       effort: {
         type: 'string',
       },
+      profile: {
+        type: 'string',
+      },
+      'setting-sources': {
+        type: 'string',
+      },
       tools: {
         type: 'string',
       },
@@ -590,6 +605,8 @@ async function loadPreset(): Promise<Startup> {
   set('quiet', values.quiet);
   set('print', values.print);
   set('effortLevel', parseEffort(values.effort));
+  set('profile', parseProfile(values.profile));
+  set('settingSources', parseSettingSources(values['setting-sources']));
   set('tools', parseToolList(values.tools));
   set('disallowedTools', parseToolList(values['disallowed-tools']));
   set('addDirs', values['add-dir']);
@@ -704,6 +721,29 @@ function parseEffort(value: string | undefined): EffortLevel | undefined {
     throw new Error(`--effort ${level.summary}`);
   }
   return level;
+}
+
+function parseProfile(value: string | undefined): LaunchProfile | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const profile = launchProfile(value);
+  if (profile instanceof type.errors) {
+    throw new Error(`--profile ${profile.summary}`);
+  }
+  return profile;
+}
+
+/** Comma-separated setting sources, by the rule `LaunchConfig` enforces. */
+function parseSettingSources(value: string | undefined): SettingSource[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const sources = settingSourceList(value.split(','));
+  if (sources instanceof type.errors) {
+    throw new Error(`--setting-sources ${sources.summary}`);
+  }
+  return sources;
 }
 
 /** Comma-separated tool names; the empty string means "none", not "unset". */
@@ -845,7 +885,7 @@ async function main() {
       // messages, and every assistant display rule excludes it, so preloaded
       // tool calls would render as raw JSON or not at all.
       preset.model ?? '<bare-claude>',
-      preset.effortLevel // undefined selects the builder's own default
+      preset.effortLevel ?? undefined // undefined selects the builder's own default
     );
 
     const spent = { bytes: 0 };
@@ -866,7 +906,11 @@ async function main() {
     };
   }
 
-  preset.permissionMode ??= 'acceptEdits';
+  // The CLI's worker default differs from the library's `auto`; a root takes
+  // its profile's mode, which is the library's.
+  if (preset.profile !== 'root') {
+    preset.permissionMode ??= 'acceptEdits';
+  }
 
   if (preset.custody !== undefined) {
     return runUnderCustody(preset, preset.custody, configuration);

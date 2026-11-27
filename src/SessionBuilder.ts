@@ -90,7 +90,8 @@ export class SessionBuilder {
    *   assistant display rule drops it.
    * @param effort - Effort level stamped on every assistant record. Real
    *   records carry one (`low`/`medium`/`high`/`xhigh`/`max`); defaults to
-   *   `high`, matching `resolveConfig`'s `effortLevel` default.
+   *   `high`, also for a run whose effort is left to Claude Code's
+   *   configuration, since a fabricated record must name one.
    */
   constructor(
     readonly sessionId: string,

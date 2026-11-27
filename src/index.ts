@@ -123,7 +123,83 @@ const parentSessionMarkers = [
   'CLAUDE_CODE_SESSION_ID',
   'CLAUDE_EFFORT',
   'CLAUDE_PID',
+  // Observed 2026-11-27 in the environment of a Bash tool call under claude
+  // 2.1.332: the parent's own inbox (socket and token), its attended flag, the
+  // model and effort it gives its subagents, and its notes directory for
+  // children. A spawned run is its own session, not the parent's subagent, and
+  // with the socket and token it could speak as the parent.
+  'CLAUDE_CODE_MESSAGING_SOCKET',
+  'CLAUDE_CODE_MESSAGING_TOKEN',
+  'CLAUDE_CODE_SESSION_ATTENDED',
+  'CLAUDE_CODE_SUBAGENT_MODEL',
+  'CLAUDE_CODE_SUBAGENT_EFFORT',
+  'CLAUDE_CODE_CHILD_NOTES_DIR',
 ];
+
+/**
+ * Claude Code's setting sources a run may load, as `--setting-sources` takes
+ * them. `user` is the run's own `settings.json` in its ephemeral home, where
+ * every switch of this library is written, so a run always loads it; `project`
+ * and `local` are the cwd's `.claude/settings.json` and
+ * `.claude/settings.local.json`, and with them its instruction files, skills,
+ * subagents, hooks and `.mcp.json` (measured 2026-11-27 on 2.1.332: under
+ * `user` alone none of these reached the run, and the project's deny rules did
+ * not deny).
+ */
+export const settingSources = [ 'user', 'project', 'local' ] as const;
+
+/** One of {@link settingSources}. */
+export type SettingSource = typeof settingSources[number];
+
+function isSettingSource(value: unknown): value is SettingSource {
+  return typeof value === 'string' && settingSources.some(source => source === value);
+}
+
+/**
+ * A named set of defaults for the run's kind. `worker` is the bare run:
+ * instruction files, memory, skills, hooks, plugins, MCP, subagents and
+ * compaction off. `root` is a session that works its project as an
+ * interactive session there would: all of those on, permission mode `auto`.
+ * Both load every setting source and leave effort to the configured default.
+ * Options the caller gives win over the profile's.
+ */
+export type LaunchProfile = 'worker' | 'root';
+
+function isLaunchProfile(value: unknown): value is LaunchProfile {
+  return value === 'worker' || value === 'root';
+}
+
+/** What a {@link LaunchProfile} decides, unless the caller says otherwise. */
+type ProfileDefaults = Pick<Required<LaunchOptions>,
+  'permissionMode' | 'noInstructionFiles' | 'noMemory' | 'noSkills' | 'noHooks' | 'noPlugins'
+  | 'noMcp' | 'noAgents' | 'noTasks' | 'noCompact'>;
+
+const profileDefaults: Record<LaunchProfile, ProfileDefaults> = {
+  worker: {
+    permissionMode: 'auto',
+    noInstructionFiles: true,
+    noMemory: true,
+    noSkills: true,
+    noHooks: true,
+    noPlugins: true,
+    noMcp: true,
+    noAgents: true,
+    noTasks: false,
+    noCompact: true,
+  },
+  root: {
+    permissionMode: 'auto',
+    noInstructionFiles: false,
+    noMemory: false,
+    noSkills: false,
+    noHooks: false,
+    noPlugins: false,
+    noMcp: false,
+    noAgents: false,
+    noTasks: false,
+    noCompact: false,
+  },
+};
 
 /**
  * Available launcher types for spawning Claude processes.
@@ -378,14 +454,32 @@ export interface LaunchOptions {
   model?: null | string,
 
   /**
-   * Effort level for Claude. Defaults to 'high'.
+   * The kind of run, which sets the defaults of `permissionMode` and the
+   * `no*` capability switches; see {@link LaunchProfile}. Defaults to
+   * 'worker'. Any of those options given explicitly wins over the profile.
    */
-  effortLevel?: string,
+  profile?: LaunchProfile,
 
   /**
-   * Permission mode for Claude. Defaults to 'auto'.
+   * Effort level for Claude, passed as `--effort` and written as
+   * `effortLevel` in the run's settings only when given. Defaults to null:
+   * neither is written, and the effort Claude Code is otherwise configured
+   * with applies.
+   */
+  effortLevel?: null | string,
+
+  /**
+   * Permission mode for Claude. Defaults to 'auto' under both profiles.
    */
   permissionMode?: string,
+
+  /**
+   * Setting sources the run loads, as passed to `--setting-sources`; see
+   * {@link settingSources}. Must include `user`, which holds this library's
+   * own settings, and name each source at most once. Defaults to all three:
+   * the cwd's project and local settings apply, deny rules included.
+   */
+  settingSources?: SettingSource[],
 
   /**
    * Configuration for modifying the system prompt.
@@ -393,47 +487,48 @@ export interface LaunchOptions {
   changeSystemPrompt?: null | { type: SystemPromptOp, value: string },
 
   /**
-   * Whether to disable instruction files. Defaults to true.
+   * Whether to disable instruction files. Defaults to true, false under the
+   * root profile.
    */
   noInstructionFiles?: boolean,
 
   /**
-   * Whether to disable memory. Defaults to true.
+   * Whether to disable memory. Defaults to true, false under the root profile.
    */
   noMemory?: boolean,
 
   /**
-   * Whether to disable skills. Defaults to true.
+   * Whether to disable skills. Defaults to true, false under the root profile.
    */
   noSkills?: boolean,
 
   /**
-   * Whether to disable hooks. Defaults to true.
+   * Whether to disable hooks. Defaults to true, false under the root profile.
    */
   noHooks?: boolean,
 
   /**
-   * Whether to disable plugins. Defaults to true.
+   * Whether to disable plugins. Defaults to true, false under the root profile.
    */
   noPlugins?: boolean,
 
   /**
-   * Whether to disable MCP. Defaults to true.
+   * Whether to disable MCP. Defaults to true, false under the root profile.
    */
   noMcp?: boolean,
 
   /**
-   * Whether to disable agents. Defaults to true.
+   * Whether to disable agents. Defaults to true, false under the root profile.
    */
   noAgents?: boolean,
 
   /**
-   * Whether to disable tasks. Defaults to false.
+   * Whether to disable tasks. Defaults to false under both profiles.
    */
   noTasks?: boolean,
 
   /**
-   * Whether to disable compact. Defaults to true.
+   * Whether to disable compact. Defaults to true, false under the root profile.
    */
   noCompact?: boolean,
 
@@ -648,6 +743,22 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
   }
   const auth = requested;
 
+  const requestedProfile: unknown = o.profile === undefined ? 'worker' : o.profile;
+  if (!isLaunchProfile(requestedProfile)) {
+    throw new Error(`profile must be "worker" or "root", got ${JSON.stringify(requestedProfile)}`);
+  }
+  const profile = requestedProfile;
+  const defaults = profileDefaults[profile];
+
+  const sources: unknown = o.settingSources ?? settingSources;
+  if (!Array.isArray(sources) || !sources.every(isSettingSource) || !sources.includes('user')
+    || new Set(sources).size !== sources.length) {
+    throw new Error(
+      `settingSources must name "user" and any of "project" and "local", each once, got ${JSON.stringify(sources)}: `
+      + 'the user tier is the run\'s own settings.json, where every switch of this library is written'
+    );
+  }
+
   const sessionId: unknown = o.customSessionData?.sessionId;
   if (o.customSessionData !== undefined && o.customSessionData !== null
     && (typeof sessionId !== 'string' || !sessionIdPattern.test(sessionId))) {
@@ -711,18 +822,20 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
     launcher: o.launcher ?? 'claude',
     claudePath: o.claudePath ?? 'claude',
     model: o.model ?? null,
-    effortLevel: o.effortLevel ?? 'high',
-    permissionMode: o.permissionMode ?? 'auto',
+    profile,
+    effortLevel: o.effortLevel ?? null,
+    permissionMode: o.permissionMode ?? defaults.permissionMode,
+    settingSources: [ ...sources ],
     changeSystemPrompt: o.changeSystemPrompt ?? null,
-    noInstructionFiles: o.noInstructionFiles ?? true,
-    noMemory: o.noMemory ?? true,
-    noSkills: o.noSkills ?? true,
-    noHooks: o.noHooks ?? true,
-    noPlugins: o.noPlugins ?? true,
-    noMcp: o.noMcp ?? true,
-    noAgents: o.noAgents ?? true,
-    noTasks: o.noTasks ?? false,
-    noCompact: o.noCompact ?? true,
+    noInstructionFiles: o.noInstructionFiles ?? defaults.noInstructionFiles,
+    noMemory: o.noMemory ?? defaults.noMemory,
+    noSkills: o.noSkills ?? defaults.noSkills,
+    noHooks: o.noHooks ?? defaults.noHooks,
+    noPlugins: o.noPlugins ?? defaults.noPlugins,
+    noMcp: o.noMcp ?? defaults.noMcp,
+    noAgents: o.noAgents ?? defaults.noAgents,
+    noTasks: o.noTasks ?? defaults.noTasks,
+    noCompact: o.noCompact ?? defaults.noCompact,
     noIntegrations: o.noIntegrations ?? true,
     noHousekeeping: o.noHousekeeping ?? true,
     noBashEditDiff: o.noBashEditDiff ?? true,
@@ -797,13 +910,16 @@ export function buildArgv(config: LaunchConfig, sessionId: string): string[] {
   // a fresh one and collide with the transcript already on disk.
   argv.push(config.customSessionData ? '--resume' : '--session-id', sessionId);
 
-  argv.push('--effort', config.effortLevel);
+  // Not given, not forced: the effort Claude Code is configured with applies.
+  if (config.effortLevel !== null) {
+    argv.push('--effort', config.effortLevel);
+  }
   argv.push('--permission-mode', config.permissionMode);
 
-  // Only the ephemeral home's own settings.json may contribute; project and
-  // local .claude/settings*.json would otherwise still be loaded, which is
-  // the opposite of running bare.
-  argv.push('--setting-sources', 'user');
+  // `user` is the ephemeral home's own settings.json and always present;
+  // `project` and `local` bring in the cwd's configuration, deny rules
+  // included (see settingSources).
+  argv.push('--setting-sources', config.settingSources.join(','));
 
   if (config.changeSystemPrompt) {
     argv.push(systemPromptFlags[config.changeSystemPrompt.type], config.changeSystemPrompt.value);
@@ -972,7 +1088,9 @@ export function buildSettings(config: LaunchConfig): JsonObject {
     settings.model = config.model;
   }
 
-  settings.effortLevel = config.effortLevel;
+  if (config.effortLevel !== null) {
+    settings.effortLevel = config.effortLevel;
+  }
 
   // Both of these live under `permissions`, and disableBypassPermissionsMode
   // is the string 'disable', not a boolean. At the settings root they are

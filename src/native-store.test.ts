@@ -21,8 +21,8 @@ describe('native-store authentication', () => {
     expect(env.ANTHROPIC_CONFIG_DIR).toBe('/enrolled/account-a/anthropic-profile');
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     const argv = buildArgv(c, 'native-probe');
-    expect(argv).toContain('--setting-sources');
-    expect(argv).toContain('user');
+    // The ephemeral home's settings are the user tier, which every run loads.
+    expect(argv[argv.indexOf('--setting-sources') + 1]?.split(',')).toContain('user');
   });
 
   test('refuses ambiguous option and settings sources', () => {
